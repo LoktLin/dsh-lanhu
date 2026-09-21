@@ -1,0 +1,10 @@
+# 依赖（本插件零运行时依赖；puppeteer-core 只用于真机验收，可选）
+node_modules/
+
+# 设计资产与产物：设计稿切图常含业务信息，别提交
+assets/
+*.log
+mapping.json
+
+# macOS
+.DS_Store

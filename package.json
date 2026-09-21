@@ -1,0 +1,62 @@
+{
+  "name": "dsh-lanhu",
+  "version": "0.1.0",
+  "description": "蓝湖（Lanhu）设计稿读取插件 —— 把设计稿的精确色值/字号/字重/圆角/坐标/文本喂给 agent，替代靠截图估算",
+  "type": "module",
+  "main": "./lib/index.js",
+  "exports": {
+    ".": {
+      "default": "./lib/index.js"
+    },
+    "./client": "./lib/client.js",
+    "./lanhu": {
+      "default": "./lanhu.mjs"
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "lanhu": "./lanhu.mjs"
+  },
+  "files": [
+    "lib",
+    "lanhu.mjs",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": []
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "deepseek-harness",
+    "cordis",
+    "lanhu",
+    "design",
+    "design-to-code",
+    "design-spec"
+  ],
+  "author": "LoktLin",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/LoktLin/dsh-lanhu.git"
+  },
+  "homepage": "https://github.com/LoktLin/dsh-lanhu#readme",
+  "bugs": {
+    "url": "https://github.com/LoktLin/dsh-lanhu/issues"
+  },
+  "license": "MIT",
+  "optionalDependencies": {
+    "puppeteer-core": "^25.11.0"
+  }
+}

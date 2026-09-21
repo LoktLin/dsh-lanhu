@@ -1,0 +1,5 @@
+# dsh-lanhu bundle patch —— 把插件插入 web profile 的插件名册。
+# 不带 id 的 insert 才是「新增一行插件」；带 id 是「往已有行里追加」。
+- insert:
+    - id: lanhu
+      name: dsh-lanhu
