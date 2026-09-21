@@ -727,14 +727,14 @@ group('⑥.11 字体族比对');
 group('⑥.12 坐标映射');
 
 {
-  // 需求里的实测参照框：设计稿九地市 Region 总 bbox → 本地自绘 SVG 内容 bbox
+  // 需求里的实测参照框：设计稿地图区域总 bbox → 本地自绘 SVG 内容 bbox
   const mb = { x0: 659.32, y0: 120.58, x1: 1271.64, y1: 651.53 }; // 612.32 × 530.95，比例 1.153
   const tb = { x0: 4, y0: 4, x1: 442.3, y1: 480.3 };              // 438.3 × 476.3，比例 0.920
   const sx = (tb.x1 - tb.x0) / (mb.x1 - mb.x0);
   const sy = (tb.y1 - tb.y0) / (mb.y1 - mb.y0);
   const r2 = (v) => Math.round(v * 100) / 100;
 
-  const hotspot = layer({ name: '福州 / Hotspot', x: 1095.44, y: 323.1, w: 13.2, h: 15.21 });
+  const hotspot = layer({ name: '某热点 / Hotspot', x: 1095.44, y: 323.1, w: 13.2, h: 15.21 });
   const r = renderRegion([hotspot], { y0: 0, y1: 1000, mapBox: mb, toBox: tb });
   ok('表头出现「映射 x,y」「映射 w×h」', r.text.includes('映射 x,y') && r.text.includes('映射 w×h'));
   const expX = r2(tb.x0 + (1095.44 - mb.x0) * sx);
