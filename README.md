@@ -16,7 +16,7 @@
 > **没有它**：AI 写页面前只能看设计稿**截图**，色值和字号靠视觉估算（OCR 小字经常错）。
 > **有了它**：设计稿的真实数值直接进上下文 —— 等于把「设计标注」喂给模型；还能反过来拿它**自动验收**页面还原度。
 
-**版本 `0.4.3`**（见 [CHANGELOG](https://github.com/LoktLin/dsh-lanhu/blob/main/CHANGELOG.md)） · MIT
+**版本 `0.4.3`**（见 [CHANGELOG](https://github.com/LoktLin/dsh-lanhu/blob/main/CHANGELOG.md)） · **npm** [`dsh-lanhu`](https://www.npmjs.com/package/dsh-lanhu) · MIT
 适用于 [DeepSeek Harness](https://github.com/deepseek-ai)（DSH）Web GUI，需要 **Node ≥ 20**。自带 15 个原生工具 + 侧边面板 + CLI。
 
 > ⚠️ **免责与数据说明**
@@ -325,10 +325,14 @@
 ## 安装
 
 ```bash
-# ① 装进 profile（<plugin-dir> = 本仓库在你机器上的路径）
-dsh plugin --profile web add <plugin-dir>
+# ① 装进 profile —— 两种来源任选
+dsh plugin --profile web add dsh-lanhu        # 从 npm（推荐使用者）
+dsh plugin --profile web add <plugin-dir>     # 从本仓库（要改代码时）
 # ② 重启 dsh web —— 15 个工具即对全部会话可见
 ```
+
+> `dsh plugin add` 就是 `pnpm add`，所以也接受 npm 包名 / tarball / git 地址。
+> 装了之后 DSH 会读包里的 `dsh.bundle.patch` 把它挂进 profile 层（**没有这个声明的包只会装成普通依赖**）。
 
 开发态用软链（改代码立即生效，但 **Host 代码仍需重启 `dsh web`**）：
 

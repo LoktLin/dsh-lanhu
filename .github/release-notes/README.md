@@ -28,6 +28,30 @@
    接着打开 `https://github.com/LoktLin/dsh-lanhu/releases/new?tag=v<版本>`，
    标题填 `v<版本>`，描述框粘贴第 4 步那份，Publish。
 
+7. **发 npm**（`dsh-lanhu`，公开包）：
+   ```bash
+   npm pack --dry-run          # 先看会发什么（内容清单 + 体积）
+   npm publish --registry=https://registry.npmjs.org
+   ```
+   ⚠️ **四个坑，都踩过**：
+   1. **必须显式带 `--registry=https://registry.npmjs.org`** —— 本机 `~/.npmrc` 指向
+      `registry.npmmirror.com`（**只读镜像，发不上去**）。装包继续走镜像没问题，只有发布要覆盖。
+   2. **发布需要 2FA**。两条路：① 给账号开 2FA 然后 `npm publish --otp=<六位码>`；
+      ② 建一个**细粒度令牌（Granular Access Token）并勾上
+      `Allow this token to bypass two-factor authentication`** ——
+      缺这一步会报 `403 ... granular access token with bypass 2fa enabled is required`。
+      建完**先自检**再发：
+      `curl -s -H "Authorization: Bearer <token>" https://registry.npmjs.org/-/npm/v1/tokens`
+      → 必须是 `"bypass_2fa":true`。
+   3. **版本不可重发**：npm 上发出去的版本**不能覆盖**（删了也不能用同一号重发）。
+      发完发现有问题 → **升版本**（如 0.4.4）再发，别想重发。
+   4. **令牌用完就撤**：临时 `npm config set //registry.npmjs.org/:_authToken=<token>`
+      → 发布 → **还原 `.npmrc` 并去 npmjs.com 撤销令牌**。长期凭据不值得留在磁盘上。
+   > 打包范围由 `package.json` 的 `files` 决定（当前含 `lib` / `lanhu.mjs` / `cordis.patch.yml` /
+   > `docs` / `CHANGELOG.md` / `README.md` / `LICENSE`，实测 14 文件 ≈ 187 kB）。
+   > ⚠️ **README 里的文档链接必须是 GitHub 绝对地址** —— 相对路径在 npm 页面上会 404
+   > （那些文件在包里，但 npm 不提供文件浏览）；`readme-test` 的链接绊线会同时验两种形态。
+
 > ⚠️ **本机 ssh-agent 不常驻**：`git push` 若报 `Permission denied (publickey)`，显式指定密钥即可：
 > `GIT_SSH_COMMAND='ssh -i ~/.ssh/id_ed25519 -o IdentitiesOnly=yes' git push origin main`
 > 本机另有网络插曲：GitHub **SSH 偶发不通**，重试通常就好；`github.com:443` 的下载通道**极慢**
