@@ -15,12 +15,12 @@
    > 漏改一处就红。以前这步是纯靠人核的。
 2. **改了工具就跑生成器**：`node tools/gen-readme-tools.mjs --write`
    （README 的「每个工具的完整说明」是从 `lib/index.js` 的 `TOOLS` 生成的，`readme-test` 逐字比对。）
-3. **跑自检**：`node test/selfcheck.mjs` —— 569 项，**纯离线、秒级**，改完代码先跑它。
+3. **跑自检**：`node test/selfcheck.mjs` —— 611 项，**纯离线、秒级**，改完代码先跑它。
    `node test/readme-test.mjs` —— **文档绊线**（项数看它自己的输出，**别在文档里写死**）：生成块是否最新 / `docs/` 链接是否存在且无孤立文件 /
    版本号五处是否一致 / 发布说明格式与公开纪律（不含本机路径）。
    （可选）插件脚手架自检：`node <dsh-plugin-mac 技能目录>/scripts/selftest.mjs --plugin .` —— 16 项，
    覆盖工具形状 / 路由信封 / lossless JSON / 本机守卫 / 槽位注册与回收。
-   顺手核对 README 里写死的项数（**569 / 16**）有没有过期。
+   顺手核对 README 里写死的项数（**611 / 16**）有没有过期。
 4. **写发布说明**：照上一个版本的文件格式新建 `v<新版本>.md`。
 5. **提交并推送**：`git add -A && git commit -m "release: v<版本>" && git push origin main`。
 6. **打 tag 并推送**（除了 `main`，这是唯一要推的东西）：

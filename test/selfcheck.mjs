@@ -32,6 +32,7 @@ process.on('uncaughtException', (e) => { cleanupTmp(); console.error(e); process
 
 const {
   parseLanhuUrl,
+  searchLines,
   parseProjectTarget,
   countSitemapPages,
   titleName,
@@ -1658,6 +1659,86 @@ group('⑨ 产品文档（A1/A2）与算法（B1~B4）');
   const r = await tryProjectInfo('', null, {});
   ok('tryProjectInfo：失败 → {info:null, error:非空}（不抛错、不静默）',
     r.info === null && typeof r.error === 'string' && r.error.length > 0, JSON.stringify(r).slice(0, 90));
+}
+
+/* ═══════ CLI 的 --account 透传（工具链有同款守卫；**CLI 这条缝里漏出过 30005**） ═══════ */
+{
+  // 起因：CLI 的 16 个 cmdXxx 全都没把 args.account 传给核心函数 → 永远走默认账号。
+  // 实测：空天碳团队（属 kongtian）用默认账号 quanzi 调 search → `code=30005 用户或团队不存在`，
+  //      而同入参改走工具（带 account）就正常。**工具对、CLI 错**，就是这条缝。
+  const hostSrc = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'lanhu.mjs'), 'utf8');
+  const NET_CALL = /await (checkAuth|listTeams|listDirectory|listSectors|listImages|search|readDesign|readBlocks|readProductDoc|downloadSlices|verifySpec|saveCookie|productDocuments|tryProjectInfo|fetchDesignTree|whoIsIt|buildAccountIndex)\(/;
+  // 显式白名单：**注入但不适用**，不是漏传。改动这里必须同时改 lanhu.mjs 里对应函数的注释。
+  const NOT_APPLICABLE = {
+    cmdLog: '纯本地读使用记录，不走网络',
+    cmdAccounts: '它管理全部账号，要操作哪个用 --alias —— 与 --account（用哪个身份）语义不同',
+    cmdWho: '它的职责就是跨账号判定（遍历各账号 Cookie 去试），指定 account 等于让它别干本职',
+  };
+  // ⚠️ 这里踩过一次：朴素的"数花括号"会**从参数表的 `{` 就开始数**，
+  //    于是 `({ args, cookie })` 一闭合就返回（实测只拿到 41 个字符）→ 所有命令都被当成"不走网络"。
+  //    而且模板字符串里的 `${…}` 也会被误算。所以必须**跳过参数表 + 字符串感知**。
+  const bodyOf = (name) => {
+    const sig = hostSrc.indexOf(`async function ${name}(`);
+    if (sig < 0) return null;
+    // 1) 先跳过参数表：从 sig 起找配平的 `)`（字符串感知）
+    let j = hostSrc.indexOf('(', sig), pd = 0, q = null;
+    for (; j < hostSrc.length; j += 1) {
+      const c = hostSrc[j];
+      if (q) { if (c === '\\') j += 1; else if (c === q) q = null; continue; }
+      if (c === "'" || c === '"' || c === '`') { q = c; continue; }
+      if (c === '(') pd += 1;
+      else if (c === ')') { pd -= 1; if (pd === 0) break; }
+    }
+    // 2) 再找函数体的 `{`，并对它做字符串感知的配平
+    const start = hostSrc.indexOf('{', j);
+    if (start < 0) return null;
+    let depth = 0, k = start; q = null;
+    for (; k < hostSrc.length; k += 1) {
+      const c = hostSrc[k];
+      if (q) { if (c === '\\') k += 1; else if (c === q) q = null; continue; }
+      if (c === "'" || c === '"' || c === '`') { q = c; continue; }
+      if (c === '/' && hostSrc[k + 1] === '/') { k = hostSrc.indexOf('\n', k); if (k < 0) break; continue; }
+      if (c === '/' && hostSrc[k + 1] === '*') { k = hostSrc.indexOf('*/', k) + 1; continue; }
+      if (c === '{') depth += 1;
+      else if (c === '}') { depth -= 1; if (depth === 0) return hostSrc.slice(sig, k + 1); }
+    }
+    return hostSrc.slice(sig);
+  };
+  const names = [...hostSrc.matchAll(/^async function (cmd[A-Z]\w*)\(/gm)].map((m) => m[1]);
+  ok('能枚举出 CLI 的命令处理器（守卫本身要可靠）', names.length >= 12, `枚举到 ${names.length} 个`);
+  let checked = 0;
+  for (const n of names) {
+    const body = bodyOf(n);
+    ok(`${n} 的源码区间能定位`, !!body && body.length > 20);
+    if (!body) continue;
+    if (NOT_APPLICABLE[n]) continue;
+    if (!NET_CALL.test(body)) continue;          // 不走网络 → 不要求
+    checked += 1;
+    ok(`${n} 把 args.account 传给了核心函数`, body.includes('args.account'), '没传 → 会永远走默认账号');
+  }
+  ok('确实检查到了走网络的命令（不是空跑）', checked >= 12, `检查了 ${checked} 个`);
+  // 白名单**不许变成摆设**：它列的命令必须真实存在，且确实没传 account
+  for (const [n, why] of Object.entries(NOT_APPLICABLE)) {
+    const body = bodyOf(n);
+    ok(`白名单 ${n} 真实存在（${why}）`, !!body, '白名单里的命令没了 → 名单该更新');
+    if (body) ok(`白名单 ${n} 确实没传 args.account（否则该从名单里移出）`, !body.includes('args.account'));
+  }
+}
+
+/* ═══════ CLI search：三类结果都要打（原先只打 images → PRD-only 的搜索**零输出**） ═══════ */
+{
+  const imgsOnly = searchLines({ images: [{ imageId: 'i1', name: '稿A', projectName: 'P', path: '/x' }], prds: [], projects: [] }, 'kw');
+  ok('search：只有稿时打稿 + 汇总', imgsOnly.length === 2 && /稿 1 · PRD 0/.test(imgsOnly[1]), JSON.stringify(imgsOnly).slice(0, 90));
+  // ⚠️ 这条就是真缺陷的回归：原先只遍历 r.images → 命中 PRD 时**什么都不打**、退出码却是 0
+  const prdsOnly = searchLines({ images: [], prds: [{ prdId: 'p1', name: 'PRD A', path: '/y' }], projects: [] }, 'kw');
+  ok('search：**只有 PRD 时也必须打**（原先零输出 + 退出码 0）',
+    prdsOnly.some((l) => /\[PRD\]/.test(l)) && prdsOnly.length === 2, JSON.stringify(prdsOnly).slice(0, 90));
+  const projsOnly = searchLines({ images: [], prds: [], projects: [{ projectId: 'j1', name: '项目A' }] }, 'kw');
+  ok('search：只有项目时也打', projsOnly.some((l) => /\[项目\]/.test(l)), JSON.stringify(projsOnly).slice(0, 80));
+  const empty = searchLines({ images: [], prds: [], projects: [] }, 'kw');
+  ok('search：三类全空 → 明说"没有匹配"（**不许零输出**）',
+    empty.length === 1 && /没有匹配/.test(empty[0]), JSON.stringify(empty));
+  ok('search：字段缺失时不许抛（防御性）', searchLines({}, 'kw')[0].includes('没有匹配'));
 }
 
 /* ═══════════════ 汇总 ═══════════════ */

@@ -5401,7 +5401,7 @@ function printJson(v) { console.log(JSON.stringify(v, null, 2)); }
 
 /** `auth` 命令。 */
 async function cmdAuth({ args, cookie }) {
-  const r = await checkAuth({ cookie });
+  const r = await checkAuth({ cookie, account: args.account });
   if (args.json) printJson(r);
   else if (r.ok) {
     console.log(`✅ 登录有效（来源：${r.cookieSource}）`);
@@ -5418,14 +5418,14 @@ async function cmdAuth({ args, cookie }) {
 
 /** `teams` 命令。 */
 async function cmdTeams({ args, cookie }) {
-  const r = await listTeams({ cookie });
+  const r = await listTeams({ cookie, account: args.account });
   if (args.json) printJson(r); else for (const t of r.teams) console.log(`${t.teamId}  ${t.name}  成员 ${t.memberNum}`);
   return r;
 }
 
 /** `projects` 命令。 */
 async function cmdProjects({ args, cookie }) {
-  const r = await listDirectory(args.team, { cookie });
+  const r = await listDirectory(args.team, { cookie, account: args.account });
   if (args.json) printJson(r); else for (const p of r.projects) console.log(`${p.sourceId}  ${p.sourceName}`);
   return r;
 }
@@ -5436,7 +5436,7 @@ async function cmdDesigns({ args, cookie }) {
   const target = args.url ? parseProjectTarget(args.url) : null;
   const projectId = args.project ?? target?.projectId ?? null;
   if (!projectId) throw new LanhuError('用法：node lanhu.mjs designs --url "<蓝湖链接>"，或 --project <pid>（两个都不给无法定位项目）');
-  const r = await listImages(projectId, { cookie });
+  const r = await listImages(projectId, { cookie, account: args.account });
   if (args.json) printJson(r);
   else {
     console.log(`${r.projectName ?? r.projectId}：${r.images.length} 张稿`);
@@ -5447,16 +5447,39 @@ async function cmdDesigns({ args, cookie }) {
 
 /** `sectors` 命令。 */
 async function cmdSectors({ args, cookie }) {
-  const r = await listSectors(args.project, { cookie });
+  const r = await listSectors(args.project, { cookie, account: args.account });
   if (args.json) printJson(r); else console.log(r.sectors.length ? r.sectors.map((s) => `${s.id} ${s.name}`).join('\n') : '(无分组)');
   return r;
 }
 
+/**
+ * `search` 的人读行（**纯函数，便于离屏断言**）。
+ *
+ * ⚠️ 三类结果**都要打**。原先只遍历 `r.images` —— 于是"命中的是 PRD / 项目而不是稿"的搜索
+ * 会变成**零输出 + 退出码 0**，即本项目最忌讳的"看着跑成功但什么都没干"
+ * （实测：搜「雷达组网」命中 2 条 PRD / 0 张稿 → 人读路径什么都不打，而 `--json` 里 prds=2）。
+ *
+ * 三类都空时**也要说话**，否则还是一次"零输出但成功"。
+ */
+export function searchLines(r, keyword) {
+  const images = r?.images ?? [];
+  const prds = r?.prds ?? [];
+  const projects = r?.projects ?? [];
+  const lines = [];
+  for (const i of images) lines.push(`${i.imageId}  ${i.name}  @ ${i.projectName}  (${i.path})`);
+  for (const d of prds) lines.push(`[PRD]  ${d.prdId}  ${d.name}  @ ${d.path}`);
+  for (const j of projects) lines.push(`[项目] ${j.projectId}  ${j.name}`);
+  const total = images.length + prds.length + projects.length;
+  if (total === 0) lines.push(`没有匹配「${keyword ?? ''}」的稿 / 项目 / PRD。`);
+  else lines.push(`— 共 ${total} 条（稿 ${images.length} · PRD ${prds.length} · 项目 ${projects.length}）`);
+  return lines;
+}
+
 /** `search` 命令。 */
 async function cmdSearch({ args, cookie }) {
-  const r = await search(args.team, args.keyword, { cookie });
+  const r = await search(args.team, args.keyword, { cookie, account: args.account });
   if (args.json) printJson(r);
-  else for (const i of r.images) console.log(`${i.imageId}  ${i.name}  @ ${i.projectName}  (${i.path})`);
+  else for (const line of searchLines(r, args.keyword)) console.log(line);
   return r;
 }
 
@@ -5470,7 +5493,7 @@ async function cmdRead({ args, cookie }) {
     mapBox: args['map-box'], toBox: args['to-box'],
     version: args.version, gapMaxDistance: args['gap-max-distance'] === undefined ? undefined : Number(args['gap-max-distance']),
     dds: Boolean(args.dds),
-    cookie, outDir: args.out,
+    cookie, account: args.account, outDir: args.out,
   });
   if (args.json) printJson(r);
   else {
@@ -5490,7 +5513,7 @@ async function cmdBlocks({ args, cookie }) {
     limit: args.limit === undefined ? undefined : Number(args.limit),
     includeNoise: Boolean(args.all),
     version: args.version,
-    cookie,
+    cookie, account: args.account,
   });
   if (args.json) printJson(r);
   else {
@@ -5508,8 +5531,8 @@ async function cmdProductDocs({ args, cookie }) {
   const projectId = args.project ?? parsed.projectId;
   const teamId = args.team ?? parsed.teamId;
   if (!projectId || !teamId) throw new LanhuError('用法：node lanhu.mjs product-docs --url "<原型链接>"（链接里带 tid/pid），或 --project <pid> --team <tid>');
-  const listed = await productDocuments(projectId, teamId, { cookie });
-  const pi = await tryProjectInfo(projectId, teamId, { cookie });
+  const listed = await productDocuments(projectId, teamId, { cookie, account: args.account });
+  const pi = await tryProjectInfo(projectId, teamId, { cookie, account: args.account });
   const info = pi.info;
   // --with-pages：逐份拉 sitemap 数页面规模（**默认关** —— N 份 = N 次额外请求）。
   // 单份失败只标 `?`，绝不炸整张表（与工具链同一口径）。
@@ -5517,7 +5540,7 @@ async function cmdProductDocs({ args, cookie }) {
   if (withPages) {
     for (const d of listed.axureDocs) {
       try {
-        const { tree } = await fetchDesignTree(projectId, d.docId, { cookie, expect: 'prototype' });
+        const { tree } = await fetchDesignTree(projectId, d.docId, { cookie, account: args.account, expect: 'prototype' });
         const c = countSitemapPages(tree?.sitemap?.rootNodes);
         d.pages = { nodes: c.nodes, readable: c.readable };
       } catch (e) {
@@ -5553,7 +5576,7 @@ async function cmdProductDoc({ args, cookie }) {
     format: args.format,
     layerLimit: args['layer-limit'] === undefined ? undefined : Number(args['layer-limit']),
     includeNoise: Boolean(args.all),
-    cookie,
+    cookie, account: args.account,
   });
   if (args.json) printJson({ ...r, text: undefined });
   else {
@@ -5567,6 +5590,7 @@ async function cmdProductDoc({ args, cookie }) {
 }
 
 /** `log` 命令。 */
+/** `log` 命令。⚠️ **不传 account**（有意）：纯本地读使用记录，不走网络。 */
 async function cmdLog({ args, cookie }) {
   const r = readUsage({ limit: args.limit === undefined ? 30 : Number(args.limit) });
   if (args.json) printJson(r);
@@ -5584,7 +5608,7 @@ async function cmdLog({ args, cookie }) {
 
 /** `slices` 命令。 */
 async function cmdSlices({ args, cookie }) {
-  const r = await downloadSlices({ projectId: args.project, imageId: args.image, url: args.url, cookie, outDir: args.out });
+  const r = await downloadSlices({ projectId: args.project, imageId: args.image, url: args.url, cookie, account: args.account, outDir: args.out });
   if (args.json) printJson(r);
   else {
     console.log(`✅ 下载 ${r.downloaded} 个（去重 ${r.skipped}）→ ${r.dir}\n   mapping: ${r.mappingPath}`);
@@ -5596,12 +5620,15 @@ async function cmdSlices({ args, cookie }) {
 
 /** `verify` 命令。 */
 async function cmdVerify({ args, cookie }) {
-  const r = await verifySpec({ projectId: args.project, imageId: args.image, url: args.url, pageUrl: args.page, cookie, outDir: args.out });
+  const r = await verifySpec({ projectId: args.project, imageId: args.image, url: args.url, pageUrl: args.page, cookie, account: args.account, outDir: args.out });
   if (args.json) printJson(r); else console.log(r.text ?? JSON.stringify(r, null, 2));
   return r;
 }
 
 /** `accounts` 命令。 */
+/** `accounts` 命令。
+ *  ⚠️ **不传 account**（有意）：它管理**全部**账号，要操作哪个用 `--alias` 指定 ——
+ *     与 `--account`（"用哪个账号的身份"）语义不同，硬塞会让人以为 `--account` 能选账号。 */
 async function cmdAccounts({ args, cookie }) {
   // 添加 / 更新账号
   if (args.add) {
@@ -5670,6 +5697,9 @@ async function cmdAccounts({ args, cookie }) {
 }
 
 /** `who` 命令。 */
+/** `who` 命令。
+ *  ⚠️ **不传 account**（有意）：它的职责就是"这张稿属于哪个账号"——跨账号遍历所有账号的 Cookie 去试。
+ *     给它指定 account 等于让它别干本职。工具侧同款白名单见 lib/index.js 的 EXPLICITLY_INAPPLICABLE。 */
 async function cmdWho({ args, cookie }) {
   const r = await whoIsIt({ url: args.url, projectId: args.project, imageId: args.image, teamId: args.team });
   if (args.json) printJson(r);
@@ -5707,7 +5737,7 @@ async function cmdCookie({ args, cookie }) {
   if (!text) throw new LanhuError('用法：lanhu.mjs cookie --set "<粘贴内容>" | --file <路径> | --stdin | --clipboard');
 
   const dry = Boolean(args['dry-run']);
-  const r = await saveCookie(text, { verify: args.verify !== false, dryRun: dry });
+  const r = await saveCookie(text, { verify: args.verify !== false, dryRun: dry, account: args.account });
   console.log(dry ? '🔍 解析结果（--dry-run，未写入）' : `✅ 已写入 ${r.path}（600）`);
   console.log(`   解析来源：${r.source}`);
   console.log(`   Cookie：${r.masked}`);
@@ -5739,6 +5769,12 @@ const CLI_COMMANDS = {
 const USAGE = `dsh-lanhu —— 蓝湖设计稿读取
 
 用法：node lanhu.mjs <命令> [选项]
+
+全局选项：
+  --account <别名>   用**指定账号**的身份（目标团队不属于默认账号时**必须给**，否则接口报 30005）。
+                   不给则用默认账号。优先级：--cookie > 环境变量 LANHU_COOKIE > --account > 默认账号
+                   —— 也就是说**显式 cookie 与环境变量会盖过 --account**（它们表达的是更强的显式意图）。
+                   不需要它的命令：who（职责就是跨账号判定）、accounts（用 --alias 指定要操作的账号）、log（纯本地）。
 
   auth                                   探活 Cookie（含有效期）
   teams                                  列团队

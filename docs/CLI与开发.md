@@ -7,6 +7,19 @@
 > **原型页面样式**：`node lanhu.mjs product-doc --url "<原型链接>" --format layers [--layer-limit 200]`
 > —— 输出该页的色值/字号/坐标块级清单（与设计稿同一张表）。没有设计稿、只有原型时用它。
 >
+> **指定账号**：`node lanhu.mjs <命令> … --account <别名>`
+> —— 目标团队不属于**默认账号**时**必须给**，否则接口报 `30005 用户或团队不存在`。
+> 实测（空天碳团队属 `kongtian`，而默认账号是 `quanzi`）：
+>
+> ```bash
+> node lanhu.mjs search --team 1b89ab48-… --keyword 雷达组网                    # ❌ code=30005 用户或团队不存在
+> node lanhu.mjs search --team 1b89ab48-… --keyword 雷达组网 --account kongtian  # ✅ 正常返回
+> ```
+>
+> 优先级：`--cookie` > 环境变量 `LANHU_COOKIE` > `--account` > 默认账号 ——
+> 也就是**显式 cookie 与环境变量会盖过 `--account`**（它们表达更强的显式意图）。
+> `who`（职责就是跨账号判定）/ `accounts`（用 `--alias` 指定要操作的账号）/ `log`（纯本地）不需要它。
+>
 > **列原型清单**：`node lanhu.mjs product-docs --url "<原型链接>" [--with-pages]`
 > —— 清单带 `order`（界面「文档」面板按它倒序、是滚动区，只看到前几个不代表只有几个）；
 > `--with-pages` 额外附上每份的**页面规模**（页面节点 / 可读页），**代价是每份多发 1 次请求**，默认关。
@@ -54,7 +67,7 @@ node lanhu.mjs cookie --clipboard --dry-run  # 只看解析结果，不写入
 ## 本地自检
 
 ```bash
-node test/selfcheck.mjs          # 569 项，纯离线、秒级
+node test/selfcheck.mjs          # 611 项，纯离线、秒级
 node test/selfcheck.mjs --json   # 机器可读
 ```
 
