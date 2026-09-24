@@ -32,6 +32,7 @@ process.on('uncaughtException', (e) => { cleanupTmp(); console.error(e); process
 
 const {
   parseLanhuUrl,
+  resolveTarget,
   parseColor,
   buildBlocks,
   renderBlocks,
@@ -1165,6 +1166,30 @@ group('⑨ 产品文档（A1/A2）与算法（B1~B4）');
   ok('产品文档工具的描述点明"不是设计稿"（防拿错工具）', byName.lanhu_read_product_doc.description.includes('不是设计稿') && byName.lanhu_list_product_documents.description.includes('不是设计稿'));
   ok('列表工具指路到读取工具（拿错工具的代价是白跑一次）', byName.lanhu_list_product_documents.description.includes('lanhu_read_product_doc'));
   ok('设计稿工具的描述点明**不是**产品文档（反向防混淆）', byName.lanhu_read_design.description.includes('不是') || byName.lanhu_read_blocks.description.includes('不是') || true, '（仅记录，不作硬判据）');
+}
+
+/* ═══════════ 混链：docId / image_id / versionId 同时出现（蓝湖编辑页的真实形态） ═══════════ */
+{
+  const IMG = 'beceb033-866c-4759-913d-cee0a3b18d3a';
+  const DOC = 'cc30bbca-bf64-4599-976d-4d8f03d50011';
+  const DOCVER = '42dd6788-6a17-459a-beba-bd210e089b34';
+  const PAGE = '5899c262ab8e4609bbb7adef3ecd5450';
+  const MIX = `https://lanhuapp.com/web/#/item/project/detailDetach?tid=1b89ab48-799c-4899-888c-5040991bef9b`
+    + `&pid=639b8833-6a8c-401f-a002-7d5b3f090365&versionId=${DOCVER}&docId=${DOC}&docType=axure`
+    + `&image_id=${IMG}&pageId=${PAGE}&type=image`;
+  const p = parseLanhuUrl(MIX);
+  ok('混链里 image_id 优先（type=image，不是那个 docId）', p.imageId === IMG, p.imageId);
+  ok('混链解析保留 versionId / docId / pageId（**以前直接丢掉**）',
+    p.versionId === DOCVER && p.docId === DOC && p.pageId === PAGE,
+    JSON.stringify({ v: p.versionId, d: p.docId, pg: p.pageId }));
+  // ⚠️ 回归：resolveTarget 曾把 versionId 吞掉 → URL 里的版本号完全失效，永远读 latest
+  ok('resolveTarget **不许吞掉 versionId**（吞了 URL 版本就失效）',
+    resolveTarget({ url: MIX }).versionId === DOCVER, String(resolveTarget({ url: MIX }).versionId));
+  const plain = 'https://lanhuapp.com/web/#/item/project/detailDetach?pid=639b8833-6a8c-401f-a002-7d5b3f090365&image_id=' + IMG;
+  ok('链接没带 versionId 时就是 null（不瞎猜）', resolveTarget({ url: plain }).versionId === null,
+    String(resolveTarget({ url: plain }).versionId));
+  ok('显式给 projectId+imageId 时不编 versionId', resolveTarget({ projectId: 'p', imageId: 'i' }).versionId === undefined
+    || resolveTarget({ projectId: 'p', imageId: 'i' }).versionId === null);
 }
 
 /* ═══════════════ 汇总 ═══════════════ */

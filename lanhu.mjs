@@ -1006,10 +1006,23 @@ export async function imageDetail(projectId, imageId, opts = {}) {
   const { json } = await apiRequest(url, opts);
   const raw = unwrap(json) ?? {};
   const versions = Array.isArray(raw.versions) ? raw.versions : [];
-  const want = opts.version == null || opts.version === '' ? 'latest' : String(opts.version);
+  const explicitVersion = opts.version == null || opts.version === '' ? null : String(opts.version);
+  // URL 里带的版本：**只在没显式传 version 时**作为默认值 —— 你浏览器里看的是哪版就读哪版。
+  const urlVersion = explicitVersion ? null : (opts.urlVersionId ? String(opts.urlVersionId) : null);
+  const want = explicitVersion ?? urlVersion ?? 'latest';
   let version = null;
+  let urlVersionIgnored = null;
   if (versions.length > 0) {
-    version = pickVersion(versions, want);
+    try {
+      version = pickVersion(versions, want);
+    } catch (e) {
+      // URL 里那个 versionId 很可能属于**同一条链接里的另一份东西**（实测：编辑页链接同时带
+      // docId 与 image_id，versionId 属于那份文档）。这不该报错；但**显式传 version 时仍严格报错**。
+      if (urlVersion && e?.code === 'VERSION_NOT_FOUND') {
+        version = pickVersion(versions, 'latest');
+        urlVersionIgnored = urlVersion;
+      } else throw e;
+    }
   } else if (want !== 'latest') {
     throw new LanhuError(`指定的版本不存在：${want}（该稿在当前账号下没有任何版本）。`, { code: 'VERSION_NOT_FOUND' });
   }
@@ -1024,7 +1037,10 @@ export async function imageDetail(projectId, imageId, opts = {}) {
     versionLayoutData: version?.version_layout_data ?? null,
     // 版本透明度：调用方要能知道"我拿到的是第几版、还有没有更新的版本"
     versionCount: versions.length,
-    versionRequested: want,
+    // requested 报**实际用的**那个版本，别把"URL 里没用上的那个"说成 requested
+    versionRequested: urlVersionIgnored ? 'latest' : want,
+    versionFromUrl: Boolean(urlVersion) && !urlVersionIgnored,
+    urlVersionIgnored,
     versionLatestId: versions[0]?.id ?? null,
     versionIsLatest: versions.length > 0 ? String(versions[0]?.id) === String(version?.id) : null,
     latestVersionAt: versions[0]?.create_time ?? null,
@@ -1810,6 +1826,16 @@ export async function readProductDoc(args = {}) {
   const docId = docIdIn ?? listed.axureDocs[0].docId;
   const doc = listed.axureDocs.find((d) => d.docId === docId) ?? null;
   if (!doc) {
+    // 这个 docId 不是原型文档 —— 先查它是不是**设计稿**再开口。
+    // （实测：只说"没有这个原型文档"，AI 会去翻文档列表白跑几轮；而它十有八九是拿设计稿链接来问的。）
+    const asDesign = await imageDetail(projectId, docId, ao).then((d) => d, () => null);
+    if (asDesign && asDesign.jsonUrl) {
+      throw new LanhuError(`docId=${docId} 是**设计稿**「${asDesign.name ?? ''}」，不是产品文档（原型）。`, {
+        code: 'DESIGN_NOT_PROTOTYPE',
+        hint: '这条链接直接给 lanhu_read_design / lanhu_read_blocks 就行。'
+          + `本项目里的原型文档有：${listed.axureDocs.map((d) => `${d.docId}(${d.name})`).join('；')}`.slice(0, 600),
+      });
+    }
     throw new LanhuError(`项目下没有 docId=${docId} 的原型文档。`, {
       code: 'DOC_NOT_FOUND',
       hint: `可选：${listed.axureDocs.map((d) => `${d.docId}(${d.name})`).join('；')}`.slice(0, 600),
@@ -2222,7 +2248,7 @@ export function parseLanhuUrl(input) {
     const parts = raw.split(/[\s,]+/).filter(Boolean);
     const ids = parts.filter((p) => UUID_RE.test(p));
     if (ids.length >= 2) {
-      return { teamId: ids[2] ?? null, projectId: ids[0], imageId: ids[1], url: null, source: 'ids' };
+      return { teamId: ids[2] ?? null, projectId: ids[0], imageId: ids[1], url: null, source: 'ids', versionId: null, docId: null, pageId: null };
     }
   }
 
@@ -2248,6 +2274,12 @@ export function parseLanhuUrl(input) {
   const projectId = pick('project_id', 'projectId', 'pid');
   const imageId = pick('image_id', 'imageId', 'iid');
   const teamId = pick('tid', 'team_id', 'teamId');
+  // ⚠️ 这三项以前直接丢了。蓝湖**编辑页链接会把文档与设计稿混在一条 URL 里**
+  //    （实测：docId + image_id + versionId 同时出现，而 versionId 属于那份文档）。
+  //    留着它们才能做到"你浏览器里看的是哪一版，读的就是哪一版"。
+  const versionId = pick('versionId', 'version_id');
+  const docId = pick('docId', 'doc_id');
+  const pageId = pick('pageId', 'page_id');
 
   if (!projectId || !UUID_RE.test(projectId)) {
     throw new LanhuError(`链接里没找到有效的项目 id（project_id/pid）：${projectId ?? '缺失'}。请确认复制的是设计稿详情页的完整地址。`);
@@ -2255,7 +2287,7 @@ export function parseLanhuUrl(input) {
   if (!imageId || !UUID_RE.test(imageId)) {
     throw new LanhuError(`链接里没找到有效的设计稿 id（image_id）：${imageId ?? '缺失'}。请确认复制的是**具体某张稿**的地址（列表页没有 image_id）。`);
   }
-  return { teamId, projectId, imageId, url: raw, source: 'url' };
+  return { teamId, projectId, imageId, url: raw, source: 'url', versionId, docId, pageId };
 }
 
 /** 判定块的类型。规则可解释、可调，不做玄学分类。 */
@@ -2640,7 +2672,7 @@ export async function readDesign(args = {}) {
   const picked = await pickAccount({ ...args, projectId: target.projectId, imageId: target.imageId, teamId: target.teamId });
   const acct = picked.alias;
   const { detail, tree, bytes } = await fetchDesignTree(target.projectId, target.imageId, {
-    cookie, account: acct, version: args.version, teamId: target.teamId, pageId: args.pageId,
+    cookie, account: acct, version: args.version, urlVersionId: target.versionId, teamId: target.teamId, pageId: args.pageId,
   });
   const artboard = tree.artboard ?? tree;
   const layers = flattenArtboard(artboard);
@@ -2683,6 +2715,8 @@ export async function readDesign(args = {}) {
       latestId: detail.versionLatestId ?? null,
       latestAt: detail.latestVersionAt ?? null,
       relocatedFrom: detail.relocatedFrom ?? null,
+        fromUrl: detail.versionFromUrl ?? false,
+        urlVersionIgnored: detail.urlVersionIgnored ?? null,
     },
   };
 
@@ -2796,7 +2830,7 @@ export async function readBlocks(args = {}) {
   const picked = await pickAccount({ ...args, projectId: target.projectId, imageId: target.imageId, teamId: target.teamId });
   const acct = picked.alias;
   const { detail, tree, bytes } = await fetchDesignTree(target.projectId, target.imageId, {
-    cookie: args.cookie, account: acct, version: args.version, teamId: target.teamId, pageId: args.pageId,
+    cookie: args.cookie, account: acct, version: args.version, urlVersionId: target.versionId, teamId: target.teamId, pageId: args.pageId,
   });
   const artboard = tree.artboard ?? tree;
   const layers = flattenArtboard(artboard);
@@ -2878,7 +2912,12 @@ export function resolveTarget({ projectId, imageId, url }) {
   if (url) {
     try {
       const p = parseLanhuUrl(url);
-      return { projectId: projectId ?? p.projectId, imageId: imageId ?? p.imageId, teamId: p.teamId };
+      // ⚠️ 必须把 versionId 带出来 —— 它是「你浏览器里看的是哪一版」的唯一线索。
+      //    之前在这里被吞掉，导致 URL 里的版本号完全失效（读的永远是 latest）。
+      return {
+        projectId: projectId ?? p.projectId, imageId: imageId ?? p.imageId,
+        teamId: p.teamId, versionId: p.versionId ?? null,
+      };
     } catch (e) {
       // 退一步：老形态链接直接从整串里按序抠 uuid
       const pid = projectId ?? uuidFrom(url, 0);
@@ -3131,7 +3170,7 @@ export async function downloadSlices(args = {}) {
   const picked = await pickAccount({ ...args, projectId: target.projectId, imageId: target.imageId, teamId: target.teamId });
   const acct = picked.alias;
   const { detail, tree } = await fetchDesignTree(target.projectId, target.imageId, {
-    cookie, account: acct, version: args.version, teamId: target.teamId, pageId: args.pageId,
+    cookie, account: acct, version: args.version, urlVersionId: target.versionId, teamId: target.teamId, pageId: args.pageId,
   });
   const urls = [...new Set((tree.assets ?? []).filter((u) => typeof u === 'string'))];
 
@@ -3240,7 +3279,7 @@ export async function downloadSlices(args = {}) {
     /** 含半透明切图清单（文件 + alpha 范围）—— 给程序化消费用 */
     translucent: translucent.map((f) => ({ file: f.file, alphaRange: f.alphaRange })),
     /** 版本透明度（B1）：切图也要能追溯"这是哪一版导出的" */
-    version: { id: detail.versionId ?? null, requested: detail.versionRequested ?? 'latest', isLatest: detail.versionIsLatest ?? null, count: detail.versionCount ?? null },
+    version: { id: detail.versionId ?? null, requested: detail.versionRequested ?? 'latest', isLatest: detail.versionIsLatest ?? null, count: detail.versionCount ?? null, fromUrl: detail.versionFromUrl ?? false, urlVersionIgnored: detail.urlVersionIgnored ?? null },
     /** B3 判据的输入：设计稿自带的切图倍率与本次目标倍率 */
     sliceScale,
     targetDpr,
