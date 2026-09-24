@@ -65,13 +65,23 @@ group('① 工具速查块');
 /* ═══════════════ ② docs 链接与孤立文件 ═══════════════ */
 group('② docs 链接');
 {
+  // ⚠️ **相对路径与 GitHub 绝对链接都要查**。README 里的文档链接改成了 GitHub 绝对地址
+  //    （因为 npm 页面上相对链接会 404），若这里只查相对路径，剩下的就没几条了 ——
+  //    这条断言会退化成**空跑（假绿）**。所以把绝对链接也映射回仓库相对路径来验存在性。
+  const REPO_URL = 'https://github.com/LoktLin/dsh-lanhu/blob/main/';
   const links = [...readme.matchAll(/\]\(([^)\s]+)\)/g)]
-    .map((m) => m[1])
-    .filter((t) => !/^https?:|^#|^mailto:/.test(t))
-    .map((t) => t.split('#')[0])
+    .map((m) => m[1].split('#')[0])
+    .filter((t) => t && !/^#|^mailto:/.test(t))
+    .map((t) => {
+      if (t.startsWith(REPO_URL)) return t.slice(REPO_URL.length);        // 绝对 → 仓库相对
+      if (/^https?:/.test(t)) return null;                                 // 外链不查
+      return t;                                                            // 本来就是相对
+    })
     .filter(Boolean);
-  const dead = [...new Set(links)].filter((t) => !exists(t));
-  ok('README 里的相对链接都存在', dead.length === 0, dead.join(', '));
+  const uniqLinks = [...new Set(links)];
+  const dead = uniqLinks.filter((t) => !exists(t));
+  ok('README 的链接都指向真实存在的文件（相对 + GitHub 绝对）', dead.length === 0, dead.join(', '));
+  ok('确实检查到了链接（不是空跑）', uniqLinks.length >= 10, `检查了 ${uniqLinks.length} 条`);
 
   const docsDir = path.join(ROOT, 'docs');
   const docs = fs.existsSync(docsDir)

@@ -16,7 +16,7 @@
 > **没有它**：AI 写页面前只能看设计稿**截图**，色值和字号靠视觉估算（OCR 小字经常错）。
 > **有了它**：设计稿的真实数值直接进上下文 —— 等于把「设计标注」喂给模型；还能反过来拿它**自动验收**页面还原度。
 
-**版本 `0.4.2`**（见 [CHANGELOG](CHANGELOG.md)） · MIT
+**版本 `0.4.3`**（见 [CHANGELOG](https://github.com/LoktLin/dsh-lanhu/blob/main/CHANGELOG.md)） · MIT
 适用于 [DeepSeek Harness](https://github.com/deepseek-ai)（DSH）Web GUI，需要 **Node ≥ 20**。自带 15 个原生工具 + 侧边面板 + CLI。
 
 > ⚠️ **免责与数据说明**
@@ -63,7 +63,7 @@
 > 也欢迎**直接提 PR**。判断标准只有一条：**它有没有让 AI 更准、返工更少**。
 > 不为人类美观加东西，也不为"功能齐全"加东西 —— **加一个没人调用的工具，就是让模型在选择上多花一次 token。**
 >
-> 已知的欠账与空缺都写在 [`.github/release-notes/README.md`](.github/release-notes/README.md) 的「已知空缺」里，
+> 已知的欠账与空缺都写在 [`.github/release-notes/README.md`](https://github.com/LoktLin/dsh-lanhu/blob/main/.github/release-notes/README.md) 的「已知空缺」里，
 > 不用你替我们重新发现一遍。
 
 ## 30 秒上手（**不用读完全文**）
@@ -82,14 +82,14 @@
 > 那是**产品文档（Axure 原型）**，不是设计稿；设计稿的色值字号仍走 `lanhu_read_design` / `lanhu_read_blocks`。先列文档用 `lanhu_list_product_documents`。
 >
 > **原型里也有样式值**：加 `"format":"layers"` 就能拿到该页的色值 / 字号 / 坐标 / 描边 / 渐变（**与设计稿同一张块级表**）——
-> 没有设计稿、只有原型的项目靠这个。⚠️ 原型样式是设计者随手填的，**有设计稿时以设计稿为准**；详见 [docs/原型样式.md](docs/原型样式.md)。
+> 没有设计稿、只有原型的项目靠这个。⚠️ 原型样式是设计者随手填的，**有设计稿时以设计稿为准**；详见 [docs/原型样式.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/原型样式.md)。
 
 **四条铁律**（先记住，能省掉大部分返工；每条的具体做法在对应 `docs/` 里，**这里只留一句，细节不复制**）：
 
 1. **色值 / 字号 / 圆角一律照抄设计稿数值** —— 插件给的是真实值，**不许目测估**（视觉估算正是它存在的理由）。
-2. **接稿先扫三列**：「不透明」「字体」「行高·字距」，并确认渐变是完整的（带 `→`）—— 详见 [docs/读稿.md](docs/读稿.md)。
-3. **换算基准显式写进样式注释头**（设计稿 375 → 750rpx？1920 → 实际屏宽？），别让每个人心里各有一套 —— 详见 [docs/CLI与开发.md](docs/CLI与开发.md)。
-4. **素材有问题当场提出来，别默默绕**；切图带 alpha 时**不要直接转 JPG** —— 详见 [docs/验收.md](docs/验收.md)。
+2. **接稿先扫三列**：「不透明」「字体」「行高·字距」，并确认渐变是完整的（带 `→`）—— 详见 [docs/读稿.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/读稿.md)。
+3. **换算基准显式写进样式注释头**（设计稿 375 → 750rpx？1920 → 实际屏宽？），别让每个人心里各有一套 —— 详见 [docs/CLI与开发.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/CLI与开发.md)。
+4. **素材有问题当场提出来，别默默绕**；切图带 alpha 时**不要直接转 JPG** —— 详见 [docs/验收.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/验收.md)。
 
 ---
 
@@ -359,13 +359,13 @@ cd <plugin-dir> && npm i puppeteer-core   # 只装这一个（它是 optional �
 
 | 你手上在做的事 | 读哪个文件 |
 |---|---|
-| 读设计稿 / 抠某个区域 / 把坐标搬进自己的坐标系 | [docs/读稿.md](docs/读稿.md) |
-| 读**产品文档 / 原型（PRD）** / 原型和设计稿分不清 | [docs/产品文档.md](docs/产品文档.md) |
-| **项目没有设计稿、只有原型**，要照着它实现 | [docs/原型样式.md](docs/原型样式.md) |
-| 还原完要验收 / 导出切图 | [docs/验收.md](docs/验收.md) |
-| 用侧边面板 / 配多账号 / Cookie 失效了 | [docs/面板与账号.md](docs/面板与账号.md) |
-| 用命令行 / 跑自检 / 踩到限制 | [docs/CLI与开发.md](docs/CLI与开发.md) |
-| 这一版改了什么 | [CHANGELOG.md](CHANGELOG.md) · [最新发布说明（v0.2.1）](.github/release-notes/v0.2.1.md) |
+| 读设计稿 / 抠某个区域 / 把坐标搬进自己的坐标系 | [docs/读稿.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/读稿.md) |
+| 读**产品文档 / 原型（PRD）** / 原型和设计稿分不清 | [docs/产品文档.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/产品文档.md) |
+| **项目没有设计稿、只有原型**，要照着它实现 | [docs/原型样式.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/原型样式.md) |
+| 还原完要验收 / 导出切图 | [docs/验收.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/验收.md) |
+| 用侧边面板 / 配多账号 / Cookie 失效了 | [docs/面板与账号.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/面板与账号.md) |
+| 用命令行 / 跑自检 / 踩到限制 | [docs/CLI与开发.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/CLI与开发.md) |
+| 这一版改了什么 | [CHANGELOG.md](https://github.com/LoktLin/dsh-lanhu/blob/main/CHANGELOG.md) · [最新发布说明（v0.2.1）](https://github.com/LoktLin/dsh-lanhu/blob/main/.github/release-notes/v0.2.1.md) |
 
 ---
 
@@ -398,7 +398,7 @@ cd <plugin-dir> && npm i puppeteer-core   # 只装这一个（它是 optional �
 > **Reading requirements / prototypes (PRD)?** `lanhu_read_product_doc {"url":"<prototype link>"}` gives the page tree and
 > the body text of one page. It is a **product document (Axure prototype), not a design**. Add `"format":"layers"` for that
 > page's style values (colours / font sizes / coordinates) — the only route when a project has **no design artboards**.
-> Prototype styles are typed in by hand by the designer, so **a design always wins when one exists**. See [docs/原型样式.md](docs/原型样式.md).
+> Prototype styles are typed in by hand by the designer, so **a design always wins when one exists**. See [docs/原型样式.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/原型样式.md).
 
 **The 15 tools, one line each**
 
@@ -438,4 +438,4 @@ cd <plugin-dir> && npm i puppeteer-core   # 只装这一个（它是 optional �
 
 ## License
 
-[MIT](LICENSE) © 2026 LoktLin
+[MIT](https://github.com/LoktLin/dsh-lanhu/blob/main/LICENSE) © 2026 LoktLin
