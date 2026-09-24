@@ -1170,28 +1170,32 @@ export function parseRfc2822(value) {
 /**
  * 解析**产品文档/原型**链接。
  *
- * 为什么不复用 `parseLanhuUrl`：那个函数**强制要求 `image_id`**（设计稿详情页才有），
- * 而原型页链接形如 `#/item/project/product?...&docId=…&docType=axure&pageId=…`，
- * 可能一个 `image_id` 都没有。硬套会让"原型链接"直接报"没找到设计稿 id"。
+ * ⚠️ **URL 解析的分工（两层）—— 先在这里选对入口，别乱试：**
+ *
+ * ```
+ * 底层（宽容，只抽参数不校验）：lanhuUrlParams(raw) → { params, pick }
+ *   ↑ 由下面**三个语义入口**共用；**新增解析一律复用它**，不要再抄一遍抽取循环
+ *
+ * 上层（按"你要什么"选，各自负责校验与报错）：
+ *   parseLanhuUrl(url)      → 要**某一张设计稿**：**必须有 image_id**，没有就抛错
+ *                             （也接受 2~3 个裸 uuid：projectId imageId [teamId]）
+ *   parseProjectTarget(url) → 要**某个项目**（列出该项目全部设计稿）：**不要求 image_id**
+ *                             （项目页/列表页链接本来就没有它）
+ *   parseProductUrl(url)    → 要**一份产品文档/原型**：认 docId / pageId / versionId
+ *                             （原型链接形如 `#/item/project/product?...&docId=…&docType=axure`）
+ *
+ * 胶水层：resolveTarget({ projectId, imageId, url }) —— 只做"显式 id 优先，否则解析 url"，
+ *         给 read/blocks/slices 这类"可能给 id 也可能给链接"的入口用。
+ * ```
+ *
+ * **别用 `parseLanhuUrl` 干前两者之外的事**：它面向"单张稿"，硬套到项目页/原型页会报
+ * "没找到设计稿 id"（实测踩过）。自检里有一条**反向断言**专门守着它"必须继续要求 image_id"。
  */
 export function parseProductUrl(input) {
   const raw = String(input ?? '').trim();
   if (!raw) throw new LanhuError('请粘贴一个蓝湖产品文档（原型）链接，形如 https://lanhuapp.com/web/#/item/project/product?tid=…&pid=…&docId=…');
-  const params = new Map();
-  const chunks = [raw];
-  const hashIdx = raw.indexOf('#');
-  if (hashIdx >= 0) chunks.push(raw.slice(hashIdx + 1));
-  const qIdx = raw.indexOf('?');
-  if (qIdx >= 0) chunks.push(raw.slice(qIdx + 1));
-  for (const chunk of chunks) {
-    const q = chunk.includes('?') ? chunk.slice(chunk.indexOf('?') + 1) : chunk;
-    for (const m of q.matchAll(/([A-Za-z_][A-Za-z0-9_]*)=([^&#\s]*)/g)) {
-      if (!params.has(m[1])) {
-        try { params.set(m[1], decodeURIComponent(m[2])); } catch { params.set(m[1], m[2]); }
-      }
-    }
-  }
-  const pick = (...keys) => { for (const k of keys) { const v = params.get(k); if (v) return v; } return null; };
+  // 参数抽取走**共享底层** `lanhuUrlParams` —— 这里以前抄了一份逐行相同的循环（真重复）。
+  const { pick } = lanhuUrlParams(raw);
   const uuid = (v) => (v && UUID_RE.test(v) ? v : null);
   const teamId = uuid(pick('tid', 'team_id', 'teamId'));
   const projectId = uuid(pick('project_id', 'projectId', 'pid'));
@@ -1254,6 +1258,24 @@ export async function multiInfo(projectId, teamId, opts = {}) {
     memberCount: raw.member_cnt ?? null,
     scale: raw.scale ?? null,
   };
+}
+
+/**
+ * 取"项目信息"（名称 / 文件夹 / 创建者）—— **失败降级，但留痕**。
+ *
+ * 项目信息是**锦上添花**：取不到不该让整次调用失败（它只影响输出里一行「项目：…」）。
+ * 但也**不许静默** —— 调用方必须能分清"这个项目真没有名字"和"我们没取到"。
+ * 所以返回 `{ info, error }`：`info` 为 null 时 `error` 一定有值（短原因，可直接打进人读文本）。
+ *
+ * ⚠️ 以前这里是 `multiInfo(...).catch(() => null)` —— 输出只是**少一行**，
+ * 看不出是"真没有"还是"取失败"，与本项目"不静默"的原则不符。
+ */
+export async function tryProjectInfo(projectId, teamId, opts = {}) {
+  try {
+    return { info: await multiInfo(projectId, teamId, opts), error: null };
+  } catch (e) {
+    return { info: null, error: String(e?.message ?? e).slice(0, 120) || '未知原因' };
+  }
 }
 
 /**
@@ -2072,6 +2094,149 @@ export function axureFontFamily(fontName) {
 }
 
 /**
+ * **归一化一个 Axure 控件**（纯函数）—— 把 `data.js` 的原始节点算成与设计稿同构的字段。
+ *
+ * 拆出来的理由：这段占 `normalizeAxurePage` 的大半，而且**全是纯计算**
+ * （坐标累加、颜色 role 归类、字体、描边、圆角、内边距），与"怎么遍历、层级怎么传"无关。
+ * 单独放一个函数：能单独读懂、能单独测，改颜色规则时不必在 290 行里找。
+ *
+ * **不做的事**（留在 `normalizeAxurePage`）：遍历子层、维护 origin/depth/继承的可见性与透明度、
+ * 生成路径 `path`。这里只回答"**这一个节点**长什么样"。
+ *
+ * @param {object} o `data.js` 里的一个控件节点
+ * @param {object} ctx `{ scriptIds, byScriptId, origin, parentPath, depth, inheritedOpacity, inheritedVisible, parentBox, panelState, containerKind }`
+ */
+function axureNodeFields(o, ctx) {
+  const { scriptIds, byScriptId, origin, parentPath, depth, inheritedOpacity, inheritedVisible, parentBox, panelState, containerKind } = ctx;
+  const st = o.style ?? {};
+  const loc = st.location && typeof st.location === 'object' ? st.location : null;
+  const size = st.size && typeof st.size === 'object' ? st.size : null;
+  const rx = loc ? round2(Number(loc.x) || 0) : null;
+  const ry = loc ? round2(Number(loc.y) || 0) : null;
+  const w = size ? axureNumber(size.width) : null;
+  const h = size ? axureNumber(size.height) : null;
+  const x = rx === null ? null : round2(origin.x + rx);
+  const y = ry === null ? null : round2(origin.y + ry);
+
+  const name = (typeof o.label === 'string' && o.label.trim()) ? o.label.trim() : (o.friendlyType ?? o.type ?? '');
+  const path = parentPath ? `${parentPath}/${name}` : name;
+  const ownOpacity = axureNumber(st.opacity);
+  const effectiveOpacity = round2((ownOpacity === null ? 1 : ownOpacity) * inheritedOpacity);
+  const visible = o.visible !== false && inheritedVisible;
+
+  // 文本锚点先取好：颜色与字体都要用它
+  const sid = scriptIds.get(o.id) ?? null;
+
+  // 颜色：填充 / 描边 / 文字色 / 渐变 —— 与设计稿同构（`role` 决定下游怎么归类）
+  const colors = [];
+  const fillC = axureFillColor(st.fill);
+  if (fillC && fillC.a > 0) colors.push({ ...fillC, role: 'fill' });
+  const borderC = axureFillColor(st.borderFill);
+  if (borderC && borderC.a > 0) colors.push({ ...borderC, role: 'border' });
+  const fgC = axureFillColor(st.foreGroundFill);
+  if (fgC && fgC.a > 0) colors.push({ ...fgC, role: 'text' });
+  colors.push(...axureGradientColors(st));
+
+  // 文本：靠 `widgetId → u###` 去 HTML 里取（data.js 里的 label 是空的）
+  const text = (sid ? byScriptId.get(sid) : null) ?? (typeof o.label === 'string' && o.label.trim() ? o.label.trim() : null);
+
+  /**
+   * 字体。
+   *
+   * ⚠️ **为什么会有 `size: null`**：实测 144 个有文本的层里，**60 个在导出里就没有字号**
+   *    （`style.fontSize` 缺席，只有一个 `baseStyle` 哈希，而那个哈希在整个 data.js 里
+   *    **从不当对象键** —— 文档里根本没有样式表，基础样式留在了原始 .rp 里）。
+   *
+   *    去外链 CSS 找过，**找不到**：`files/<页>/styles.css` 里那 251 条 `#uNNN{font-size}`
+   *    经比对**全部**落在"本来就有字号"的控件上（即那份 CSS 是从 data.js **生成**的，不带新信息）；
+   *    `data/styles.css` 只能给出 `.ax_default{13px}` 这种**通用兜底** —— 把它当成设计者填的值
+   *    就是编造。所以这里**留 null**，渲染成 `?`，宁缺勿错。
+   */
+  const fontSize = axureNumber(st.fontSize);
+  const fontWeight = axureNumber(st.fontWeight);
+  const lineHeight = axureNumber(st.lineSpacing);
+  const fontName = st.fontName ?? null;
+  const font = (fontName || fontSize !== null) ? {
+    family: axureFontFamily(fontName),
+    fontStack: fontName ? String(fontName) : null,
+    size: fontSize,
+    weight: fontWeight,
+    align: st.horizontalAlignment ?? null,
+    lineHeight,
+    letterSpacing: null,
+  } : null;
+
+  const cr = axureNumber(st.cornerRadius);
+  const radius = cr && cr > 0 ? { corners: [cr, cr, cr, cr], max: cr } : null;
+
+  const bw = axureNumber(st.borderWidth);
+  let border;
+  if (bw && bw > 0) {
+    border = {
+      color: borderC ? rgbHex(borderC) : null,
+      alpha: borderC ? round2(borderC.a) : null,
+      colorKnown: Boolean(borderC),
+      widths: { top: bw, right: bw, bottom: bw, left: bw },
+      width: bw,
+      sides: ['top', 'right', 'bottom', 'left'],
+      single: null,
+    };
+  }
+
+  // 内边距：Axure 的 `location` **本来就是相对父容器**的，比设计稿那条链更直接
+  const inset = parentBox ? {
+    left: rx,
+    top: ry,
+    right: (w === null || parentBox.w === null) ? null : round2(parentBox.w - (rx ?? 0) - w),
+    bottom: (h === null || parentBox.h === null) ? null : round2(parentBox.h - (ry ?? 0) - h),
+  } : null;
+
+  const imgKeys = Object.keys(o.images ?? {}).filter((k) => !k.endsWith('-isGeneratedImage'));
+  const layer = {
+    id: o.id ?? null,
+    type: o.type ?? null,
+    name,
+    parentPath,
+    depth,
+    x,
+    y,
+    w,
+    h,
+    inset,
+    visible,
+    opacity: ownOpacity === null ? 1 : ownOpacity,
+    effectiveOpacity,
+    shape: o.friendlyType ?? null,
+    radius,
+    border,
+    colors,
+    text,
+    font,
+    hasImage: imgKeys.length > 0,
+    /**
+     * ⚠️ **Axure 与 Figma 的一个真语义差异**：Figma 里文字节点的 `fills` **就是文字色**，
+     *    所以 `buildBlocks` 对"有文字的层"会把 fill 置 null（否则会把文字色当底色）。
+     *    但 Axure 的 `fill`（背景）与 `foreGroundFill`（文字色）是**两个独立字段** ——
+     *    同一个文本控件**可以真的有背景**（实测「需求说明」那个文本域带 `#facd91@6%` 底色，
+     *    若照 Figma 的规则抹掉，背景就整块丢了）。
+     *    这个标记让下游知道："本层的 `role:'fill'` 是真背景，别抹"。
+     */
+    fillIsBackground: true,
+    /** 动态面板的**状态名**（不在面板里就是 null）。这些层是**互斥的备选状态**，不是同时显示的层。 */
+    panelState: panelState ? panelState.label : null,
+    /** 所属动态面板的控件 id（便于把同一面板的状态归组） */
+    panelOf: panelState ? panelState.panelId : null,
+    /** 子层挂在哪种容器下：`repeater`（中继器模板）/ `table`（表格单元格）等；普通层为 null */
+    containerKind,
+    /** 原型专有：Axure 的友好类型（形状/矩形/椭圆/星星/线段/组合）与 HTML 锚点 */
+    friendlyType: o.friendlyType ?? null,
+    scriptId: sid,
+  };
+  return layer;
+}
+
+
+/**
  * 把一份原型页面的控件树规范化成**与设计稿同形状**的图层数组。
  *
  * 形状与 `flattenArtboard` 的产物一致（`x/y/w/h` 绝对、`inset` 相对父、
@@ -2123,130 +2288,15 @@ export function normalizeAxurePage({ document: doc, html, pageUrl = null } = {})
 
   const walk = (arr, parentPath, depth, origin, inheritedOpacity, inheritedVisible, parentBox, panelState = null, containerKind = null) => {
     for (const o of arr ?? []) {
-      const st = o.style ?? {};
-      const loc = st.location && typeof st.location === 'object' ? st.location : null;
-      const size = st.size && typeof st.size === 'object' ? st.size : null;
-      const rx = loc ? round2(Number(loc.x) || 0) : null;
-      const ry = loc ? round2(Number(loc.y) || 0) : null;
-      const w = size ? axureNumber(size.width) : null;
-      const h = size ? axureNumber(size.height) : null;
-      const x = rx === null ? null : round2(origin.x + rx);
-      const y = ry === null ? null : round2(origin.y + ry);
+    const layer = axureNodeFields(o, {
+      scriptIds, byScriptId, origin, parentPath, depth,
+      inheritedOpacity, inheritedVisible, parentBox, panelState, containerKind,
+    });
+    // 递归要用到这几个：从 layer 上取（它们已经是算好的绝对值）
+    const { x, y, w, h, effectiveOpacity, visible } = layer;
+    const name = layer.name;
+    const path = parentPath ? `${parentPath}/${name}` : name;
 
-      const name = (typeof o.label === 'string' && o.label.trim()) ? o.label.trim() : (o.friendlyType ?? o.type ?? '');
-      const path = parentPath ? `${parentPath}/${name}` : name;
-      const ownOpacity = axureNumber(st.opacity);
-      const effectiveOpacity = round2((ownOpacity === null ? 1 : ownOpacity) * inheritedOpacity);
-      const visible = o.visible !== false && inheritedVisible;
-
-      // 文本锚点先取好：颜色与字体都要用它
-      const sid = scriptIds.get(o.id) ?? null;
-
-      // 颜色：填充 / 描边 / 文字色 / 渐变 —— 与设计稿同构（`role` 决定下游怎么归类）
-      const colors = [];
-      const fillC = axureFillColor(st.fill);
-      if (fillC && fillC.a > 0) colors.push({ ...fillC, role: 'fill' });
-      const borderC = axureFillColor(st.borderFill);
-      if (borderC && borderC.a > 0) colors.push({ ...borderC, role: 'border' });
-      const fgC = axureFillColor(st.foreGroundFill);
-      if (fgC && fgC.a > 0) colors.push({ ...fgC, role: 'text' });
-      colors.push(...axureGradientColors(st));
-
-      // 文本：靠 `widgetId → u###` 去 HTML 里取（data.js 里的 label 是空的）
-      const text = (sid ? byScriptId.get(sid) : null) ?? (typeof o.label === 'string' && o.label.trim() ? o.label.trim() : null);
-
-      /**
-       * 字体。
-       *
-       * ⚠️ **为什么会有 `size: null`**：实测 144 个有文本的层里，**60 个在导出里就没有字号**
-       *    （`style.fontSize` 缺席，只有一个 `baseStyle` 哈希，而那个哈希在整个 data.js 里
-       *    **从不当对象键** —— 文档里根本没有样式表，基础样式留在了原始 .rp 里）。
-       *
-       *    去外链 CSS 找过，**找不到**：`files/<页>/styles.css` 里那 251 条 `#uNNN{font-size}`
-       *    经比对**全部**落在"本来就有字号"的控件上（即那份 CSS 是从 data.js **生成**的，不带新信息）；
-       *    `data/styles.css` 只能给出 `.ax_default{13px}` 这种**通用兜底** —— 把它当成设计者填的值
-       *    就是编造。所以这里**留 null**，渲染成 `?`，宁缺勿错。
-       */
-      const fontSize = axureNumber(st.fontSize);
-      const fontWeight = axureNumber(st.fontWeight);
-      const lineHeight = axureNumber(st.lineSpacing);
-      const fontName = st.fontName ?? null;
-      const font = (fontName || fontSize !== null) ? {
-        family: axureFontFamily(fontName),
-        fontStack: fontName ? String(fontName) : null,
-        size: fontSize,
-        weight: fontWeight,
-        align: st.horizontalAlignment ?? null,
-        lineHeight,
-        letterSpacing: null,
-      } : null;
-
-      const cr = axureNumber(st.cornerRadius);
-      const radius = cr && cr > 0 ? { corners: [cr, cr, cr, cr], max: cr } : null;
-
-      const bw = axureNumber(st.borderWidth);
-      let border;
-      if (bw && bw > 0) {
-        border = {
-          color: borderC ? rgbHex(borderC) : null,
-          alpha: borderC ? round2(borderC.a) : null,
-          colorKnown: Boolean(borderC),
-          widths: { top: bw, right: bw, bottom: bw, left: bw },
-          width: bw,
-          sides: ['top', 'right', 'bottom', 'left'],
-          single: null,
-        };
-      }
-
-      // 内边距：Axure 的 `location` **本来就是相对父容器**的，比设计稿那条链更直接
-      const inset = parentBox ? {
-        left: rx,
-        top: ry,
-        right: (w === null || parentBox.w === null) ? null : round2(parentBox.w - (rx ?? 0) - w),
-        bottom: (h === null || parentBox.h === null) ? null : round2(parentBox.h - (ry ?? 0) - h),
-      } : null;
-
-      const imgKeys = Object.keys(o.images ?? {}).filter((k) => !k.endsWith('-isGeneratedImage'));
-      const layer = {
-        id: o.id ?? null,
-        type: o.type ?? null,
-        name,
-        parentPath,
-        depth,
-        x,
-        y,
-        w,
-        h,
-        inset,
-        visible,
-        opacity: ownOpacity === null ? 1 : ownOpacity,
-        effectiveOpacity,
-        shape: o.friendlyType ?? null,
-        radius,
-        border,
-        colors,
-        text,
-        font,
-        hasImage: imgKeys.length > 0,
-        /**
-         * ⚠️ **Axure 与 Figma 的一个真语义差异**：Figma 里文字节点的 `fills` **就是文字色**，
-         *    所以 `buildBlocks` 对"有文字的层"会把 fill 置 null（否则会把文字色当底色）。
-         *    但 Axure 的 `fill`（背景）与 `foreGroundFill`（文字色）是**两个独立字段** ——
-         *    同一个文本控件**可以真的有背景**（实测「需求说明」那个文本域带 `#facd91@6%` 底色，
-         *    若照 Figma 的规则抹掉，背景就整块丢了）。
-         *    这个标记让下游知道："本层的 `role:'fill'` 是真背景，别抹"。
-         */
-        fillIsBackground: true,
-        /** 动态面板的**状态名**（不在面板里就是 null）。这些层是**互斥的备选状态**，不是同时显示的层。 */
-        panelState: panelState ? panelState.label : null,
-        /** 所属动态面板的控件 id（便于把同一面板的状态归组） */
-        panelOf: panelState ? panelState.panelId : null,
-        /** 子层挂在哪种容器下：`repeater`（中继器模板）/ `table`（表格单元格）等；普通层为 null */
-        containerKind,
-        /** 原型专有：Axure 的友好类型（形状/矩形/椭圆/星星/线段/组合）与 HTML 锚点 */
-        friendlyType: o.friendlyType ?? null,
-        scriptId: sid,
-      };
       layers.push(layer);
       const childOrigin = { x: x ?? origin.x, y: y ?? origin.y };
       const childBox = { w, h };
@@ -2298,9 +2348,10 @@ export function normalizeAxurePage({ document: doc, html, pageUrl = null } = {})
           x, y, w, h,
           /** ⚠️ 几何取自**所属面板**（容器自己没有 location/size）—— 标出来，别让人以为这是它的坐标 */
           geometryFromParent: true,
-          inset,
+          // 几何与不透明度都取自**所属面板那一层**（状态容器自己没有 location/size/opacity）
+          inset: layer.inset,
           visible,
-          opacity: ownOpacity === null ? 1 : ownOpacity,
+          opacity: layer.opacity,
           effectiveOpacity,
           shape: '状态容器',
           radius: dgCr && dgCr > 0 ? { corners: [dgCr, dgCr, dgCr, dgCr], max: dgCr } : null,
@@ -2378,6 +2429,7 @@ export function renderProductLayers(result, opts = {}) {
   L.push('> ⚠️ 这是 **Axure 原型**里的样式值，**不是设计稿** —— 颜色/字号是设计者随手填的，');
   L.push('> 可以照着实现，但**最终视觉以 UI 设计稿为准**（有设计稿时用 lanhu_read_design / lanhu_read_blocks）。');
   if (result.project) L.push(`> 项目：${result.project.name ?? '—'}${result.project.folderName ? `（${result.project.folderName}）` : ''}`);
+  else if (result.projectInfoError) L.push(`> ⚠️ 项目信息未取到（${result.projectInfoError}）—— 不影响下面的结果`);
   L.push(`> 版本：${result.version?.id ?? '—'}${result.version?.isLatest === false ? `（**不是最新版**，最新 ${result.version.latestId}）` : '（最新版）'}`);
   for (const p of result.content ?? []) {
     L.push('');
@@ -2466,6 +2518,7 @@ export function renderProductDoc(result) {
   L.push(`# 产品文档（原型）${result.doc?.name ? ` —— ${result.doc.name}` : ''}`);
   L.push('> ⚠️ 这是**产品文档 / 原型（Axure）**，回答"业务规则、字段、跳转"；**不是设计稿**（色值/字号/圆角请用 lanhu_read_design）。');
   if (result.project) L.push(`> 项目：${result.project.name ?? '—'}${result.project.folderName ? `（${result.project.folderName}）` : ''}${result.project.creatorName ? ` · 创建者 ${result.project.creatorName}` : ''}`);
+  else if (result.projectInfoError) L.push(`> ⚠️ 项目信息未取到（${result.projectInfoError}）—— 不影响下面的结果`);
   L.push(`> 版本：${result.version?.id ?? '—'}${result.version?.isLatest === false ? `（**不是最新版**，最新 ${result.version.latestId}）` : '（最新版）'} · 共 ${result.version?.count ?? '?'} 个版本`);
   L.push('');
   L.push(`## 页面树（${result.pageCount} 个节点，${result.wireframeCount} 个可读页）`);
@@ -2519,7 +2572,8 @@ export async function readProductDoc(args = {}) {
   const ao = { cookie, account: acct };
 
   const listed = await productDocuments(projectId, teamIdIn, ao);
-  const project = await multiInfo(projectId, teamIdIn, ao).catch(() => null);
+  const pi = await tryProjectInfo(projectId, teamIdIn, ao);
+  const project = pi.info;
   if (listed.axureDocs.length === 0) {
     throw new LanhuError(`项目 ${projectId} 下没有 axure 原型文档（共 ${listed.total} 个其它类型资源）。`, {
       code: 'DOC_NOT_FOUND',
@@ -2572,6 +2626,8 @@ export async function readProductDoc(args = {}) {
   };
   const result = {
     project,
+    // 项目信息没取到时的**原因**（取到了就是 null）—— 见 tryProjectInfo
+    projectInfoError: pi.error,
     doc,
     docCount: listed.axureDocs.length,
     version: versionInfo,
@@ -3657,9 +3713,8 @@ export async function readBlocks(args = {}) {
   };
 }
 
-/** 支持直接给蓝湖链接：可含 image_id / pid / project_id 等参数。 */
 /**
- * 解析「要读哪张稿」。
+ * 解析「要读哪张稿」—— **胶水层**：显式 id 优先，否则解析 url。
  *
  * ⚠️ 这里踩过一个坑：蓝湖详情页是 **hash 路由**，参数在 `#` 之后的 query 里
  *    （`…#/item/project/detailDetach?tid=…&pid=…&image_id=…`），
@@ -4277,9 +4332,6 @@ export const BROWSER_INSTALL_HINT = isLegacyMac()
   : 'npm i -D puppeteer-core   # 推荐：直接驱动系统 Chrome，不下载浏览器\n'
     + '或 npm i -g playwright && npx playwright install chromium\n'
     + '（playwright 包与 chromium 二进制是两件事：装了包仍可能因为没装浏览器而启动失败）';
-
-/** 兼容旧名。 */
-export const PW_INSTALL_HINT = BROWSER_INSTALL_HINT;
 
 export const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -4926,23 +4978,9 @@ function toTarget(px, target, opts = {}) {
   return `${v}px`;
 }
 
-/**
- * 单块的六项属性判定（方案 §1.3）。
- * 四态：✅ 完全匹配 ｜ 🟡 容差内 ｜ ❌ 不匹配 ｜ ⚪ 无法比对
- */
-export function compareBlockProps(block, el, opts = {}) {
-  const scale = Number(opts.scale) || 1;
-  const tol = { ...BLOCK_TOLERANCE, ...(opts.tolerance ?? {}) };
-  const target = opts.target ?? 'h5';
-  const rows = [];
-  const add = (field, expected, actual, verdict, suggestion, extra = {}) =>
-    rows.push({ field, expected, actual, verdict, suggestion: suggestion ?? '', ...extra });
-
-  if (!el) {
-    add('(映射)', '—', '页面上没找到对应元素', '⚪', '给元素加 data-lanhu="' + (block.name ?? '') + '"，或确认它真的渲染出来了');
-    return rows;
-  }
-
+/** ① 圆角（含"胶囊 vs 全圆"的视觉等价判定）。`ctx = { scale, tol, target, add, rows }`（由 compareBlockProps 组装）。 */
+function cmpRadius(block, el, ctx) {
+  const { scale, tol, target, add, rows, opts } = ctx;
   // ① 圆角
   if (block.radius) {
     const exp = block.radius.max * scale;
@@ -4968,6 +5006,12 @@ export function compareBlockProps(block, el, opts = {}) {
       verdict, suggestion);
   }
 
+}
+
+
+/** ② 大小 w×h（文本块用更宽的容差）。`ctx = { scale, tol, target, add, rows }`（由 compareBlockProps 组装）。 */
+function cmpSize(block, el, ctx) {
+  const { scale, tol, target, add, rows, opts } = ctx;
   // ② 大小 w×h
   const expW = block.w * scale;
   const expH = block.h * scale;
@@ -4996,6 +5040,12 @@ export function compareBlockProps(block, el, opts = {}) {
     add('大小', `${Math.round(expW)}×${Math.round(expH)}`, `${Math.round(el.w)}×${Math.round(el.h)}`, verdict, hint);
   }
 
+}
+
+
+/** ③ 文字色。`ctx = { scale, tol, target, add, rows }`（由 compareBlockProps 组装）。 */
+function cmpTextColor(block, el, ctx) {
+  const { scale, tol, target, add, rows, opts } = ctx;
   // ③ 文字色
   if (block.color) {
     const exp = parseColor(block.color);
@@ -5010,6 +5060,12 @@ export function compareBlockProps(block, el, opts = {}) {
     }
   }
 
+}
+
+
+/** ④ 字号（字重随行输出）。`ctx = { scale, tol, target, add, rows }`（由 compareBlockProps 组装）。 */
+function cmpFontWeight(block, el, ctx) {
+  const { scale, tol, target, add, rows, opts } = ctx;
   // ④ 字号（字重随行输出）
   if (block.font && block.font.size) {
     const exp = block.font.size * scale;
@@ -5044,6 +5100,12 @@ export function compareBlockProps(block, el, opts = {}) {
     }
   }
 
+}
+
+
+/** ⑤ 有无底色。`ctx = { scale, tol, target, add, rows }`（由 compareBlockProps 组装）。 */
+function cmpFill(block, el, ctx) {
+  const { scale, tol, target, add, rows, opts } = ctx;
   // ⑤ 有无底色
   {
     const expBg = block.bg;
@@ -5063,6 +5125,12 @@ export function compareBlockProps(block, el, opts = {}) {
     }
   }
 
+}
+
+
+/** ⑥ 边框 / 分割线。`ctx = { scale, tol, target, add, rows }`（由 compareBlockProps 组装）。 */
+function cmpBorder(block, el, ctx) {
+  const { scale, tol, target, add, rows, opts } = ctx;
   // ⑥ 边框 / 分割线
   {
     const exp = block.border;
@@ -5099,8 +5167,37 @@ export function compareBlockProps(block, el, opts = {}) {
           : '');
     }
   }
+}
+
+
+/**
+ * **块级六项属性逐项比对** —— 编排器：只组装 ctx、依次调用比较器。
+ *
+ * 每个属性一个比较器（`cmpRadius` / `cmpSize` / …），**逐项独立**：
+ * 改"圆角怎么判"不必在 170 行里翻，也不会碰到别的属性。比较器都是纯函数（自检直接喂夹具）。
+ */
+export function compareBlockProps(block, el, opts = {}) {
+  const scale = Number(opts.scale) || 1;
+  const tol = { ...BLOCK_TOLERANCE, ...(opts.tolerance ?? {}) };
+  const target = opts.target ?? 'h5';
+  const rows = [];
+  const add = (field, expected, actual, verdict, suggestion, extra = {}) =>
+    rows.push({ field, expected, actual, verdict, suggestion: suggestion ?? '', ...extra });
+
+  if (!el) {
+    add('(映射)', '—', '页面上没找到对应元素', '⚪', '给元素加 data-lanhu="' + (block.name ?? '') + '"，或确认它真的渲染出来了');
+    return rows;
+  }
+  const ctx = { scale, tol, target, add, rows, opts };
+  cmpRadius(block, el, ctx);
+  cmpSize(block, el, ctx);
+  cmpTextColor(block, el, ctx);
+  cmpFontWeight(block, el, ctx);
+  cmpFill(block, el, ctx);
+  cmpBorder(block, el, ctx);
   return rows;
 }
+
 
 /** 四态汇总。 */
 function summarizeVerdicts(rows) {
@@ -5292,304 +5389,354 @@ function parseArgv(argv) {
 
 function printJson(v) { console.log(JSON.stringify(v, null, 2)); }
 
-export async function main(argv = process.argv.slice(2)) {
-  const args = parseArgv(argv);
-  const cmd = args._[0];
-  const cookie = typeof args.cookie === 'string' ? args.cookie : undefined;
+/* ==========================================================================
+ * CLI —— **命令表**
+ *
+ * `main` 只做三件事：解析参数 → 按名字取处理器 → 统一错误处理。
+ * 每个命令一个处理器（`cmdXxx`），输出**逐字节不变**（有 `/tmp/golden-capture.mjs` 的黄金输出兜着）。
+ * 处理器只管"取参 + 调核心函数 + 打印" —— **核心逻辑一律在文件上半部分**，
+ * 工具链（`lib/index.js`）调的是同一批函数，**两边不许各写一遍**（踩过：同一个空列 bug 出现两次）。
+ * 加命令 = 加一个 `cmdXxx` + 在 `CLI_COMMANDS` 里登记一行。
+ * ========================================================================== */
 
-  try {
-    switch (cmd) {
-      case 'auth': {
-        const r = await checkAuth({ cookie });
-        if (args.json) printJson(r);
-        else if (r.ok) {
-          console.log(`✅ 登录有效（来源：${r.cookieSource}）`);
-          console.log(`   Cookie：${r.cookieMasked}`);
-          if (r.expiry) console.log(`   过期：${r.expiry.expiresAt}（剩 ${r.expiry.daysLeft} 天）`);
-          for (const t of r.teams) console.log(`   团队 ${t.teamId}  ${t.name}  成员 ${t.memberNum}`);
-        } else {
-          console.error(`❌ ${r.error}`);
-          if (r.hint) console.error(`   ${r.hint}`);
-          process.exitCode = 1;
-        }
-        return r;
-      }
-      case 'teams': {
-        const r = await listTeams({ cookie });
-        if (args.json) printJson(r); else for (const t of r.teams) console.log(`${t.teamId}  ${t.name}  成员 ${t.memberNum}`);
-        return r;
-      }
-      case 'projects': {
-        const r = await listDirectory(args.team, { cookie });
-        if (args.json) printJson(r); else for (const p of r.projects) console.log(`${p.sourceId}  ${p.sourceName}`);
-        return r;
-      }
-      case 'designs': {
-        // 与工具链一致：**贴链接就行**；显式 --project 优先；都不给 → 明确报错（不静默给空表）
-        const target = args.url ? parseProjectTarget(args.url) : null;
-        const projectId = args.project ?? target?.projectId ?? null;
-        if (!projectId) throw new LanhuError('用法：node lanhu.mjs designs --url "<蓝湖链接>"，或 --project <pid>（两个都不给无法定位项目）');
-        const r = await listImages(projectId, { cookie });
-        if (args.json) printJson(r);
-        else {
-          console.log(`${r.projectName ?? r.projectId}：${r.images.length} 张稿`);
-          for (const i of r.images) console.log(`  ${i.imageId}  ${i.name}  ${i.width}×${i.height}`);
-        }
-        return r;
-      }
-      case 'sectors': {
-        const r = await listSectors(args.project, { cookie });
-        if (args.json) printJson(r); else console.log(r.sectors.length ? r.sectors.map((s) => `${s.id} ${s.name}`).join('\n') : '(无分组)');
-        return r;
-      }
-      case 'search': {
-        const r = await search(args.team, args.keyword, { cookie });
-        if (args.json) printJson(r);
-        else for (const i of r.images) console.log(`${i.imageId}  ${i.name}  @ ${i.projectName}  (${i.path})`);
-        return r;
-      }
-      case 'read': {
-        const r = await readDesign({
-          projectId: args.project, imageId: args.image, url: args.url,
-          format: args.region ? 'region' : (args.format ?? 'summary'),
-          region: args.region, minWidth: args['min-width'],
-          limit: args.limit === undefined ? undefined : Number(args.limit),
-          mapBox: args['map-box'], toBox: args['to-box'],
-          version: args.version, gapMaxDistance: args['gap-max-distance'] === undefined ? undefined : Number(args['gap-max-distance']),
-          dds: Boolean(args.dds),
-          cookie, outDir: args.out,
-        });
-        if (args.json) printJson(r);
-        else {
-          console.log(r.text);
-          console.log('');
-          console.log(`— ${r.format} 模式 | ${r.layerCount} 层 | 输出 ${kb(r.text)}${r.filePath ? ` | 落盘 ${r.filePath}` : ''}`);
-        }
-        return r;
-      }
-      case 'blocks': {
-        const r = await readBlocks({
-          projectId: args.project, imageId: args.image, url: args.url,
-          region: args.region, kind: args.kind,
-          minWidth: args['min-width'],
-          limit: args.limit === undefined ? undefined : Number(args.limit),
-          includeNoise: Boolean(args.all),
-          version: args.version,
-          cookie,
-        });
-        if (args.json) printJson(r);
-        else {
-          console.log(r.text);
-          console.log('');
-          console.log(`— blocks 模式 | ${r.layerCount} 层 → ${r.blockCount} 块（碎片 ${r.noiseCount}） | 输出 ${kb(r.text)}`);
-        }
-        return r;
-      }
-      case 'product-docs': {
-        // 产品文档（原型）—— 与 read/blocks 是**两套东西**，命令名分开，避免拿错
-        const parsed = args.url ? parseProductUrl(args.url) : {};
-        const projectId = args.project ?? parsed.projectId;
-        const teamId = args.team ?? parsed.teamId;
-        if (!projectId || !teamId) throw new LanhuError('用法：node lanhu.mjs product-docs --url "<原型链接>"（链接里带 tid/pid），或 --project <pid> --team <tid>');
-        const listed = await productDocuments(projectId, teamId, { cookie });
-        const info = await multiInfo(projectId, teamId, { cookie }).catch(() => null);
-        // --with-pages：逐份拉 sitemap 数页面规模（**默认关** —— N 份 = N 次额外请求）。
-        // 单份失败只标 `?`，绝不炸整张表（与工具链同一口径）。
-        const withPages = Boolean(args['with-pages']);
-        if (withPages) {
-          for (const d of listed.axureDocs) {
-            try {
-              const { tree } = await fetchDesignTree(projectId, d.docId, { cookie, expect: 'prototype' });
-              const c = countSitemapPages(tree?.sitemap?.rootNodes);
-              d.pages = { nodes: c.nodes, readable: c.readable };
-            } catch (e) {
-              d.pages = { nodes: null, readable: null, reason: String(e?.message ?? e).slice(0, 80) };
-            }
-          }
-        }
-        if (args.json) printJson({ ...listed, project: info });
-        else {
-          console.log(`# 产品文档（原型）${info?.name ? ` —— ${info.name}` : ''}`);
-          if (info) console.log(`> 项目：${info.folderName ? `${info.folderName} / ` : ''}${info.name ?? '—'}${info.creatorName ? ` · 创建者 ${info.creatorName}` : ''}`);
-          console.log(`> 共 ${listed.total} 个资源，其中 ${listed.axureDocs.length} 个是 axure 原型文档（**不是设计稿**）`);
-          console.log('');
-          const table = productDocsTable(listed.axureDocs, { withPages });
-          console.log(table.header);
-          console.log(table.sep);
-          table.rows.forEach((r) => console.log(r));
-          console.log('');
-          console.log('> 「序」是接口的 order：蓝湖「文档」面板**按它倒序**显示且是**滚动区** —— 界面里只看到前几个，不代表只有那几个。');
-          if (withPages) console.log(`> 「页面节点 / 可读页」是逐份拉 sitemap 数出来的（本次额外发了 ${listed.axureDocs.length} 次请求）；\`?\` = 那份失败。Folder 没有 url，所以节点数 ≥ 可读页数。`);
-        }
-        return listed;
-      }
-      case 'product-doc': {
-        const r = await readProductDoc({
-          url: args.url, projectId: args.project, docId: args.doc, teamId: args.team,
-          pageId: args['page-id'] ?? args.page, pageName: args['page-name'],
-          version: args.version,
-          limit: args.limit === undefined ? 1 : Number(args.limit),
-          format: args.format,
-          layerLimit: args['layer-limit'] === undefined ? undefined : Number(args['layer-limit']),
-          includeNoise: Boolean(args.all),
-          cookie,
-        });
-        if (args.json) printJson({ ...r, text: undefined });
-        else {
-          console.log(r.text);
-          console.log('');
-          console.log(r.format === 'layers'
-            ? `— 原型样式（layers） | ${r.doc?.name ?? ''} | 读 ${r.selectedCount} 页 | 输出 ${kb(r.text)}`
-            : `— 产品文档（原型） | ${r.pageCount} 个页面节点（${r.wireframeCount} 可读） | 读正文 ${r.selectedCount} 页 | 输出 ${kb(r.text)}`);
-        }
-        return r;
-      }
-      case 'log': {
-        const r = readUsage({ limit: args.limit === undefined ? 30 : Number(args.limit) });
-        if (args.json) printJson(r);
-        else {
-          if (r.entries.length === 0) console.log('(还没有记录 —— 用一次工具或面板就会出现在这里)');
-          for (const e of r.entries) {
-            const t = String(e.tool).padEnd(24);
-            const ms = e.ms === null || e.ms === undefined ? '' : `${e.ms}ms`;
-            console.log(`${e.at.slice(11, 19)}  ${e.ok ? '✅' : '❌'}  ${t}${ms.padStart(7)}  ${e.summary ?? e.error ?? ''}`);
-          }
-          console.log(`— 共 ${r.total} 条 | 来源 ${r.source} | ${r.file}`);
-        }
-        return r;
-      }
-      case 'slices': {
-        const r = await downloadSlices({ projectId: args.project, imageId: args.image, url: args.url, cookie, outDir: args.out });
-        if (args.json) printJson(r);
-        else {
-          console.log(`✅ 下载 ${r.downloaded} 个（去重 ${r.skipped}）→ ${r.dir}\n   mapping: ${r.mappingPath}`);
-          // 半透明警告必须在**人看得见的地方**打出来，不能只躺在 mapping.json 里
-          for (const w of r.warnings ?? []) console.log(`\n${w}`);
-        }
-        return r;
-      }
-      case 'verify': {
-        const r = await verifySpec({ projectId: args.project, imageId: args.image, url: args.url, pageUrl: args.page, cookie, outDir: args.out });
-        if (args.json) printJson(r); else console.log(r.text ?? JSON.stringify(r, null, 2));
-        return r;
-      }
-      case 'accounts': {
-        // 添加 / 更新账号
-        if (args.add) {
-          const alias = typeof args.alias === 'string' ? args.alias : (args._[1] ?? null);
-          if (!alias) {
-            throw new LanhuError('用法：node lanhu.mjs accounts --add --alias <别名> [--company "<公司>"] [--note "<备注>"] [--cookie "<粘贴>" | --clipboard]');
-          }
-          let raw = null;
-          if (typeof args.cookie === 'string') raw = args.cookie;
-          else if (args.clipboard) {
-            const { execFileSync } = await import('node:child_process');
-            raw = execFileSync('pbpaste', { encoding: 'utf8', timeout: 10000 });
-          }
-          const cookie = raw ? parseCookieInput(raw).cookie : null;
-          const { entry, created } = upsertAccount({ alias, company: args.company, note: args.note, cookie });
-          console.log(`${created ? '✅ 已添加' : '✅ 已更新'}账号 ${entry.alias}（${entry.company}）`);
-          if (cookie) console.log(`   Cookie 已写入 ${cookiePathFor(entry.alias)}（600）`);
-          if (cookie && args['no-index'] !== true) {
-            console.log('   正在建索引（团队 + 项目）…');
-            try {
-              const ix = await buildAccountIndex(entry.alias);
-              console.log(`   ✅ ${ix.teamCount} 个团队 / ${ix.projectCount} 个项目${ix.errors.length ? `（部分失败：${ix.errors.join('；')}）` : ''}`);
-            } catch (e) {
-              console.log(`   ⚠️ 索引失败（不影响读稿，稍后可 --reindex 重试）：${e.message}`);
-            }
-          }
-          return entry;
-        }
-        if (typeof args.remove === 'string') {
-          const r = removeAccount(args.remove);
-          console.log(`✅ 已删除账号 ${r.removed}（默认账号：${r.default ?? '无'}）`);
-          return r;
-        }
-        if (typeof args.default === 'string') {
-          const r = setDefaultAccount(args.default);
-          console.log(`✅ 默认账号 → ${r.default}`);
-          return r;
-        }
-        if (args.reindex) {
-          const doc = loadAccounts();
-          const targets = typeof args.reindex === 'string' ? [args.reindex] : doc.accounts.map((a) => a.alias);
-          if (targets.length === 0) throw new LanhuError('还没配置任何账号，先 --add 一个。');
-          for (const a of targets) {
-            process.stdout.write(`   ${a} … `);
-            const ix = await buildAccountIndex(a);
-            console.log(`${ix.teamCount} 团队 / ${ix.projectCount} 项目${ix.errors.length ? ` ⚠️ ${ix.errors.join('；')}` : ''}`);
-          }
-          return listAccounts();
-        }
-        // 默认：列表
-        const acc = listAccounts();
-        if (args.json) printJson(acc);
-        else if (acc.accounts.length === 0) {
-          console.log('(还没配置账号)');
-          console.log('  添加一个：node lanhu.mjs accounts --add --alias Acme --company "Acme" --clipboard');
-          console.log(`  （没配置时，读稿会退回旧路径 ${cookieFilePaths()[0]}，行为与从前一致）`);
-        } else {
-          for (const a of acc.accounts) {
-            const days = a.expiry ? `剩 ${a.expiry.daysLeft} 天` : (a.hasCookie ? '有效期未知' : '❌ 无 Cookie');
-            console.log(`${a.isDefault ? '★' : ' '} ${a.alias.padEnd(14)} ${a.company.padEnd(14)} ${days.padStart(12)}   团队 ${a.teamCount} · 项目 ${a.projectCount}`);
-            if (a.note) console.log(`  ${' '.repeat(14)} ${a.note}`);
-          }
-          console.log(`\n默认账号：${acc.default ?? '（无）'}  |  档案：${acc.file}`);
-        }
-        return acc;
-      }
-      case 'who': {
-        const r = await whoIsIt({ url: args.url, projectId: args.project, imageId: args.image, teamId: args.team });
-        if (args.json) printJson(r);
-        else if (r.found) {
-          const by = r.matchedBy === 'tid' ? '链接里的团队 id（零请求）'
-            : r.matchedBy === 'pid' ? '项目 id（零请求）'
-              : String(r.matchedBy ?? '未知');
-          console.log(`✅ 归属账号：${r.company}（${r.alias}）`);
-          console.log(`   命中依据：${by}`);
-          if (r.team) console.log(`   团队：${r.team.name ?? r.team.teamId}`);
-          if (r.project) console.log(`   项目：${r.project.name ?? r.project.projectId}`);
-          if (r.expiry) console.log(`   Cookie：剩 ${r.expiry.daysLeft} 天`);
-          if (r.readable && r.readableName) console.log(`   ⚠️ 这张稿能读到（「${r.readableName}」），但不属于任何已配置账号`);
-        } else {
-          console.log('❓ 没找到这张稿的归属账号');
-          if (r.knownAccounts?.length) {
-            console.log('   已知账号：' + r.knownAccounts.map((a) => `${a.company}(${a.alias}，${a.teamCount} 团队)`).join('、'));
-          }
-          if (r.probeErrors?.length) console.log('   探测结果：' + r.probeErrors.join(' / '));
-          console.log('   ' + r.hint);
-        }
-        return r;
-      }
-      case 'cookie': {
-        let text = null;
-        if (typeof args.set === 'string') text = args.set;
-        else if (args.file) text = fs.readFileSync(args.file, 'utf8');
-        else if (args.stdin) text = fs.readFileSync(0, 'utf8');
-        else if (args.clipboard) {
-          const { execFileSync } = await import('node:child_process');
-          text = execFileSync('pbpaste', { encoding: 'utf8', timeout: 10000 });   // macOS 剪贴板
-        }
-        if (!text) throw new LanhuError('用法：lanhu.mjs cookie --set "<粘贴内容>" | --file <路径> | --stdin | --clipboard');
+/** `auth` 命令。 */
+async function cmdAuth({ args, cookie }) {
+  const r = await checkAuth({ cookie });
+  if (args.json) printJson(r);
+  else if (r.ok) {
+    console.log(`✅ 登录有效（来源：${r.cookieSource}）`);
+    console.log(`   Cookie：${r.cookieMasked}`);
+    if (r.expiry) console.log(`   过期：${r.expiry.expiresAt}（剩 ${r.expiry.daysLeft} 天）`);
+    for (const t of r.teams) console.log(`   团队 ${t.teamId}  ${t.name}  成员 ${t.memberNum}`);
+  } else {
+    console.error(`❌ ${r.error}`);
+    if (r.hint) console.error(`   ${r.hint}`);
+    process.exitCode = 1;
+  }
+  return r;
+}
 
-        const dry = Boolean(args['dry-run']);
-        const r = await saveCookie(text, { verify: args.verify !== false, dryRun: dry });
-        console.log(dry ? '🔍 解析结果（--dry-run，未写入）' : `✅ 已写入 ${r.path}（600）`);
-        console.log(`   解析来源：${r.source}`);
-        console.log(`   Cookie：${r.masked}`);
-        if (r.checks) console.log(`   关键项：${Object.entries(r.checks).map(([k, v]) => `${k}${v ? '✓' : '✗'}`).join('  ')}`);
-        if (r.expiry) console.log(`   有效期至：${r.expiry.expiresAt}（剩 ${r.expiry.daysLeft} 天）`);
-        return r;
+/** `teams` 命令。 */
+async function cmdTeams({ args, cookie }) {
+  const r = await listTeams({ cookie });
+  if (args.json) printJson(r); else for (const t of r.teams) console.log(`${t.teamId}  ${t.name}  成员 ${t.memberNum}`);
+  return r;
+}
+
+/** `projects` 命令。 */
+async function cmdProjects({ args, cookie }) {
+  const r = await listDirectory(args.team, { cookie });
+  if (args.json) printJson(r); else for (const p of r.projects) console.log(`${p.sourceId}  ${p.sourceName}`);
+  return r;
+}
+
+/** `designs` 命令。 */
+async function cmdDesigns({ args, cookie }) {
+  // 与工具链一致：**贴链接就行**；显式 --project 优先；都不给 → 明确报错（不静默给空表）
+  const target = args.url ? parseProjectTarget(args.url) : null;
+  const projectId = args.project ?? target?.projectId ?? null;
+  if (!projectId) throw new LanhuError('用法：node lanhu.mjs designs --url "<蓝湖链接>"，或 --project <pid>（两个都不给无法定位项目）');
+  const r = await listImages(projectId, { cookie });
+  if (args.json) printJson(r);
+  else {
+    console.log(`${r.projectName ?? r.projectId}：${r.images.length} 张稿`);
+    for (const i of r.images) console.log(`  ${i.imageId}  ${i.name}  ${i.width}×${i.height}`);
+  }
+  return r;
+}
+
+/** `sectors` 命令。 */
+async function cmdSectors({ args, cookie }) {
+  const r = await listSectors(args.project, { cookie });
+  if (args.json) printJson(r); else console.log(r.sectors.length ? r.sectors.map((s) => `${s.id} ${s.name}`).join('\n') : '(无分组)');
+  return r;
+}
+
+/** `search` 命令。 */
+async function cmdSearch({ args, cookie }) {
+  const r = await search(args.team, args.keyword, { cookie });
+  if (args.json) printJson(r);
+  else for (const i of r.images) console.log(`${i.imageId}  ${i.name}  @ ${i.projectName}  (${i.path})`);
+  return r;
+}
+
+/** `read` 命令。 */
+async function cmdRead({ args, cookie }) {
+  const r = await readDesign({
+    projectId: args.project, imageId: args.image, url: args.url,
+    format: args.region ? 'region' : (args.format ?? 'summary'),
+    region: args.region, minWidth: args['min-width'],
+    limit: args.limit === undefined ? undefined : Number(args.limit),
+    mapBox: args['map-box'], toBox: args['to-box'],
+    version: args.version, gapMaxDistance: args['gap-max-distance'] === undefined ? undefined : Number(args['gap-max-distance']),
+    dds: Boolean(args.dds),
+    cookie, outDir: args.out,
+  });
+  if (args.json) printJson(r);
+  else {
+    console.log(r.text);
+    console.log('');
+    console.log(`— ${r.format} 模式 | ${r.layerCount} 层 | 输出 ${kb(r.text)}${r.filePath ? ` | 落盘 ${r.filePath}` : ''}`);
+  }
+  return r;
+}
+
+/** `blocks` 命令。 */
+async function cmdBlocks({ args, cookie }) {
+  const r = await readBlocks({
+    projectId: args.project, imageId: args.image, url: args.url,
+    region: args.region, kind: args.kind,
+    minWidth: args['min-width'],
+    limit: args.limit === undefined ? undefined : Number(args.limit),
+    includeNoise: Boolean(args.all),
+    version: args.version,
+    cookie,
+  });
+  if (args.json) printJson(r);
+  else {
+    console.log(r.text);
+    console.log('');
+    console.log(`— blocks 模式 | ${r.layerCount} 层 → ${r.blockCount} 块（碎片 ${r.noiseCount}） | 输出 ${kb(r.text)}`);
+  }
+  return r;
+}
+
+/** `product-docs` 命令。 */
+async function cmdProductDocs({ args, cookie }) {
+  // 产品文档（原型）—— 与 read/blocks 是**两套东西**，命令名分开，避免拿错
+  const parsed = args.url ? parseProductUrl(args.url) : {};
+  const projectId = args.project ?? parsed.projectId;
+  const teamId = args.team ?? parsed.teamId;
+  if (!projectId || !teamId) throw new LanhuError('用法：node lanhu.mjs product-docs --url "<原型链接>"（链接里带 tid/pid），或 --project <pid> --team <tid>');
+  const listed = await productDocuments(projectId, teamId, { cookie });
+  const pi = await tryProjectInfo(projectId, teamId, { cookie });
+  const info = pi.info;
+  // --with-pages：逐份拉 sitemap 数页面规模（**默认关** —— N 份 = N 次额外请求）。
+  // 单份失败只标 `?`，绝不炸整张表（与工具链同一口径）。
+  const withPages = Boolean(args['with-pages']);
+  if (withPages) {
+    for (const d of listed.axureDocs) {
+      try {
+        const { tree } = await fetchDesignTree(projectId, d.docId, { cookie, expect: 'prototype' });
+        const c = countSitemapPages(tree?.sitemap?.rootNodes);
+        d.pages = { nodes: c.nodes, readable: c.readable };
+      } catch (e) {
+        d.pages = { nodes: null, readable: null, reason: String(e?.message ?? e).slice(0, 80) };
       }
-      default:
-        // 给了命令但没人接：必须非零退出，否则脚本调用方会把「打了一屏帮助」当成功。
-        // 没给命令（或 --help）只是看帮助，退出码保持 0。
-        if (cmd) {
-          process.stderr.write(`❌ 未知命令：${cmd}（用 node lanhu.mjs 看全部命令）\n`);
-          process.exitCode = 1;
-        }
-        console.log(`dsh-lanhu —— 蓝湖设计稿读取
+    }
+  }
+  if (args.json) printJson({ ...listed, project: info, projectInfoError: pi.error });
+  else {
+    console.log(`# 产品文档（原型）${info?.name ? ` —— ${info.name}` : ''}`);
+    if (info) console.log(`> 项目：${info.folderName ? `${info.folderName} / ` : ''}${info.name ?? '—'}${info.creatorName ? ` · 创建者 ${info.creatorName}` : ''}`);
+    else if (pi.error) console.log(`> ⚠️ 项目信息未取到（${pi.error}）—— 不影响下面结果`);
+    console.log(`> 共 ${listed.total} 个资源，其中 ${listed.axureDocs.length} 个是 axure 原型文档（**不是设计稿**）`);
+    console.log('');
+    const table = productDocsTable(listed.axureDocs, { withPages });
+    console.log(table.header);
+    console.log(table.sep);
+    table.rows.forEach((r) => console.log(r));
+    console.log('');
+    console.log('> 「序」是接口的 order：蓝湖「文档」面板**按它倒序**显示且是**滚动区** —— 界面里只看到前几个，不代表只有那几个。');
+    if (withPages) console.log(`> 「页面节点 / 可读页」是逐份拉 sitemap 数出来的（本次额外发了 ${listed.axureDocs.length} 次请求）；\`?\` = 那份失败。Folder 没有 url，所以节点数 ≥ 可读页数。`);
+  }
+  return listed;
+}
+
+/** `product-doc` 命令。 */
+async function cmdProductDoc({ args, cookie }) {
+  const r = await readProductDoc({
+    url: args.url, projectId: args.project, docId: args.doc, teamId: args.team,
+    pageId: args['page-id'] ?? args.page, pageName: args['page-name'],
+    version: args.version,
+    limit: args.limit === undefined ? 1 : Number(args.limit),
+    format: args.format,
+    layerLimit: args['layer-limit'] === undefined ? undefined : Number(args['layer-limit']),
+    includeNoise: Boolean(args.all),
+    cookie,
+  });
+  if (args.json) printJson({ ...r, text: undefined });
+  else {
+    console.log(r.text);
+    console.log('');
+    console.log(r.format === 'layers'
+      ? `— 原型样式（layers） | ${r.doc?.name ?? ''} | 读 ${r.selectedCount} 页 | 输出 ${kb(r.text)}`
+      : `— 产品文档（原型） | ${r.pageCount} 个页面节点（${r.wireframeCount} 可读） | 读正文 ${r.selectedCount} 页 | 输出 ${kb(r.text)}`);
+  }
+  return r;
+}
+
+/** `log` 命令。 */
+async function cmdLog({ args, cookie }) {
+  const r = readUsage({ limit: args.limit === undefined ? 30 : Number(args.limit) });
+  if (args.json) printJson(r);
+  else {
+    if (r.entries.length === 0) console.log('(还没有记录 —— 用一次工具或面板就会出现在这里)');
+    for (const e of r.entries) {
+      const t = String(e.tool).padEnd(24);
+      const ms = e.ms === null || e.ms === undefined ? '' : `${e.ms}ms`;
+      console.log(`${e.at.slice(11, 19)}  ${e.ok ? '✅' : '❌'}  ${t}${ms.padStart(7)}  ${e.summary ?? e.error ?? ''}`);
+    }
+    console.log(`— 共 ${r.total} 条 | 来源 ${r.source} | ${r.file}`);
+  }
+  return r;
+}
+
+/** `slices` 命令。 */
+async function cmdSlices({ args, cookie }) {
+  const r = await downloadSlices({ projectId: args.project, imageId: args.image, url: args.url, cookie, outDir: args.out });
+  if (args.json) printJson(r);
+  else {
+    console.log(`✅ 下载 ${r.downloaded} 个（去重 ${r.skipped}）→ ${r.dir}\n   mapping: ${r.mappingPath}`);
+    // 半透明警告必须在**人看得见的地方**打出来，不能只躺在 mapping.json 里
+    for (const w of r.warnings ?? []) console.log(`\n${w}`);
+  }
+  return r;
+}
+
+/** `verify` 命令。 */
+async function cmdVerify({ args, cookie }) {
+  const r = await verifySpec({ projectId: args.project, imageId: args.image, url: args.url, pageUrl: args.page, cookie, outDir: args.out });
+  if (args.json) printJson(r); else console.log(r.text ?? JSON.stringify(r, null, 2));
+  return r;
+}
+
+/** `accounts` 命令。 */
+async function cmdAccounts({ args, cookie }) {
+  // 添加 / 更新账号
+  if (args.add) {
+    const alias = typeof args.alias === 'string' ? args.alias : (args._[1] ?? null);
+    if (!alias) {
+      throw new LanhuError('用法：node lanhu.mjs accounts --add --alias <别名> [--company "<公司>"] [--note "<备注>"] [--cookie "<粘贴>" | --clipboard]');
+    }
+    let raw = null;
+    if (typeof args.cookie === 'string') raw = args.cookie;
+    else if (args.clipboard) {
+      const { execFileSync } = await import('node:child_process');
+      raw = execFileSync('pbpaste', { encoding: 'utf8', timeout: 10000 });
+    }
+    const cookie = raw ? parseCookieInput(raw).cookie : null;
+    const { entry, created } = upsertAccount({ alias, company: args.company, note: args.note, cookie });
+    console.log(`${created ? '✅ 已添加' : '✅ 已更新'}账号 ${entry.alias}（${entry.company}）`);
+    if (cookie) console.log(`   Cookie 已写入 ${cookiePathFor(entry.alias)}（600）`);
+    if (cookie && args['no-index'] !== true) {
+      console.log('   正在建索引（团队 + 项目）…');
+      try {
+        const ix = await buildAccountIndex(entry.alias);
+        console.log(`   ✅ ${ix.teamCount} 个团队 / ${ix.projectCount} 个项目${ix.errors.length ? `（部分失败：${ix.errors.join('；')}）` : ''}`);
+      } catch (e) {
+        console.log(`   ⚠️ 索引失败（不影响读稿，稍后可 --reindex 重试）：${e.message}`);
+      }
+    }
+    return entry;
+  }
+  if (typeof args.remove === 'string') {
+    const r = removeAccount(args.remove);
+    console.log(`✅ 已删除账号 ${r.removed}（默认账号：${r.default ?? '无'}）`);
+    return r;
+  }
+  if (typeof args.default === 'string') {
+    const r = setDefaultAccount(args.default);
+    console.log(`✅ 默认账号 → ${r.default}`);
+    return r;
+  }
+  if (args.reindex) {
+    const doc = loadAccounts();
+    const targets = typeof args.reindex === 'string' ? [args.reindex] : doc.accounts.map((a) => a.alias);
+    if (targets.length === 0) throw new LanhuError('还没配置任何账号，先 --add 一个。');
+    for (const a of targets) {
+      process.stdout.write(`   ${a} … `);
+      const ix = await buildAccountIndex(a);
+      console.log(`${ix.teamCount} 团队 / ${ix.projectCount} 项目${ix.errors.length ? ` ⚠️ ${ix.errors.join('；')}` : ''}`);
+    }
+    return listAccounts();
+  }
+  // 默认：列表
+  const acc = listAccounts();
+  if (args.json) printJson(acc);
+  else if (acc.accounts.length === 0) {
+    console.log('(还没配置账号)');
+    console.log('  添加一个：node lanhu.mjs accounts --add --alias Acme --company "Acme" --clipboard');
+    console.log(`  （没配置时，读稿会退回旧路径 ${cookieFilePaths()[0]}，行为与从前一致）`);
+  } else {
+    for (const a of acc.accounts) {
+      const days = a.expiry ? `剩 ${a.expiry.daysLeft} 天` : (a.hasCookie ? '有效期未知' : '❌ 无 Cookie');
+      console.log(`${a.isDefault ? '★' : ' '} ${a.alias.padEnd(14)} ${a.company.padEnd(14)} ${days.padStart(12)}   团队 ${a.teamCount} · 项目 ${a.projectCount}`);
+      if (a.note) console.log(`  ${' '.repeat(14)} ${a.note}`);
+    }
+    console.log(`\n默认账号：${acc.default ?? '（无）'}  |  档案：${acc.file}`);
+  }
+  return acc;
+}
+
+/** `who` 命令。 */
+async function cmdWho({ args, cookie }) {
+  const r = await whoIsIt({ url: args.url, projectId: args.project, imageId: args.image, teamId: args.team });
+  if (args.json) printJson(r);
+  else if (r.found) {
+    const by = r.matchedBy === 'tid' ? '链接里的团队 id（零请求）'
+      : r.matchedBy === 'pid' ? '项目 id（零请求）'
+        : String(r.matchedBy ?? '未知');
+    console.log(`✅ 归属账号：${r.company}（${r.alias}）`);
+    console.log(`   命中依据：${by}`);
+    if (r.team) console.log(`   团队：${r.team.name ?? r.team.teamId}`);
+    if (r.project) console.log(`   项目：${r.project.name ?? r.project.projectId}`);
+    if (r.expiry) console.log(`   Cookie：剩 ${r.expiry.daysLeft} 天`);
+    if (r.readable && r.readableName) console.log(`   ⚠️ 这张稿能读到（「${r.readableName}」），但不属于任何已配置账号`);
+  } else {
+    console.log('❓ 没找到这张稿的归属账号');
+    if (r.knownAccounts?.length) {
+      console.log('   已知账号：' + r.knownAccounts.map((a) => `${a.company}(${a.alias}，${a.teamCount} 团队)`).join('、'));
+    }
+    if (r.probeErrors?.length) console.log('   探测结果：' + r.probeErrors.join(' / '));
+    console.log('   ' + r.hint);
+  }
+  return r;
+}
+
+/** `cookie` 命令。 */
+async function cmdCookie({ args, cookie }) {
+  let text = null;
+  if (typeof args.set === 'string') text = args.set;
+  else if (args.file) text = fs.readFileSync(args.file, 'utf8');
+  else if (args.stdin) text = fs.readFileSync(0, 'utf8');
+  else if (args.clipboard) {
+    const { execFileSync } = await import('node:child_process');
+    text = execFileSync('pbpaste', { encoding: 'utf8', timeout: 10000 });   // macOS 剪贴板
+  }
+  if (!text) throw new LanhuError('用法：lanhu.mjs cookie --set "<粘贴内容>" | --file <路径> | --stdin | --clipboard');
+
+  const dry = Boolean(args['dry-run']);
+  const r = await saveCookie(text, { verify: args.verify !== false, dryRun: dry });
+  console.log(dry ? '🔍 解析结果（--dry-run，未写入）' : `✅ 已写入 ${r.path}（600）`);
+  console.log(`   解析来源：${r.source}`);
+  console.log(`   Cookie：${r.masked}`);
+  if (r.checks) console.log(`   关键项：${Object.entries(r.checks).map(([k, v]) => `${k}${v ? '✓' : '✗'}`).join('  ')}`);
+  if (r.expiry) console.log(`   有效期至：${r.expiry.expiresAt}（剩 ${r.expiry.daysLeft} 天）`);
+  return r;
+}
+
+/** 命令名 → 处理器。 */
+const CLI_COMMANDS = {
+  'auth': cmdAuth,
+  'teams': cmdTeams,
+  'projects': cmdProjects,
+  'designs': cmdDesigns,
+  'sectors': cmdSectors,
+  'search': cmdSearch,
+  'read': cmdRead,
+  'blocks': cmdBlocks,
+  'product-docs': cmdProductDocs,
+  'product-doc': cmdProductDoc,
+  'log': cmdLog,
+  'slices': cmdSlices,
+  'verify': cmdVerify,
+  'accounts': cmdAccounts,
+  'who': cmdWho,
+  'cookie': cmdCookie,
+};
+
+const USAGE = `dsh-lanhu —— 蓝湖设计稿读取
 
 用法：node lanhu.mjs <命令> [选项]
 
@@ -5628,9 +5775,24 @@ export async function main(argv = process.argv.slice(2)) {
            （粘贴内容可以是 F12 → Copy as cURL 的整段、Cookie 请求头、或裸 Cookie 串；
              --dry-run 只解析校验不写入）
 
-通用选项：--cookie <串>  --json`);
-        return null;
-    }
+通用选项：--cookie <串>  --json`;
+
+export async function main(argv = process.argv.slice(2)) {
+  const args = parseArgv(argv);
+  const cmd = args._[0];
+  const cookie = typeof args.cookie === 'string' ? args.cookie : undefined;
+
+  try {
+    const handler = CLI_COMMANDS[cmd];
+    if (handler) return await handler({ args, cookie });
+  // 给了命令但没人接：必须非零退出，否则脚本调用方会把「打了一屏帮助」当成功。
+  // 没给命令（或 --help）只是看帮助，退出码保持 0。
+  if (cmd) {
+    process.stderr.write(`❌ 未知命令：${cmd}（用 node lanhu.mjs 看全部命令）\n`);
+    process.exitCode = 1;
+  }
+    console.log(USAGE);
+    return null;
   } catch (e) {
     if (args.json) printJson({ ok: false, error: e.message, hint: e.hint ?? null, code: e.code ?? null });
     else {

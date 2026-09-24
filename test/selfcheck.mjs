@@ -86,6 +86,8 @@ const {
   decodeAxureText,
   normalizeAxurePage,
   renderProductLayers,
+  tryProjectInfo,
+  renderProductDoc,
   auditAxureChildKeys,
   AXURE_CHILD_KEYS,
   argbParts,
@@ -1628,6 +1630,34 @@ group('⑨ 产品文档（A1/A2）与算法（B1~B4）');
     pathLines.some((l) => l.startsWith('> 路径：')), pathLines.map((l) => l.slice(0, 22)).join(' ／ '));
   ok('「路径：」也出现在**每个页面标题**上（嵌套 path 最容易被读成多页）',
     pathLines.some((l) => l.startsWith('## 路径：')), pathLines.map((l) => l.slice(0, 22)).join(' ／ '));
+}
+
+
+/* ═══════════ 项目信息取不到时：**降级，但不静默** ═══════════ */
+{
+  const base = {
+    doc: { name: '某原型' }, version: { id: 'v1', isLatest: true },
+    content: [{ pageId: 'p1', path: 'A', readable: false, reason: '夹具' }],
+  };
+  // 反例：取不到 → 人读文本必须**说出原因**（以前 `.catch(() => null)` 只是少一行，分不清"真没有"还是"取失败"）
+  const bad = renderProductLayers({ ...base, project: null, projectInfoError: 'boom：HTTP 500' });
+  ok('renderProductLayers：项目信息没取到 → 提示**带原因**',
+    /项目信息未取到（boom：HTTP 500）/.test(bad),
+    bad.split('\n').find((l) => /项目信息/.test(l)) ?? '（没找到提示行）');
+  const badDoc = renderProductDoc({
+    ...base, project: null, projectInfoError: 'boom：HTTP 500',
+    pageCount: 1, wireframeCount: 1, pages: [],
+  });
+  ok('renderProductDoc：同样带原因', /项目信息未取到（boom：HTTP 500）/.test(badDoc),
+    badDoc.split('\n').find((l) => /项目信息/.test(l)) ?? '（没找到提示行）');
+  // 正例：正常时**不许**出现该提示（满屏"未取到"同样是噪声）
+  const good = renderProductLayers({ ...base, project: { name: 'P', folderName: 'F' }, projectInfoError: null });
+  ok('renderProductLayers：正常时**不出现**该提示', !/项目信息未取到/.test(good));
+  ok('renderProductLayers：正常时「项目：」那行照旧', /> 项目：P（F）/.test(good));
+  // tryProjectInfo 自身：失败时 info=null 且 error 非空（空 projectId → 同步抛，零网络）
+  const r = await tryProjectInfo('', null, {});
+  ok('tryProjectInfo：失败 → {info:null, error:非空}（不抛错、不静默）',
+    r.info === null && typeof r.error === 'string' && r.error.length > 0, JSON.stringify(r).slice(0, 90));
 }
 
 /* ═══════════════ 汇总 ═══════════════ */
