@@ -16,7 +16,7 @@
 > **没有它**：AI 写页面前只能看设计稿**截图**，色值和字号靠视觉估算（OCR 小字经常错）。
 > **有了它**：设计稿的真实数值直接进上下文 —— 等于把「设计标注」喂给模型；还能反过来拿它**自动验收**页面还原度。
 
-**版本 `0.3.0`**（见 [CHANGELOG](CHANGELOG.md)） · MIT
+**版本 `0.4.0`**（见 [CHANGELOG](CHANGELOG.md)） · MIT
 适用于 [DeepSeek Harness](https://github.com/deepseek-ai)（DSH）Web GUI，需要 **Node ≥ 20**。自带 15 个原生工具 + 侧边面板 + CLI。
 
 > ⚠️ **免责与数据说明**
@@ -42,7 +42,7 @@
 | **侧边面板** | 块级 / 账号 / 记录，三个 Tab，不用敲命令 |
 | **多账号** | 一账号一套 Cookie；贴链接自动判归属（索引命中零请求） |
 | **零运行时依赖** | 真机验收才需要 `puppeteer-core`（`optionalDependencies`，不装也能用） |
-| **离线自检 530 项** | 秒级、零网络；改完代码先跑它（另有**文档绊线** `test/readme-test.mjs`：生成块 / `docs/` 链接与孤立文件 / 版本号五处 / 发布说明格式 / 写死的数字） |
+| **离线自检 564 项** | 秒级、零网络；改完代码先跑它（另有**文档绊线** `test/readme-test.mjs`：生成块 / `docs/` 链接与孤立文件 / 版本号五处 / 发布说明格式 / 写死的数字） |
 
 ---
 
@@ -152,11 +152,12 @@
 
 #### `lanhu_list_designs`
 
-列出某个项目下的全部设计稿（稿名 / 尺寸 / imageId）。
+列出某个项目下的全部设计稿（稿名 / 尺寸 / imageId）。**可以直接贴蓝湖链接**（里面的 tid/pid 自动解析，不用手拆）；也可以给 projectId。要看**产品文档/原型**请用 lanhu_list_product_documents。
 
 | 参数 | 类型 | 必填 | 取值 | 说明 |
 |---|---|---|---|---|
-| `projectId` | `string` | **是** | — | 项目 UUID |
+| `url` | `string` | 否 | — | 蓝湖链接（整条粘贴即可 —— 里面的 tid/pid 会自动解析，不用手拆） |
+| `projectId` | `string` | 否 | — | 项目 UUID（与 url 二选一；**两个都给时以 projectId 为准**） |
 | `sector` | `string` | 否 | — | 分组名（可选；实测未分组项目也能列出全部稿子，无需此参数） |
 | `account` | `string` | 否 | — | 可选：指定蓝湖账号别名（多账号场景，如 acme）。不给时会按链接里的团队 id 自动判定，再退到默认账号。先用 lanhu_accounts 看有哪些账号。 |
 
@@ -210,13 +211,14 @@
 
 #### `lanhu_list_product_documents`
 
-列出蓝湖项目下的**产品文档**（也叫原型 / PRD —— Axure 导出，`docType=axure`）。**这不是设计稿**：设计稿回答"什么颜色、几 px 圆角"，产品文档回答"业务规则、字段、跳转"。当用户给的是**原型链接**（URL 里带 `docType=axure`），或要看需求文档/PRD/原型、要定位某一步的业务规则时用它；顺带返回项目名/文件夹/创建者。设计稿请用 lanhu_list_designs。拿到 docId 后交给 lanhu_read_product_doc 读页面树与正文。
+输出带 `order` —— 蓝湖「文档」面板**按它倒序**显示且是**滚动区**，界面里只看到前几个**不代表只有几个**（实测有人据此以为插件读错了）。`withPages:true` 可额外附上每份的**页面规模**（页面节点数 / 可读页数），便于一眼选对文档；**代价是每份多发 1 次请求**（要拉一次 sitemap），所以**默认关**，单份失败只标 `?` 不会毁掉整张表。列出蓝湖项目下的**产品文档**（也叫原型 / PRD —— Axure 导出，`docType=axure`）。**这不是设计稿**：设计稿回答"什么颜色、几 px 圆角"，产品文档回答"业务规则、字段、跳转"。当用户给的是**原型链接**（URL 里带 `docType=axure`），或要看需求文档/PRD/原型、要定位某一步的业务规则时用它；顺带返回项目名/文件夹/创建者。设计稿请用 lanhu_list_designs。拿到 docId 后交给 lanhu_read_product_doc 读页面树与正文。
 
 | 参数 | 类型 | 必填 | 取值 | 说明 |
 |---|---|---|---|---|
 | `url` | `string` | 否 | — | 蓝湖原型链接（整条粘贴，自动解析 tid/pid/docId/pageId） |
 | `teamId` | `string` | 否 | — | 团队 UUID（与 projectId 搭配；给了 url 可不传） |
 | `projectId` | `string` | 否 | — | 项目 UUID（与 teamId 搭配） |
+| `withPages` | `boolean` | 否 | — | true = 额外附上每份原型的**页面规模**（页面节点数 / 可读页数），便于一眼选对文档。**代价：N 份 = N 次额外请求**（每份拉一次 sitemap），**默认关**；单份失败只标 `?`，不让整张表失败 |
 | `account` | `string` | 否 | — | 可选：指定蓝湖账号别名（多账号场景，如 acme）。不给时会按链接里的团队 id 自动判定，再退到默认账号。先用 lanhu_accounts 看有哪些账号。 |
 
 #### `lanhu_read_product_doc`

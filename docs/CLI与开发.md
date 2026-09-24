@@ -6,12 +6,16 @@
 
 > **原型页面样式**：`node lanhu.mjs product-doc --url "<原型链接>" --format layers [--layer-limit 200]`
 > —— 输出该页的色值/字号/坐标块级清单（与设计稿同一张表）。没有设计稿、只有原型时用它。
+>
+> **列原型清单**：`node lanhu.mjs product-docs --url "<原型链接>" [--with-pages]`
+> —— 清单带 `order`（界面「文档」面板按它倒序、是滚动区，只看到前几个不代表只有几个）；
+> `--with-pages` 额外附上每份的**页面规模**（页面节点 / 可读页），**代价是每份多发 1 次请求**，默认关。
 
 `lanhu.mjs` 零依赖，命令面与工具一一对应：
 
 ```bash
 node lanhu.mjs auth
-node lanhu.mjs teams / projects --team <id> / designs --project <id> / sectors --project <id>
+node lanhu.mjs teams / projects --team <id> / designs --url "<链接>"|--project <id> / sectors --project <id>
 node lanhu.mjs search   --team <teamId> --keyword <kw>
 node lanhu.mjs read     --project <id> --image <id> [--format summary|full|tokens] [--region y0,y1] [--limit N] [--map-box … --to-box …]
 node lanhu.mjs blocks   --url "<蓝湖链接>" [--kind card,pill] [--min-width 60] [--all]
@@ -50,7 +54,7 @@ node lanhu.mjs cookie --clipboard --dry-run  # 只看解析结果，不写入
 ## 本地自检
 
 ```bash
-node test/selfcheck.mjs          # 530 项，纯离线、秒级
+node test/selfcheck.mjs          # 564 项，纯离线、秒级
 node test/selfcheck.mjs --json   # 机器可读
 ```
 

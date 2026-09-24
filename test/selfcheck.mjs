@@ -32,10 +32,16 @@ process.on('uncaughtException', (e) => { cleanupTmp(); console.error(e); process
 
 const {
   parseLanhuUrl,
+  parseProjectTarget,
+  countSitemapPages,
+  titleName,
+  productDocsTable,
   resolveTarget,
   parseColor,
   buildBlocks,
   renderBlocks,
+  renderTokens,
+  renderFonts,
   renderRegion,
   renderSummary,
   collectTokens,
@@ -1496,6 +1502,132 @@ group('⑨ 产品文档（A1/A2）与算法（B1~B4）');
     ok(`axureScriptIds：传 ${label} → **抛错**（曾静默返回空 Map）`,
       (() => { try { axureScriptIds(bad); return false; } catch { return true; } })());
   }
+}
+
+/* ═══════════ 攒着的小改进（0.4.0）：url / order / withPages / 路径 ═══════════ */
+{
+  const hostSrc = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'lib', 'index.js'), 'utf8');
+  const cliSrc = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'lanhu.mjs'), 'utf8');
+
+  // ── 改进1：list_designs 收 url（一致性 —— 兄弟工具都收，它原来只收 projectId）──
+  const ld = pick('lanhu_list_designs');
+  ok('list_designs 声明了 url', 'url' in ld.parameters.properties);
+  ok('list_designs 的 projectId 已**非必填**（原来 required:true）', ld.parameters.properties.projectId?.required !== true);
+  ok('list_designs 描述写明"可以直接贴链接"', /贴.*链接/.test(ld.description));
+  // 都不给 → 必须明确报错，**不许静默返回空列表**（这一步不发网络请求，可离屏测）
+  const ldNoArgs = await ld.execute({});
+  ok('list_designs 两个都不给 → 明确报错（不静默给空表）',
+    /需要 projectId/.test(ldNoArgs.text ?? ''), String(ldNoArgs.text ?? '').slice(0, 56));
+
+  // ── parseProjectTarget：面向"项目"的解析（**不要求 image_id**）──
+  const TID2 = '1b89ab48-799c-4899-888c-5040991bef9b';
+  const PID2 = '639b8833-6a8c-401f-a002-7d5b3f090365';
+  const projectPage = `https://lanhuapp.com/web/#/item/project/detailDetach?tid=${TID2}&pid=${PID2}`;
+  const pt = parseProjectTarget(projectPage);
+  ok('项目页链接（**没有 image_id**）也能取到 pid / tid',
+    pt.projectId === PID2 && pt.teamId === TID2 && pt.imageId === null, JSON.stringify(pt).slice(0, 76));
+  ok('直接给一个 uuid → 当项目 id 用', parseProjectTarget(PID2).projectId === PID2);
+  let noPidErr = null;
+  try { parseProjectTarget('https://example.com/x'); } catch (e) { noPidErr = e; }
+  ok('链接里没有 pid → 明确抛错（不静默）', !!noPidErr && /项目 id/.test(noPidErr.message));
+  // ⚠️ 反向守卫：parseLanhuUrl 面向"某一张稿"，**必须继续要求 image_id** ——
+  //    别为了给 list_designs 让步而把它改宽容，那会破坏 read_design 等一串工具。
+  let noImgErr = null;
+  try { parseLanhuUrl(projectPage); } catch (e) { noImgErr = e; }
+  ok('parseLanhuUrl 仍**要求** image_id（没被顺手改宽容）', !!noImgErr && /image_id/.test(noImgErr.message));
+
+  // ── 改进2：清单加 order + 说明面板按 order 倒序且是滚动区 ──
+  const lp = pick('lanhu_list_product_documents');
+  ok('list_product_documents 描述提到 order 与"滚动区"', /order/.test(lp.description) && /滚动/.test(lp.description));
+  ok('清单表格里有「序」这一列（表格构造器现在住在 lanhu.mjs，工具与 CLI 共用）',
+    /\| # \| 序 \|/.test(cliSrc));
+  ok('清单渲染带"不代表只有那几个"的说明（防把滚动区误读成只有几个）', /不代表只有那几个/.test(hostSrc));
+
+  // ── 改进3：withPages（**默认关** + 代价写进描述 + 单份失败不炸表）──
+  const wp = lp.parameters.properties.withPages;
+  ok('withPages 已声明且是 boolean', wp?.type === 'boolean');
+  ok('withPages **默认关**（描述里写明）', /默认关/.test(wp?.description ?? ''), String(wp?.description ?? '').slice(0, 50));
+  ok('withPages 的**代价**写进描述（N 份 = N 次额外请求）', /额外请求/.test(wp?.description ?? ''));
+  ok('单份失败**不炸整张表**（源码里给 pages.reason 兜底）', /pages\.reason/.test(hostSrc) && /d\.pages = \{ nodes: null/.test(hostSrc));
+  // 纯函数：数 sitemap 规模（withPages 靠它，而那条路要发网络请求 → 必须能离屏测）
+  ok('countSitemapPages：节点与可读页**分开数**（Folder 没有 url）',
+    JSON.stringify(countSitemapPages([{ pageName: 'a', url: 'a.html' }, { pageName: 'F', children: [{ pageName: 'b', url: 'b.html' }] }])) === '{"nodes":3,"readable":2}',
+    JSON.stringify(countSitemapPages([{ pageName: 'a', url: 'a.html' }, { pageName: 'F', children: [{ pageName: 'b', url: 'b.html' }] }])));
+  ok('countSitemapPages：空树 / null / 垃圾项都不炸',
+    JSON.stringify(countSitemapPages([])) === '{"nodes":0,"readable":0}'
+    && JSON.stringify(countSitemapPages(null)) === '{"nodes":0,"readable":0}'
+    && JSON.stringify(countSitemapPages([null, {}, { pageName: 'x', url: 'x.html' }])) === '{"nodes":1,"readable":1}');
+  ok('countSitemapPages：只有 Folder → nodes>0 且 readable=0（两个数别混用）',
+    JSON.stringify(countSitemapPages([{ pageName: 'F', children: [{ pageName: 'G' }] }])) === '{"nodes":2,"readable":0}');
+
+
+  // ── 表格构造器：行列数必须一致（实测踩过「多一个空列」—— 单元格带了前导竖线，
+  //    而行模板已经收尾；**工具与 CLI 各栽了一次**，所以抽成共用纯函数并在这里钉住）──
+  const nPipes = (line) => (line.match(/\|/g) ?? []).length;
+  const rowA = { order: 3, name: 'A', docId: 'd1', latestVersion: 'v1', lastVersionNum: 2, updateTime: 't', isReplaced: false };
+  const tOff = productDocsTable([rowA]);
+  ok('productDocsTable 默认（withPages 关）：表头/分隔/行**列数一致**且不含页面列',
+    nPipes(tOff.header) === nPipes(tOff.sep) && nPipes(tOff.sep) === nPipes(tOff.rows[0]) && !/页面节点/.test(tOff.header),
+    `${nPipes(tOff.header)}/${nPipes(tOff.sep)}/${nPipes(tOff.rows[0])}`);
+  const tOn = productDocsTable([{ ...rowA, pages: { nodes: 219, readable: 188 } }], { withPages: true });
+  ok('productDocsTable withPages 开：列数仍一致，页面列是「节点 / 可读页」',
+    nPipes(tOn.header) === nPipes(tOn.rows[0]) && nPipes(tOn.header) > nPipes(tOff.header) && /219 \/ 188/.test(tOn.rows[0]),
+    tOn.rows[0]);
+  const tBad = productDocsTable([{ ...rowA, pages: { nodes: null, readable: null, reason: '拉取失败' } }], { withPages: true });
+  ok('productDocsTable：单份失败 → 该格为 `?` 且**列数不变**',
+    /\| \? \|$/.test(tBad.rows[0]) && nPipes(tBad.header) === nPipes(tBad.rows[0]), tBad.rows[0]);
+  ok('工具与 CLI **共用**同一个表格构造器（不让同一个 bug 各栽一次）',
+    /productDocsTable\(listed\.axureDocs/.test(hostSrc) && /productDocsTable\(listed\.axureDocs/.test(cliSrc));
+
+  // ── 改进4**补刀**：路径标注必须覆盖**所有**打印点，且判定在源头 ──
+  //    ⚠️ 已知人读标题打印点清单（**以后新增打印页面路径的地方，必须走 titleName() 并在此登记**）：
+  //      ① `# 块级清单 —`      ② `# 设计 Token —`
+  //      ③ renderSummary 的 `#`  ④ `# 字体需求 ——`
+  //      ⑤ `# 原型页面样式 ——` 之下那行 `> 路径：`   ⑥ 每页的 `## 路径：`
+  //    （⑤⑥ 在 renderProductLayers 内，由下面另一段断言守着）
+  {
+    const pathMeta = { name: 'A / B / C', nameIsPath: true, width: 100, height: 200 };
+    const tok0 = { colors: [], fontSizes: [], fontWeights: [], fontFamilies: [], radii: [] };
+    const sites = [
+      ['① 块级清单', () => renderBlocks([], pathMeta).split('\n')[0]],
+      ['② 设计 Token', () => renderTokens(tok0, pathMeta).split('\n')[0]],
+      ['③ summary', () => renderSummary({ detail: {}, layers: [], tokens: tok0, meta: pathMeta }).split('\n')[0]],
+      ['④ 字体需求', () => renderFonts([], pathMeta).split('\n')[0]],
+    ];
+    for (const [label, fn] of sites) {
+      const line = fn();
+      ok(`打印点 ${label} 对**路径** meta 标了「路径：」`, /路径：A \/ B \/ C/.test(line), line.slice(0, 58));
+    }
+    // 反向：普通稿名**不许**加前缀 —— 满屏"路径："同样是噪声
+    const plainMeta = { name: '人才详情', width: 375, height: 1333 };
+    ok('反向：普通稿名**不**加「路径：」前缀', !/路径：/.test(renderBlocks([], plainMeta).split('\n')[0]),
+      renderBlocks([], plainMeta).split('\n')[0].slice(0, 50));
+    // 源头必须打标记 —— 漏了它上面四条会一起失灵
+    ok('源头：原型页把 path 当 name 时**必须**同时给 nameIsPath:true（判定在源头，不在打印点）',
+      /name: p\.path,[\s\S]{0,220}?nameIsPath: true,/.test(cliSrc));
+    // 政策：不许再有标题直接插 ${meta.name}（必须走 titleName）
+    ok('政策：标题里不再直接插 `${meta.name}`（一律走 titleName —— 防新增站点又漏）',
+      !/\$\{meta\.name\}/.test(cliSrc));
+    // helper 自身行为
+    ok('titleName：路径加前缀 / 稿名不加 / 空安全',
+      titleName({ name: 'A / B', nameIsPath: true }) === '路径：A / B'
+      && titleName({ name: 'X' }) === 'X' && titleName({}) === '' && titleName(null) === '');
+  }
+
+  // ── 改进4：原型 layers 标题必须标明是「路径」──
+  // 嵌套页面的 path 是 `A / B / C` 拼起来的，不标注会被读成"把多页合并了"（实测误报过一次）
+  const synth = {
+    doc: { name: '某原型' }, project: { name: 'P' }, version: { id: 'v1', isLatest: true },
+    content: [{ pageId: 'p1', path: 'A / B / C', readable: false, reason: '测试夹具' }],
+  };
+  const rendered = renderProductLayers(synth);
+  // ⚠️ **两处都要断言**：标题行一处、每个页面标题一处 —— 只断言一处时，
+  //    去掉另一处的变异**不会红**（实测：只查标题行时，把 `## 路径：` 改回裸 path 照样全绿）。
+  const pathLines = rendered.split('\n').filter((l) => /路径：/.test(l));
+  ok('「路径：」出现在**标题行**（文档名与路径分行，不再拼成 `文档 / A / B`）',
+    pathLines.some((l) => l.startsWith('> 路径：')), pathLines.map((l) => l.slice(0, 22)).join(' ／ '));
+  ok('「路径：」也出现在**每个页面标题**上（嵌套 path 最容易被读成多页）',
+    pathLines.some((l) => l.startsWith('## 路径：')), pathLines.map((l) => l.slice(0, 22)).join(' ／ '));
 }
 
 /* ═══════════════ 汇总 ═══════════════ */

@@ -1220,6 +1220,9 @@ export async function productDocuments(projectId, teamId, opts = {}) {
     latestVersion: d.latest_version ?? null,
     lastVersionNum: d.last_version_num ?? null,
     group: d.group ?? null,
+    // 界面「文档」面板按 order **倒序**且是滚动区 —— 带上它，调用方才能把
+    // "界面上只看到前几个"与"接口给了全部"对上号（实测有人据此以为插件读错了）
+    order: d.order ?? null,
     width: d.width ?? null,
     height: d.height ?? null,
   }));
@@ -1418,6 +1421,63 @@ export function flattenSitemap(roots, parentPath = '', level = 0, out = []) {
     if (Array.isArray(node.children) && node.children.length) flattenSitemap(node.children, path, level + 1, out);
   }
   return out;
+}
+
+/**
+ * 产品文档清单的表格（**工具与 CLI 共用**）。
+ *
+ * 抽出来有两个理由，都是实测换来的：
+ * ① 两边各写一遍时，**同一个"多一个空列"的 bug 出现了两次**（单元格带了前导 `|`，而行模板已收尾）；
+ * ② 抽成纯函数后，自检可以**直接断言行列数一致**，不必发网络请求。
+ */
+export function productDocsTable(docs, opts = {}) {
+  const withPages = Boolean(opts.withPages);
+  const header = `| # | 序 | 名称 | docId | 最新版本 | 版本数 | 更新时间 | 已替换 |${withPages ? ' 页面节点 / 可读页 |' : ''}`;
+  const sep = `|---|---|---|---|---|---|---|---|${withPages ? '---|' : ''}`;
+  const rows = (docs ?? []).map((d, i) => {
+    // ⚠️ 单元格内容 + **收尾**竖线；**不能带前导 `|`**（行模板已经收尾了）
+    const pages = withPages ? ` ${d.pages?.nodes == null ? '?' : `${d.pages.nodes} / ${d.pages.readable}`} |` : '';
+    return `| ${i + 1} | ${d.order ?? '—'} | ${d.name} | ${d.docId} | ${d.latestVersion ?? '—'} | ${d.lastVersionNum ?? '—'} | ${d.updateTime ?? '—'} | ${d.isReplaced ? '**是**' : '否'} |${pages}`;
+  });
+  return { header, sep, rows };
+}
+
+/**
+ * 数 sitemap 的规模：`nodes` = 页面节点总数（含 Folder），`readable` = 有 `url` 的真正可读页。
+ *
+ * 抽成纯函数是为了能**离屏自检** —— 它服务于 `withPages`，而那条路要发 N 次网络请求。
+ * ⚠️ **Folder 节点没有 `url`**，所以"节点数"与"可读页数"是**两个数**，别混用：
+ * 实测同一份原型 219 个节点 / 188 个可读页。
+ */
+export function countSitemapPages(roots) {
+  let nodes = 0;
+  let readable = 0;
+  const walk = (list) => {
+    for (const n of list ?? []) {
+      if (!n || typeof n !== 'object') continue;
+      if (n.pageName || n.name || n.url) {
+        nodes += 1;
+        if (n.url) readable += 1;
+      }
+      if (Array.isArray(n.children) && n.children.length) walk(n.children);
+    }
+  };
+  walk(Array.isArray(roots) ? roots : []);
+  return { nodes, readable };
+}
+
+/**
+ * 标题里的"名字"该怎么打印 —— **所有标题打印点都必须走它**。
+ *
+ * 为什么需要它：原型页面的 `meta.name` 是**页面树路径**（`A / B / C` 拼起来的），
+ * 直接插进去会被读成"**把多页合并了**"（实测有人据此误报过一次）。
+ * 判定放在**源头**（`meta.nameIsPath`），打印点统一走本函数 ——
+ * 这样**以后新增打印点不会又漏**（曾经漏过 `# 块级清单 —` 那条）。
+ */
+export function titleName(meta) {
+  const n = String(meta?.name ?? '');
+  if (!n) return '';
+  return meta?.nameIsPath ? `路径：${n}` : n;
 }
 
 /** 解 HTML 实体（Axure 导出的正文是**实体编码**的，如 `&#x9996;&#x9875;` = 首页）。 */
@@ -1698,7 +1758,7 @@ export function renderGaps(gaps, limit = 60) {
 /** B2 的文本渲染。 */
 export function renderFonts(fonts, meta = {}) {
   const L = [];
-  L.push(`# 字体需求（${fonts.length} 个字体族）${meta.name ? ` —— ${meta.name}` : ''}`);
+  L.push(`# 字体需求（${fonts.length} 个字体族）${meta.name ? ` —— ${titleName(meta)}` : ''}`);
   L.push('> 交付给前端时**照着这张表装字体**：漏装 = 整页回退到系统字体，排版全变。');
   L.push('> `可用性` 一律是 `not_checked` —— 本插件**不检测本机字体**（跨平台枚举不可靠），不假装校验过。');
   L.push('');
@@ -2313,14 +2373,17 @@ export function normalizeAxurePage({ document: doc, html, pageUrl = null } = {})
 export function renderProductLayers(result, opts = {}) {
   const L = [];
   const c = result.content?.[0] ?? null;
-  L.push(`# 原型页面样式 —— ${result.doc?.name ? `${result.doc.name} / ` : ''}${c?.path ?? c?.name ?? '(未指定页)'}`);
+  L.push(`# 原型页面样式 —— ${result.doc?.name ?? '(未知文档)'}`);
+  L.push(`> 路径：${c?.path ?? c?.name ?? '(未指定页)'}${c?.pageId ? `（pageId ${c.pageId}）` : ''}`);
   L.push('> ⚠️ 这是 **Axure 原型**里的样式值，**不是设计稿** —— 颜色/字号是设计者随手填的，');
   L.push('> 可以照着实现，但**最终视觉以 UI 设计稿为准**（有设计稿时用 lanhu_read_design / lanhu_read_blocks）。');
   if (result.project) L.push(`> 项目：${result.project.name ?? '—'}${result.project.folderName ? `（${result.project.folderName}）` : ''}`);
   L.push(`> 版本：${result.version?.id ?? '—'}${result.version?.isLatest === false ? `（**不是最新版**，最新 ${result.version.latestId}）` : '（最新版）'}`);
   for (const p of result.content ?? []) {
     L.push('');
-    L.push(`## ${p.path}（pageId ${p.pageId}）`);
+    // ⚠️ 必须写"路径：" —— 嵌套页面的 path 是 `A / B / C` 拼起来的，
+    //    不标注就会被读成"把多页合并了"（实测我自己就据此误报过一次）。
+    L.push(`## 路径：${p.path}（pageId ${p.pageId}）`);
     if (!p.readable) { L.push(`（不可读：${p.reason}）`); continue; }
     const s = p.stats ?? {};
     L.push(`> 控件 ${s.widgetCount ?? '?'} 个（可见 ${s.visibleCount ?? '?'}）· 带底色 ${s.withFill ?? '?'} · 带字号 ${s.withFont ?? '?'} · 带文本 ${s.withText ?? '?'} · 最大层级 ${s.maxDepth ?? '?'}`);
@@ -2356,6 +2419,9 @@ export function renderProductLayers(result, opts = {}) {
     L.push('');
     L.push(renderBlocks(blocks, {
       name: p.path,
+      // ⚠️ **必须带这个标记**：原型页的 name 是**路径**不是稿名。下游标题统一走 titleName()，
+      //    这里漏了它整条链就失灵（已加断言钉住）。
+      nameIsPath: true,
       width: p.stats?.pageWidth,
       height: p.stats?.pageHeight,
     }, { limit: Number(opts.limit ?? 60), includeNoise: Boolean(opts.includeNoise) }));
@@ -2886,19 +2952,12 @@ const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/
  * 这里把整串、`#` 之后、`?` 之后三段都扫一遍，参数名兼容 tid/team_id、pid/project_id、image_id。
  * 也接受直接给三个 id 的场景（面板里贴 id 同样能用）。
  */
-export function parseLanhuUrl(input) {
-  const raw = String(input ?? '').trim();
-  if (!raw) throw new LanhuError('请粘贴一个蓝湖链接（形如 https://lanhuapp.com/web/#/item/project/detailDetach?tid=…&image_id=…）。');
-
-  // 直接给 id 的简写：projectId imageId [teamId]（空格或逗号分隔）
-  if (!/^https?:\/\//i.test(raw) && !raw.includes('=')) {
-    const parts = raw.split(/[\s,]+/).filter(Boolean);
-    const ids = parts.filter((p) => UUID_RE.test(p));
-    if (ids.length >= 2) {
-      return { teamId: ids[2] ?? null, projectId: ids[0], imageId: ids[1], url: null, source: 'ids', versionId: null, docId: null, pageId: null };
-    }
-  }
-
+/**
+ * 从**任意**蓝湖链接里抽参数（**宽容**：只解析，不校验任何必填项）。
+ * `parseLanhuUrl`（面向"某一张稿"）与 `parseProjectTarget`（面向"某个项目"）共用它 ——
+ * 两处各写一遍迟早会走偏。
+ */
+function lanhuUrlParams(raw) {
   const params = new Map();
   const chunks = [raw];
   const hashIdx = raw.indexOf('#');
@@ -2917,6 +2976,54 @@ export function parseLanhuUrl(input) {
     for (const k of keys) { const v = params.get(k); if (v) return v; }
     return null;
   };
+  return { params, pick };
+}
+
+/**
+ * 从**任意**蓝湖链接里取**项目级**目标（`teamId` / `projectId`）—— **不要求 `image_id`**。
+ *
+ * ⚠️ **不能用 `parseLanhuUrl` 代替它**：那个是面向"**某一张稿**"的，**没有 image_id 就抛错**；
+ * 而"列出这个项目的全部设计稿"只关心项目，链接常常是**项目页/列表页**，本来就没有 image_id
+ * （实测：拿项目链接调 `list_designs` 直接报"没找到 image_id" —— 这正是它存在的理由）。
+ * 也接受直接给一个项目 id（uuid）。
+ */
+export function parseProjectTarget(input) {
+  const raw = String(input ?? '').trim();
+  if (!raw) throw new LanhuError('需要一条蓝湖链接或一个项目 id（projectId）。');
+  // 直接给 uuid：当项目 id 用
+  if (!/^https?:\/\//i.test(raw) && !raw.includes('=') && UUID_RE.test(raw)) {
+    return { projectId: raw, teamId: null, imageId: null, url: null, source: 'id' };
+  }
+  const { pick } = lanhuUrlParams(raw);
+  const projectId = pick('project_id', 'projectId', 'pid');
+  const teamId = pick('tid', 'team_id', 'teamId');
+  const imageId = pick('image_id', 'imageId', 'iid');
+  if (!projectId || !UUID_RE.test(projectId)) {
+    throw new LanhuError(`链接里没找到有效的项目 id（project_id/pid）：${projectId ?? '缺失'}。\n提示：项目页地址里通常带 pid=；也可以直接给项目 id。`);
+  }
+  return {
+    projectId,
+    teamId: teamId && UUID_RE.test(teamId) ? teamId : null,
+    imageId: imageId && UUID_RE.test(imageId) ? imageId : null,
+    url: raw,
+    source: 'url',
+  };
+}
+
+export function parseLanhuUrl(input) {
+  const raw = String(input ?? '').trim();
+  if (!raw) throw new LanhuError('请粘贴一个蓝湖链接（形如 https://lanhuapp.com/web/#/item/project/detailDetach?tid=…&image_id=…）。');
+
+  // 直接给 id 的简写：projectId imageId [teamId]（空格或逗号分隔）
+  if (!/^https?:\/\//i.test(raw) && !raw.includes('=')) {
+    const parts = raw.split(/[\s,]+/).filter(Boolean);
+    const ids = parts.filter((p) => UUID_RE.test(p));
+    if (ids.length >= 2) {
+      return { teamId: ids[2] ?? null, projectId: ids[0], imageId: ids[1], url: null, source: 'ids', versionId: null, docId: null, pageId: null };
+    }
+  }
+
+  const { pick } = lanhuUrlParams(raw);
 
   const projectId = pick('project_id', 'projectId', 'pid');
   const imageId = pick('image_id', 'imageId', 'iid');
@@ -3051,7 +3158,7 @@ export function renderBlocks(blocks, meta = {}, opts = {}) {
   const noiseCount = blocks.filter((b) => b.noise).length;
   const main = opts.includeNoise ? blocks : blocks.filter((b) => !b.noise);
 
-  L.push(`# 块级清单 — ${meta.name ?? ''}（${meta.width ?? '?'}×${meta.height ?? '?'}）`);
+  L.push(`# 块级清单 — ${titleName(meta)}（${meta.width ?? '?'}×${meta.height ?? '?'}）`);
   L.push('');
   L.push(`共 **${blocks.length}** 块：` + (Object.entries(counts).map(([k, v]) => `${BLOCK_KINDS[k] ?? k} ${v}`).join(' / ') || '—'));
   if (noiseCount > 0) {
@@ -3151,7 +3258,7 @@ function metricsText(font) {
 /** tokens 模式：只给色板 / 字号 / 圆角统计。 */
 export function renderTokens(tokens, meta = {}) {
   const L = [];
-  L.push(`# 设计 Token — ${meta.name ?? ''}（${meta.width ?? '?'}×${meta.height ?? '?'}）`);
+  L.push(`# 设计 Token — ${titleName(meta)}（${meta.width ?? '?'}×${meta.height ?? '?'}）`);
   L.push('');
   L.push(`## 色板（${tokens.colors.length} 个唯一色）`);
   L.push('| 色值 | rgb | 出现次数 |');
@@ -3176,7 +3283,7 @@ export function renderTokens(tokens, meta = {}) {
 /** summary 模式：token + 文本层清单（默认紧凑，控制在 4KB 内）。 */
 export function renderSummary({ detail, layers, tokens, meta, maxTextLayers = 36 }) {
   const L = [];
-  L.push(`# ${detail.name ?? meta.name ?? '设计稿'}（${meta.width}×${meta.height}）`);
+  L.push(`# ${detail.name || titleName(meta) || '设计稿'}（${meta.width}×${meta.height}）`);
   L.push(`图层 ${layers.length} 个 | 文本层 ${layers.filter((l) => l.text).length} 个 | 导出图 ${layers.filter((l) => l.hasImage).length} 个`);
   L.push('');
 
@@ -3338,6 +3445,8 @@ export async function readDesign(args = {}) {
   const colorLimit = format === 'full' ? tokens.colors.length : 30;
   const base = {
     name: meta.name,
+    // 机器读的输出也要能分辨：它是**路径**还是稿名（人读的标题由 titleName() 加"路径："前缀）
+    nameIsPath: Boolean(meta.nameIsPath),
     viewport: { width: meta.width, height: meta.height },
     layerCount: layers.length,
     textLayerCount: layers.filter((l) => l.text).length,
@@ -3526,6 +3635,8 @@ export async function readBlocks(args = {}) {
     ok: true,
     format: 'blocks',
     name: meta.name,
+    // 机器读的输出也要能分辨：它是**路径**还是稿名（人读的标题由 titleName() 加"路径："前缀）
+    nameIsPath: Boolean(meta.nameIsPath),
     viewport: { width: meta.width, height: meta.height },
     origin: meta.origin,
     device: meta.device,
@@ -5214,7 +5325,11 @@ export async function main(argv = process.argv.slice(2)) {
         return r;
       }
       case 'designs': {
-        const r = await listImages(args.project, { cookie });
+        // 与工具链一致：**贴链接就行**；显式 --project 优先；都不给 → 明确报错（不静默给空表）
+        const target = args.url ? parseProjectTarget(args.url) : null;
+        const projectId = args.project ?? target?.projectId ?? null;
+        if (!projectId) throw new LanhuError('用法：node lanhu.mjs designs --url "<蓝湖链接>"，或 --project <pid>（两个都不给无法定位项目）');
+        const r = await listImages(projectId, { cookie });
         if (args.json) printJson(r);
         else {
           console.log(`${r.projectName ?? r.projectId}：${r.images.length} 张稿`);
@@ -5278,15 +5393,33 @@ export async function main(argv = process.argv.slice(2)) {
         if (!projectId || !teamId) throw new LanhuError('用法：node lanhu.mjs product-docs --url "<原型链接>"（链接里带 tid/pid），或 --project <pid> --team <tid>');
         const listed = await productDocuments(projectId, teamId, { cookie });
         const info = await multiInfo(projectId, teamId, { cookie }).catch(() => null);
+        // --with-pages：逐份拉 sitemap 数页面规模（**默认关** —— N 份 = N 次额外请求）。
+        // 单份失败只标 `?`，绝不炸整张表（与工具链同一口径）。
+        const withPages = Boolean(args['with-pages']);
+        if (withPages) {
+          for (const d of listed.axureDocs) {
+            try {
+              const { tree } = await fetchDesignTree(projectId, d.docId, { cookie, expect: 'prototype' });
+              const c = countSitemapPages(tree?.sitemap?.rootNodes);
+              d.pages = { nodes: c.nodes, readable: c.readable };
+            } catch (e) {
+              d.pages = { nodes: null, readable: null, reason: String(e?.message ?? e).slice(0, 80) };
+            }
+          }
+        }
         if (args.json) printJson({ ...listed, project: info });
         else {
           console.log(`# 产品文档（原型）${info?.name ? ` —— ${info.name}` : ''}`);
           if (info) console.log(`> 项目：${info.folderName ? `${info.folderName} / ` : ''}${info.name ?? '—'}${info.creatorName ? ` · 创建者 ${info.creatorName}` : ''}`);
           console.log(`> 共 ${listed.total} 个资源，其中 ${listed.axureDocs.length} 个是 axure 原型文档（**不是设计稿**）`);
           console.log('');
-          console.log('| # | 名称 | docId | 最新版本 | 版本数 | 更新时间 |');
-          console.log('|---|---|---|---|---|---|');
-          listed.axureDocs.forEach((d, i) => console.log(`| ${i + 1} | ${d.name} | ${d.docId} | ${d.latestVersion ?? '—'} | ${d.lastVersionNum ?? '—'} | ${d.updateTime ?? '—'} |`));
+          const table = productDocsTable(listed.axureDocs, { withPages });
+          console.log(table.header);
+          console.log(table.sep);
+          table.rows.forEach((r) => console.log(r));
+          console.log('');
+          console.log('> 「序」是接口的 order：蓝湖「文档」面板**按它倒序**显示且是**滚动区** —— 界面里只看到前几个，不代表只有那几个。');
+          if (withPages) console.log(`> 「页面节点 / 可读页」是逐份拉 sitemap 数出来的（本次额外发了 ${listed.axureDocs.length} 次请求）；\`?\` = 那份失败。Folder 没有 url，所以节点数 ≥ 可读页数。`);
         }
         return listed;
       }
