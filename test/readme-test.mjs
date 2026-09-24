@@ -19,6 +19,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execFileSync } from 'node:child_process';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (p) => fs.readFileSync(path.join(ROOT, p), 'utf8');
@@ -137,6 +138,48 @@ group('④ 发布说明与公开纪律');
 }
 function pkgFilesOk(files) {
   return Array.isArray(files) && files.every((f) => !path.isAbsolute(f));
+}
+
+/* ═══════════════ ⑤ 写死的数字（最会悄悄过期的一类） ═══════════════ */
+group('⑤ 写死的数字');
+{
+  // 工具数：README 的散文里写死了「N 个原生工具」——工具从 13 长到 15 时，生成块会跟着变，
+  // 但散文里的数字**不会**，而且没有任何东西会报错（实测就是这么过期的）。这条把它钉住。
+  const { TOOLS } = await import('../lib/index.js');
+  const claims = [...readme.matchAll(/(\d+)\s*个原生工具/g)].map((m) => Number(m[1]));
+  const enClaims = [...readme.matchAll(/The\s+(\d+)\s+tools/g)].map((m) => Number(m[1]));
+  for (const n of [...claims, ...enClaims]) {
+    ok(`README 写死的工具数 ${n} == 实际 ${TOOLS.length}`, n === TOOLS.length, `README 写 ${n}，实际 ${TOOLS.length}`);
+  }
+  ok('README 至少写了一处工具数', claims.length + enClaims.length > 0);
+
+  // 自检项数：README / docs / 发布清单里写死的数字必须是**真跑出来的那个**。
+  let actual = null;
+  try {
+    const out = execFileSync(process.execPath, ['test/selfcheck.mjs'], { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
+    const m = out.match(/合计：(\d+) 项/);
+    actual = m ? Number(m[1]) : null;
+  } catch (e) { actual = null; }
+  ok('能跑通 selfcheck 并解析出项数', actual !== null, '解析结果 ' + actual);
+  if (actual !== null) {
+    const files = ['README.md', 'docs/CLI与开发.md', '.github/release-notes/README.md'];
+    let checked = 0;
+    for (const f of files) {
+      if (!exists(f)) continue;
+      const t = read(f);
+      for (const m of t.matchAll(/自检[^\d\n]{0,12}(\d+)\s*项|(\d+)\s*项[^\n]{0,10}自检/g)) {
+        const n = Number(m[1] ?? m[2]);
+        checked += 1;
+        ok(`${f} 写死的自检项数 ${n} == 实际 ${actual}`, n === actual, `写 ${n}，实际 ${actual}`);
+      }
+      for (const m of t.matchAll(/selfcheck\.mjs\s*#\s*(\d+)\s*项/g)) {
+        const n = Number(m[1]);
+        checked += 1;
+        ok(`${f} 注释里的自检项数 ${n} == 实际 ${actual}`, n === actual, `写 ${n}，实际 ${actual}`);
+      }
+    }
+    ok('确实检查到了写死的项数（不是空跑）', checked > 0, '检查了 ' + checked + ' 处');
+  }
 }
 
 /* ═══════════════ 汇报 ═══════════════ */

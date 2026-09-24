@@ -24,6 +24,10 @@ const nodeRequire = createRequire(import.meta.url);
 
 export const BASE = 'https://lanhuapp.com';
 export const REFERER = `${BASE}/web/`;
+/** Axure 原型（产品文档）的静态资源 CDN。正文与页面数据都在这里，用 sitemap 里的 `sign_md5` 当路径。 */
+export const AXURE_CDN = 'https://axure-file.lanhuapp.com';
+/** DDS（设计数据服务）—— 与主站不同域，鉴权也不同（见 ddsSchema）。 */
+export const DDS_BASE_URL = 'https://dds.lanhuapp.com';
 
 /* ==========================================================================
  * 错误
@@ -621,7 +625,8 @@ export function cookieExpiry(cookie) {
  * 或裸 Cookie 串 —— 内部统一交给 parseCookieInput 解析，调用方不用自己抠串。
  *
  * @param {string} input 粘贴内容
- * @param {{verify?: boolean, dryRun?: boolean}} [opts] dryRun=true 时只解析校验、不落盘
+ * @param {{verify?: boolean, dryRun?: boolean, account?: string}} [opts]
+ *   dryRun=true 只解析校验、不落盘；给了 account 就写进该账号（`cookies/<alias>`）而不是旧的默认文件
  */
 export async function saveCookie(input, opts = {}) {
   const parsed = parseCookieInput(input);
@@ -642,7 +647,24 @@ export async function saveCookie(input, opts = {}) {
     expiry: parsed.expiry ?? cookieExpiry(value),
   };
 
-  if (opts.dryRun) return { dryRun: true, written: false, ...info };
+  // ⚠️ 给了 account 就**必须**写进那个账号。`account` 是 lib/index.js 给所有工具统一注入的参数
+  //    （`{ ...parameters, account: ACCOUNT_PARAM }`），调用方很容易以为它在这个工具上也生效；
+  //    若忽略它，`cookie_set {account:"x"}` 会**静默覆盖默认账号**的 Cookie —— 正是本项目最怕的那类静默。
+  const account = opts.account ? safeAlias(opts.account) : null;
+  if (account && !loadAccounts().accounts.some((a) => a.alias === account)) {
+    throw new LanhuError(`账号 "${account}" 不存在，不能把 Cookie 写给它。`, {
+      code: 'ACCOUNT_NOT_FOUND',
+      hint: '先用 lanhu_accounts {action:"list"} 看现有账号；要新增就用 action:"add"。',
+    });
+  }
+
+  if (opts.dryRun) return { dryRun: true, written: false, ...info, account };
+
+  if (account) {
+    // 与 lanhu_accounts add 走同一条路：建目录、600、回填 masked/expiry 索引
+    upsertAccount({ alias: account, cookie: value });
+    return { path: cookiePathFor(account), written: true, ...info, account };
+  }
 
   const dir = lanhuHome();
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
@@ -788,17 +810,31 @@ export async function apiRequest(url, opts = {}) {
   };
   if (opts.body !== undefined) headers['content-type'] = 'application/json';
 
+  // 网络重试：蓝湖域名偶发超时（实测），而**重试一次的收益远大于让调用方自己重来**。
+  // 只重试网络层失败（超时/连接错误）——HTTP 4xx/5xx 与业务 code 一律不重试，
+  // 否则会把"登录失效"这类确定性错误拖成三次慢失败。
+  const attempts = Math.max(1, Number(opts.retries ?? 3));
   let res;
-  try {
-    res = await fetch(url, {
-      method: opts.method ?? 'GET',
-      headers,
-      body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
-      signal: AbortSignal.timeout(opts.timeout ?? DEFAULT_TIMEOUT),
-    });
-  } catch (e) {
+  let lastErr;
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      res = await fetch(url, {
+        method: opts.method ?? 'GET',
+        headers,
+        body: opts.body === undefined ? undefined : JSON.stringify(opts.body),
+        signal: AbortSignal.timeout(opts.timeout ?? DEFAULT_TIMEOUT),
+      });
+      lastErr = null;
+      break;
+    } catch (e) {
+      lastErr = e;
+      if (i < attempts - 1) await new Promise((r) => setTimeout(r, 600 * (i + 1)));
+    }
+  }
+  if (lastErr) {
+    const e = lastErr;
     const reason = e?.name === 'TimeoutError' ? `请求超时（${opts.timeout ?? DEFAULT_TIMEOUT}ms）` : `网络请求失败：${e?.message ?? e}`;
-    throw new LanhuError(reason, { hint: '检查网络连通性；若在受限网络下，蓝湖域名 lanhuapp.com 需可达。' });
+    throw new LanhuError(`${reason}（已重试 ${attempts} 次）`, { hint: '检查网络连通性；若在受限网络下，蓝湖域名 lanhuapp.com 需可达。' });
   }
 
   const buf = Buffer.from(await res.arrayBuffer());
@@ -955,22 +991,44 @@ export function isReadableDetail(detail) {
   return Boolean(detail && (detail.jsonUrl || detail.name));
 }
 
-/** 稿详情 → json_url（两步走的第一步）。 */
+/**
+ * 稿详情 → json_url（两步走的第一步）。
+ *
+ * `opts.version` = 版本 id 或 `'latest'`（默认）。**给了具体版本就必须命中**（B1），
+ * 命中不了抛 `VERSION_NOT_FOUND` —— 静默回退到 latest 会让调用方以为拿到了指定版本。
+ *
+ * ⚠️ 版本为空（空壳）时**不在这里抛错**：那是"当前账号读不到"的信号，
+ *    由 fetchDesignTree 用更准的话说（见 isReadableDetail 的长注释）。
+ */
 export async function imageDetail(projectId, imageId, opts = {}) {
   if (!projectId || !imageId) throw new LanhuError('imageDetail 需要 projectId 与 imageId。');
   const url = `${BASE}/api/project/image?pid=${encodeURIComponent(projectId)}&image_id=${encodeURIComponent(imageId)}`;
   const { json } = await apiRequest(url, opts);
   const raw = unwrap(json) ?? {};
-  const version = raw.versions?.[0] ?? {};
+  const versions = Array.isArray(raw.versions) ? raw.versions : [];
+  const want = opts.version == null || opts.version === '' ? 'latest' : String(opts.version);
+  let version = null;
+  if (versions.length > 0) {
+    version = pickVersion(versions, want);
+  } else if (want !== 'latest') {
+    throw new LanhuError(`指定的版本不存在：${want}（该稿在当前账号下没有任何版本）。`, { code: 'VERSION_NOT_FOUND' });
+  }
   return {
     imageId: raw.id ?? imageId,
     name: raw.name,
     width: raw.width,
     height: raw.height,
-    versionId: version.id,
-    jsonUrl: version.json_url,
-    d2cUrl: version.d2c_url ?? null,
-    versionLayoutData: version.version_layout_data ?? null,
+    versionId: version?.id ?? null,
+    jsonUrl: version?.json_url ?? null,
+    d2cUrl: version?.d2c_url ?? null,
+    versionLayoutData: version?.version_layout_data ?? null,
+    // 版本透明度：调用方要能知道"我拿到的是第几版、还有没有更新的版本"
+    versionCount: versions.length,
+    versionRequested: want,
+    versionLatestId: versions[0]?.id ?? null,
+    versionIsLatest: versions.length > 0 ? String(versions[0]?.id) === String(version?.id) : null,
+    latestVersionAt: versions[0]?.create_time ?? null,
+    account: opts.account ?? null,
   };
 }
 
@@ -1013,9 +1071,19 @@ export async function search(teamId, keyword, opts = {}) {
   return { images, projects, prds, keyword: keyword ?? '' };
 }
 
-/** 拉图层树（两步走：详情拿 json_url → 取 JSON）。 */
+/** 拉图层树（两步走：详情拿 json_url → 取 JSON）。内置 A2：docId 失效时自动找回。 */
 export async function fetchDesignTree(projectId, imageId, opts = {}) {
-  const detail = await imageDetail(projectId, imageId, opts);
+  let detail;
+  try {
+    detail = await imageDetail(projectId, imageId, opts);
+  } catch (e) {
+    // A2 · docId 失效（被重新上传过）→ 用 product_documents 找回当前有效的那份，而不是把错误丢给调用方
+    const gone = String(e?.code) === '10009' || /Image not exist/i.test(String(e?.message ?? ''));
+    if (!gone || opts._noRelocate || !opts.teamId) throw e;
+    const rel = await relocateDocId({ projectId, teamId: opts.teamId, docId: imageId, pageId: opts.pageId }, opts);
+    const moved = await imageDetail(projectId, rel.docId, opts);
+    detail = { ...moved, relocatedFrom: rel.relocatedFrom, relocatedTo: rel.docId, relocateCandidates: rel.candidates };
+  }
   if (!detail.jsonUrl) {
     // 空壳 ≠ "稿子坏了"：蓝湖对**当前账号读不到**的稿子就是返回空壳。
     // 多账号场景下这是最常见的原因，报错必须点出来，否则会被误当成"该稿没生成图层数据"。
@@ -1028,21 +1096,799 @@ export async function fetchDesignTree(projectId, imageId, opts = {}) {
     }
     throw new LanhuError(`稿 ${imageId} 没有 json_url（可能还没有生成图层数据，或该稿类型不支持）。`);
   }
-  const { value: cookie } = resolveCookie(opts.cookie, { account: opts.account });
-  const res = await fetch(detail.jsonUrl, {
-    headers: { Cookie: cookie ?? '', Referer: REFERER, Accept: 'application/json, text/plain, */*' },
-    signal: AbortSignal.timeout(opts.timeout ?? DEFAULT_TIMEOUT),
-  });
-  if (!res.ok) throw new LanhuError(`拉取图层树失败：HTTP ${res.status}`);
-  const buf = Buffer.from(await res.arrayBuffer());
-  const text = decodeBody(buf, res.headers.get('content-type') || '');
-  let tree;
-  try {
-    tree = JSON.parse(text);
-  } catch {
-    throw new LanhuError('图层树不是合法 JSON（编码或权限问题）。', { hint: `响应开头：${text.slice(0, 120)}` });
+  const tree = await fetchJsonUrl(detail.jsonUrl, opts);
+  // 原型（Axure）与设计稿**不是同一种树**：原型是 {pages, sitemap}，设计稿是 {artboard, …}。
+  // 拿设计稿的解析器去跑原型树不会抛错，只会得到"1 层"这种**看起来像结果**的垃圾 —— 必须拦住。
+  const isProto = !tree.artboard && Boolean(tree.pages || tree.sitemap);
+  const expect = opts.expect ?? 'design';
+  if (isProto && expect === 'design') {
+    throw new LanhuError('这是**原型/产品文档**（Axure），不是设计稿 —— 它的图层树在 `pages` 里，用设计稿解析器只会得到空结果。', {
+      code: 'PROTOTYPE_NOT_DESIGN',
+      hint: '改用 lanhu_read_product_doc 读它（页面树 + 正文）；想找设计稿请用 lanhu_list_designs。',
+    });
   }
-  return { detail, tree, bytes: buf.length };
+  if (!isProto && expect === 'prototype') {
+    throw new LanhuError('这是**设计稿**，不是原型/产品文档。', {
+      code: 'DESIGN_NOT_PROTOTYPE',
+      hint: '改用 lanhu_read_design / lanhu_read_blocks 读它。',
+    });
+  }
+  return { detail, tree, bytes: 0 };
+}
+
+/* ==========================================================================
+ * 3b. 产品文档（PRD / Axure 原型）
+ *
+ * 与「设计稿」是**两套东西**：设计稿是像素级的图（image 接口 + 图层 JSON），
+ * 产品文档是 Axure 导出的**原型/需求文档**（product_documents 接口 + sitemap + 页面 HTML）。
+ * 两者都挂在同一个 project 下，但接口、数据结构、能回答的问题完全不同：
+ *   · 设计稿 → 「这个按钮什么颜色、几 px 圆角」
+ *   · 原型   → 「这一步的业务规则是什么、字段有哪些、跳转去哪」
+ * ========================================================================== */
+
+/** Axure 的 `color` 是 32 位整数。实测高字节常是 `0xFF`（不透明），也有它是真 alpha 的时候
+ *  （渐变 stop 的 `color` 高字节与同项的 `opacity` 对得上，例如 0x1A ≈ 0.098）。
+ *  所以：高字节非 0 当 alpha，为 0 当不透明 —— 这条是**启发式**，不是官方文档保证。 */
+export function argbColor(n) {
+  if (typeof n !== 'number' || !Number.isFinite(n)) return null;
+  const u = n >>> 0;
+  const a = (u >>> 24) & 0xff;
+  const hex = '#' + (u & 0xffffff).toString(16).padStart(6, '0');
+  return { hex, alpha: a === 0 ? 1 : round2(a / 255) };
+}
+
+/** `/api/project/product_documents` 的时间是 **RFC 2822**（如 `Sat, 12 Sep 2026 22:30:43 GMT`），
+ *  和其它接口的 ISO8601 不是一套 —— 直接 `new Date()` 解析在部分环境会得到 Invalid Date。 */
+export function parseRfc2822(value) {
+  if (!value) return null;
+  const t = Date.parse(String(value));
+  if (Number.isNaN(t)) return String(value);
+  return new Date(t).toISOString();
+}
+
+/**
+ * 解析**产品文档/原型**链接。
+ *
+ * 为什么不复用 `parseLanhuUrl`：那个函数**强制要求 `image_id`**（设计稿详情页才有），
+ * 而原型页链接形如 `#/item/project/product?...&docId=…&docType=axure&pageId=…`，
+ * 可能一个 `image_id` 都没有。硬套会让"原型链接"直接报"没找到设计稿 id"。
+ */
+export function parseProductUrl(input) {
+  const raw = String(input ?? '').trim();
+  if (!raw) throw new LanhuError('请粘贴一个蓝湖产品文档（原型）链接，形如 https://lanhuapp.com/web/#/item/project/product?tid=…&pid=…&docId=…');
+  const params = new Map();
+  const chunks = [raw];
+  const hashIdx = raw.indexOf('#');
+  if (hashIdx >= 0) chunks.push(raw.slice(hashIdx + 1));
+  const qIdx = raw.indexOf('?');
+  if (qIdx >= 0) chunks.push(raw.slice(qIdx + 1));
+  for (const chunk of chunks) {
+    const q = chunk.includes('?') ? chunk.slice(chunk.indexOf('?') + 1) : chunk;
+    for (const m of q.matchAll(/([A-Za-z_][A-Za-z0-9_]*)=([^&#\s]*)/g)) {
+      if (!params.has(m[1])) {
+        try { params.set(m[1], decodeURIComponent(m[2])); } catch { params.set(m[1], m[2]); }
+      }
+    }
+  }
+  const pick = (...keys) => { for (const k of keys) { const v = params.get(k); if (v) return v; } return null; };
+  const uuid = (v) => (v && UUID_RE.test(v) ? v : null);
+  const teamId = uuid(pick('tid', 'team_id', 'teamId'));
+  const projectId = uuid(pick('project_id', 'projectId', 'pid'));
+  // docId 与 image_id 在原型链接里通常同值（原型文档也走 image 接口），两个都认。
+  const docId = uuid(pick('docId', 'doc_id', 'image_id', 'imageId'));
+  const pageId = pick('pageId', 'page_id');
+  const versionId = uuid(pick('versionId', 'version_id', 'vid'));
+  return { teamId, projectId, docId, pageId, versionId, url: raw };
+}
+
+/** 产品文档列表。`resources[]` 里 `type==='axure'` 才是原型文档（同项目下还会有别的类型）。 */
+export async function productDocuments(projectId, teamId, opts = {}) {
+  if (!projectId) throw new LanhuError('product_documents 需要 projectId。');
+  if (!teamId) throw new LanhuError('product_documents 需要 teamId（tid）—— 蓝湖这个接口不接受缺省团队。');
+  const url = `${BASE}/api/project/product_documents?team_id=${encodeURIComponent(teamId)}&project_id=${encodeURIComponent(projectId)}`;
+  const { json } = await apiRequest(url, opts);
+  const raw = unwrap(json) ?? {};
+  const all = Array.isArray(raw.resources) ? raw.resources : [];
+  const docs = all.map((d) => ({
+    docId: d.id,
+    type: d.type,
+    name: d.name,
+    updateTime: parseRfc2822(d.update_time),
+    createTime: parseRfc2822(d.create_time),
+    isReplaced: Boolean(d.is_replaced),
+    latestVersion: d.latest_version ?? null,
+    lastVersionNum: d.last_version_num ?? null,
+    group: d.group ?? null,
+    width: d.width ?? null,
+    height: d.height ?? null,
+  }));
+  return {
+    projectId,
+    teamId,
+    defaultGroupId: raw.default_group_id ?? null,
+    needGroup: raw.need_group ?? null,
+    docCanDownload: raw.doc_can_download ?? null,
+    total: docs.length,
+    axureDocs: docs.filter((d) => d.type === 'axure'),
+    docs,
+  };
+}
+
+/** 项目信息（名称 / 文件夹 / 创建者）。`doc_info=1` 让接口顺带回文档信息。 */
+export async function multiInfo(projectId, teamId, opts = {}) {
+  if (!projectId) throw new LanhuError('multi_info 需要 projectId。');
+  const qs = new URLSearchParams({ project_id: projectId, doc_info: '1' });
+  if (teamId) qs.set('team_id', teamId);
+  const { json } = await apiRequest(`${BASE}/api/project/multi_info?${qs}`, opts);
+  const raw = unwrap(json) ?? {};
+  return {
+    projectId,
+    name: raw.name ?? null,
+    folderName: raw.folder_name ?? null,
+    creatorName: raw.creator_name ?? null,
+    teamId: raw.team_id ?? teamId ?? null,
+    memberCount: raw.member_cnt ?? null,
+    scale: raw.scale ?? null,
+  };
+}
+
+/**
+ * **B1 · 固定版本选择**（纯函数，便于自检）。
+ *
+ * 为什么必须有：不指定版本时拿到的是 `latest`。设计稿一更新，**代码与稿子就不是同一版了，
+ * 而且调用方不会知道**——"我照着这版做的"这句话会悄悄失去依据。
+ * 给了 `version` 就必须命中，**命中不了要报错，绝不静默回退到 latest**（静默回退比报错更坏：
+ * 调用方会以为自己拿到的是指定版本）。
+ *
+ * @param {Array} versions `/api/project/image` 的 `result.versions`
+ * @param {string} [requested] 版本 id，或 'latest'（默认）
+ */
+export function pickVersion(versions, requested) {
+  const list = Array.isArray(versions) ? versions : [];
+  if (list.length === 0) throw new LanhuError('该稿没有任何可读版本（versions 为空）。');
+  const want = requested == null || requested === '' ? 'latest' : String(requested);
+  let selected;
+  if (want === 'latest') {
+    selected = list[0];
+  } else {
+    selected = list.find((v) => String(v.id) === want) ?? null;
+    if (!selected) {
+      const ids = list.slice(0, 5).map((v) => v.id).join('、');
+      throw new LanhuError(`指定的版本不存在：${want}`, {
+        code: 'VERSION_NOT_FOUND',
+        hint: `该稿共 ${list.length} 个版本。最近的版本 id：${ids}${list.length > 5 ? ' …' : ''}。`
+          + '不传 version 即取最新版（latest）。',
+      });
+    }
+  }
+  if (!selected.id) throw new LanhuError('选中的版本没有 id。', { code: 'VERSION_UNAVAILABLE' });
+  if (!selected.json_url) {
+    throw new LanhuError(`版本 ${selected.id} 没有 json_url（该版本可能还没生成数据，或类型不支持）。`, { code: 'SOURCE_UNAVAILABLE' });
+  }
+  return selected;
+}
+
+/** 稿的全部版本（精简字段）—— 给"我想看有哪些版本"用的。 */
+export async function imageVersions(projectId, imageId, opts = {}) {
+  if (!projectId || !imageId) throw new LanhuError('imageVersions 需要 projectId 与 imageId。');
+  const url = `${BASE}/api/project/image?pid=${encodeURIComponent(projectId)}&image_id=${encodeURIComponent(imageId)}`;
+  const { json } = await apiRequest(url, opts);
+  const raw = unwrap(json) ?? {};
+  const versions = (raw.versions ?? []).map((v) => ({
+    id: v.id,
+    type: v.type ?? null,
+    createTime: v.create_time ?? null,
+    info: v.version_info ?? null,
+    jsonUrl: v.json_url ?? null,
+    d2cUrl: v.d2c_url ?? null,
+    hasLayoutData: Boolean(v.version_layout_data),
+    comments: v.comments ?? null,
+  }));
+  return { imageId: raw.id ?? imageId, name: raw.name ?? null, width: raw.width ?? null, height: raw.height ?? null, versions };
+}
+
+/**
+ * **A2 · docId 失效自动找回**（核心函数，read_design / read_blocks / read_product_doc 共用）。
+ *
+ * 场景：原型/设计稿被**重新上传**后，URL 里冻结的旧 docId 会失效，蓝湖回 `code=10009 Image not exist`。
+ * 旧行为是把这个错误直接抛给调用方 —— 但项目里明明有一个**当前有效**的同名文档。
+ * 消歧依据用 `pageId`：**它跨版本稳定**（实测，同页在不同版本里 id 不变），
+ * 所以"哪个候选里有这个 pageId"就是正确答案。
+ *
+ * 返回 `{ docId, relocatedFrom, docName, candidates }`；找不到就抛错并**列出候选**引导用户改用列表工具。
+ */
+export async function relocateDocId({ projectId, teamId, docId, pageId }, opts = {}) {
+  const listed = await productDocuments(projectId, teamId, opts);
+  const axure = listed.axureDocs.filter((d) => !d.isReplaced);
+  const pool = axure.length > 0 ? axure : listed.axureDocs;
+  if (pool.length === 0) {
+    throw new LanhuError(`项目下未找到任何 axure 原型文档（docId=${docId} 已失效）。`, {
+      code: 'DOC_NOT_FOUND',
+      hint: '用 lanhu_list_product_documents 看该项目有哪些产品文档；若都没有，说明这张稿不是原型，而是设计稿。',
+    });
+  }
+  const one = (d) => ({ docId: d.docId, relocatedFrom: docId, docName: d.name, candidates: pool.length });
+  if (pool.length === 1) return one(pool[0]);
+
+  // 多个候选：用 pageId 跨版本稳定的特性消歧
+  if (pageId) {
+    for (const d of pool) {
+      try {
+        // ⚠️ 必须显式 expect:'prototype'：这里逐个试读的就是原型文档，
+        //    用默认的 'design' 会被 PROTOTYPE_NOT_DESIGN 守卫全部拦掉，消歧静默失效（真踩过）。
+        const { detail } = await fetchDesignTree(projectId, d.docId, { ...opts, _noRelocate: true, expect: 'prototype' });
+        const tree = await fetchJsonUrl(detail.jsonUrl, opts);
+        const found = flattenSitemap(tree.sitemap?.rootNodes ?? []).some((n) => String(n.pageId) === String(pageId));
+        if (found) return one(d);
+      } catch { /* 单个候选读不到就跳过，不影响其它候选 */ }
+    }
+  }
+  const list = pool.map((d) => `docId=${d.docId} 名称=${d.name}`).join('；');
+  throw new LanhuError(`docId=${docId} 已失效，且项目下有 ${pool.length} 个 axure 文档，无法确定用哪个。`, {
+    code: 'DOC_AMBIGUOUS',
+    hint: `候选：${list}。请用 lanhu_list_product_documents 选定后用 docId 重新调用${pageId ? '（已尝试用 pageId 消歧但未命中）' : '（传 pageId 可自动消歧）'}。`,
+  });
+}
+
+/** 取任意 JSON（json_url / CDN 资源），带 Cookie 与重试。 */
+export async function fetchJsonUrl(url, opts = {}) {
+  const { value: cookie } = resolveCookie(opts.cookie, { account: opts.account });
+  const attempts = Math.max(1, Number(opts.retries ?? 3));
+  let lastErr;
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      const res = await fetch(url, {
+        headers: { Cookie: cookie ?? '', Referer: opts.referer ?? REFERER, Accept: 'application/json, text/plain, */*' },
+        signal: AbortSignal.timeout(opts.timeout ?? DEFAULT_TIMEOUT),
+      });
+      if (!res.ok) throw new LanhuError(`拉取失败：HTTP ${res.status}（${url.slice(0, 100)}）`);
+      const buf = Buffer.from(await res.arrayBuffer());
+      const text = decodeBody(buf, res.headers.get('content-type') || '');
+      try { return JSON.parse(text); } catch {
+        throw new LanhuError('响应不是合法 JSON（编码或权限问题）。', { hint: `响应开头：${text.slice(0, 120)}` });
+      }
+    } catch (e) {
+      lastErr = e;
+      if (e instanceof LanhuError && /^拉取失败/.test(e.message)) throw e;
+      if (i < attempts - 1) await new Promise((r) => setTimeout(r, 600 * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
+/** 取文本资源（HTML / data.js），带 Cookie 与重试。 */
+export async function fetchTextUrl(url, opts = {}) {
+  const { value: cookie } = resolveCookie(opts.cookie, { account: opts.account });
+  const attempts = Math.max(1, Number(opts.retries ?? 3));
+  let lastErr;
+  for (let i = 0; i < attempts; i += 1) {
+    try {
+      const res = await fetch(url, {
+        headers: { Cookie: cookie ?? '', Referer: opts.referer ?? REFERER },
+        signal: AbortSignal.timeout(opts.timeout ?? DEFAULT_TIMEOUT),
+      });
+      if (!res.ok) throw new LanhuError(`拉取失败：HTTP ${res.status}（${url.slice(0, 100)}）`);
+      return { text: decodeBody(Buffer.from(await res.arrayBuffer()), res.headers.get('content-type') || ''), bytes: 0 };
+    } catch (e) {
+      lastErr = e;
+      if (e instanceof LanhuError && /^拉取失败/.test(e.message)) throw e;
+      if (i < attempts - 1) await new Promise((r) => setTimeout(r, 600 * (i + 1)));
+    }
+  }
+  throw lastErr;
+}
+
+/**
+ * 展平 sitemap → 页面清单。
+ * `id` 就是 `pageId`，**跨版本稳定**（A2 的消歧依据就是它）。
+ */
+export function flattenSitemap(roots, parentPath = '', level = 0, out = []) {
+  for (const node of roots ?? []) {
+    const name = node.pageName ?? node.name ?? '';
+    const path = parentPath ? `${parentPath} / ${name}` : name;
+    out.push({
+      pageId: node.id ?? null,
+      pageName: name,
+      type: node.type ?? null,
+      url: node.url ?? null,
+      level,
+      path,
+    });
+    if (Array.isArray(node.children) && node.children.length) flattenSitemap(node.children, path, level + 1, out);
+  }
+  return out;
+}
+
+/** 解 HTML 实体（Axure 导出的正文是**实体编码**的，如 `&#x9996;&#x9875;` = 首页）。 */
+export function decodeHtmlEntities(s) {
+  return String(s ?? '')
+    .replace(/&#x([0-9a-fA-F]+);/g, (_, h) => { try { return String.fromCodePoint(parseInt(h, 16)); } catch { return _; } })
+    .replace(/&#(\d+);/g, (_, d) => { try { return String.fromCodePoint(Number(d)); } catch { return _; } })
+    .replace(/&nbsp;/g, ' ').replace(/&lt;/g, '<').replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"').replace(/&#39;/g, "'").replace(/&amp;/g, '&');
+}
+
+/**
+ * 从 Axure 页面 HTML 里抽出**可见文本**。
+ *
+ * ⚠️ 实测教训：本项目拿到的 axure 原型，`data.js` 里的 `page.diagram.objects` **文本与标注都是空的**
+ *    （对象只有 `vectorShape`/`connector`，`label` 全空 —— 因为原稿是以矢量/图片形式导出的）。
+ *    正文**只存在于 HTML**里，而且是实体编码的。所以"读原型正文"必须走 HTML，
+ *    不能只解析 data.js（只解析 data.js 会得到"这页没内容"的假结论）。
+ */
+export function extractHtmlText(html, opts = {}) {
+  const limit = Number(opts.limit ?? 200);
+  const body = String(html ?? '')
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<style[\s\S]*?<\/style>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ');
+  const seen = new Set();
+  const out = [];
+  for (const m of body.matchAll(/>([^<>]+)</g)) {
+    const t = decodeHtmlEntities(m[1]).replace(/\s+/g, ' ').trim();
+    if (!t || t.length < 1) continue;
+    if (/^[\s\-—·•|/\\]+$/.test(t)) continue;
+    if (seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+    if (out.length >= limit) break;
+  }
+  return out;
+}
+
+/** 从 data.js 里抽原生 Axure 控件的文本与标注（**有就用，没有不报错** —— 见 extractHtmlText 的实测教训）。 */
+export function extractAxureObjects(data) {
+  const page = data?.page ?? {};
+  const objects = page.diagram?.objects ?? [];
+  const keep = [];
+  const walk = (arr, depth) => {
+    for (const o of arr ?? []) {
+      const text = typeof o.rich === 'string' ? o.rich : (typeof o.text === 'string' ? o.text : null);
+      const anns = o.anns && typeof o.anns === 'object' ? Object.values(o.anns).map((a) => (typeof a === 'string' ? a : a?.text ?? '')).filter(Boolean) : [];
+      if (text || anns.length || (o.label && depth <= 1)) {
+        keep.push({
+          label: o.label || null,
+          type: o.type ?? null,
+          friendlyType: o.friendlyType ?? null,
+          text: text ? decodeHtmlEntities(text).slice(0, 200) : null,
+          annotations: anns,
+          depth,
+        });
+      }
+      if (Array.isArray(o.objects)) walk(o.objects, depth + 1);
+    }
+  };
+  walk(objects, 0);
+  return {
+    pageName: page.name ?? null,
+    annotations: (page.annotations ?? []).map((a) => (typeof a === 'string' ? a : a?.text ?? '')).filter(Boolean),
+    notes: page.notes ?? {},
+    objectCount: objects.length,
+    kept: keep,
+  };
+}
+
+/** 解析 `$axure.loadCurrentPage(lanhu_Axure_Mapping_Data({…}))` 这类包装，取出里面那个 JSON 对象。 */
+export function parseAxureJs(text) {
+  const s = String(text ?? '');
+  const a = s.indexOf('{');
+  const b = s.lastIndexOf('}');
+  if (a < 0 || b <= a) throw new LanhuError('data.js 里没有找到 JSON 对象（格式可能变了）。');
+  try { return JSON.parse(s.slice(a, b + 1)); } catch (e) {
+    throw new LanhuError(`data.js 解析失败：${e.message}`, { hint: '蓝湖的 axure 导出格式可能已变，请重新取证。' });
+  }
+}
+
+/* ==========================================================================
+ * 3c. 可移植算法（B2 字体需求 / B3 切图密度 / B4 几何间距）
+ *
+ * 三个都是**纯函数**：输入普通数据、输出普通数据，不碰网络 —— 这样自检能直接喂正反例，
+ * 不用起桩、不用真机。
+ * ========================================================================== */
+
+/**
+ * **B2 · 字体需求聚合**。
+ *
+ * 为什么需要：`read_design` 的 tokens 里有 `fontFamilies`（**去重的名字列表**），
+ * 但它回答不了"**要装哪些字体、每个字体用了多少处、涉及哪些字重**"——
+ * 而那正是把设计稿交给前端时要交代的第一件事（漏装字体 = 整页回退到系统字体）。
+ * 照搬不了：一个字体出现在 48 个文本层里，和只出现 1 次，交付时的优先级完全不同。
+ *
+ * `availability` 刻意是 `'not_checked'`：**本插件不检测本机是否装了该字体**
+ * （那需要枚举系统字体，跨平台不可靠）。不假装校验过。
+ */
+export function fontRequirements(layers) {
+  const byFamily = new Map();
+  for (const l of layers ?? []) {
+    const family = l?.font?.family;
+    if (!family) continue;
+    if (!byFamily.has(family)) {
+      byFamily.set(family, { family, weights: new Set(), sizes: new Set(), nodeCount: 0, sampleNodeIds: [] });
+    }
+    const e = byFamily.get(family);
+    if (l.font.weight != null) e.weights.add(l.font.weight);
+    if (l.font.size != null) e.sizes.add(l.font.size);
+    e.nodeCount += 1;
+    if (e.sampleNodeIds.length < 5 && l.id) e.sampleNodeIds.push(l.id);
+  }
+  return [...byFamily.values()].map((e) => ({
+    family: e.family,
+    weights: [...e.weights].sort((a, b) => Number(a) - Number(b)),
+    sizes: [...e.sizes].sort((a, b) => Number(a) - Number(b)),
+    nodeCount: e.nodeCount,
+    sampleNodeIds: e.sampleNodeIds,
+    availability: 'not_checked',
+    source: 'design',
+  })).sort((a, b) => b.nodeCount - a.nodeCount || String(a.family).localeCompare(String(b.family)));
+}
+
+/**
+ * **B3 · 切图密度判定**（纯函数）。
+ *
+ * `effective_density = 实际像素 ÷ 渲染尺寸`；小于 `targetDpr` 就是**素材本身不够清晰**
+ * （不是引用方式的问题）—— 这能把 README 里那条"别信图片预览"从**定性提醒**变成**可判定数值**。
+ *
+ * 矢量图（SVG）没有密度概念，返回 `null` 而不是 1：`1` 会被误读成"正好 1 倍"。
+ * 渲染尺寸未知时返回 `null` + `reason`，**不猜**。
+ */
+export function assetDensity({ pixelWidth, pixelHeight, renderWidth, renderHeight, isVector = false, targetDpr = 2 } = {}) {
+  const dpr = Number(targetDpr) > 0 ? Number(targetDpr) : 2;
+  if (isVector) return { effectiveDensity: null, resolutionLimited: false, reason: 'vector', targetDpr: dpr };
+  if (!(Number(renderWidth) > 0) || !(Number(renderHeight) > 0)) {
+    return { effectiveDensity: null, resolutionLimited: null, reason: 'render-bounds-unavailable', targetDpr: dpr };
+  }
+  if (!(Number(pixelWidth) > 0) || !(Number(pixelHeight) > 0)) {
+    return { effectiveDensity: null, resolutionLimited: null, reason: 'pixel-size-unavailable', targetDpr: dpr };
+  }
+  const x = Number(pixelWidth) / Number(renderWidth);
+  const y = Number(pixelHeight) / Number(renderHeight);
+  return {
+    effectiveDensity: { x: round2(x), y: round2(y) },
+    resolutionLimited: Math.min(x, y) + 1e-6 < dpr,
+    reason: null,
+    targetDpr: dpr,
+  };
+}
+
+/**
+ * **B3 的配对**：把切图（裸 URL，只有实际像素）对到图层（有渲染尺寸）上。
+ *
+ * ⚠️ 为什么只能"精确匹配 + 唯一才认"：实测 `tree.assets` 是**裸 URL 数组**，
+ *    既没有 `render_bounds`，也没有和图层 id 的对应关系（那是别人数据通道才有的字段）。
+ *    能站得住的唯一依据是 **渲染尺寸 × sliceScale = 期望像素**。
+ *    一旦有多个图层算出同样的期望像素（比如一排 20×20 的图标），**就不认**——
+ *    宁可返回 `layerId: null` 让调用方自己判断，也不要配错。
+ */
+
+/**
+ * B3 的**汇总口径** —— 把「有没有一张真的被评估过」显式化：
+ *   `null` = 一张都没评估（**空列表 ≠ 都达标**）
+ *   `[]`   = 评估过了，且没有一张被判定为分辨率不足
+ *
+ * 抽成纯函数是为了能离屏断言（`selfcheck`），不必真跑一次切图下载。
+ * 恒定返回 `[]` 会被读者当成"全部达标" —— 实测踩过，是最坏的一种误导。
+ */
+export function densityLimitedOf(files, limited) {
+  const evaluated = (files ?? []).some((f) => f?.density && f.density.effectiveDensity != null);
+  if (!evaluated) return null;
+  return (limited ?? []).map((f) => ({
+    file: f.file,
+    effectiveDensity: f.density.effectiveDensity,
+    matchedLayerId: f.matchedLayerId ?? null,
+  }));
+}
+
+export function matchAssetsToLayers(assets, layers, sliceScale) {
+  const scale = Number(sliceScale) > 0 ? Number(sliceScale) : null;
+  const list = (assets ?? []).map((a) => (typeof a === 'string' ? { url: a } : a));
+  if (!scale) return list.map((a) => ({ ...a, layerId: null, layerName: null, renderWidth: null, renderHeight: null, matched: false, reason: 'slice-scale-unavailable' }));
+  const cands = (layers ?? []).filter((l) => l?.hasImage && Number(l.w) > 0 && Number(l.h) > 0);
+  const used = new Set();
+  return list.map((a) => {
+    if (!(Number(a.width) > 0) || !(Number(a.height) > 0)) {
+      return { ...a, layerId: null, layerName: null, renderWidth: null, renderHeight: null, matched: false, reason: 'pixel-size-unavailable' };
+    }
+    const hits = cands.filter((l) => !used.has(l.id)
+      && Math.abs(l.w * scale - a.width) <= 1
+      && Math.abs(l.h * scale - a.height) <= 1);
+    if (hits.length !== 1) {
+      return { ...a, layerId: null, layerName: null, renderWidth: null, renderHeight: null, matched: false, reason: hits.length === 0 ? 'no-layer-match' : 'ambiguous' };
+    }
+    used.add(hits[0].id);
+    return { ...a, layerId: hits[0].id, layerName: hits[0].name, renderWidth: hits[0].w, renderHeight: hits[0].h, matched: true, reason: null };
+  });
+}
+
+/**
+ * **B4 · 几何间距**（纯函数）。
+ *
+ * 只在**另一轴有重叠**的两个元素之间算最近边距 —— 这条限定是关键：
+ * 不限定的"最近元素"会把斜对角的元素也算进来，得出的距离在还原时毫无意义
+ * （页面里的间距几乎都是"同一条水平/垂直线上相邻两块之间"）。
+ *
+ * x / y 各自独立；每个节点每个方向只留**最近的一条**（否则 N 个元素会产生 O(N²) 条，没人看得完）。
+ *
+ * @param {Array<{id:string,x:number,y:number,w:number,h:number}>} items
+ */
+export function geometricGaps(items, opts = {}) {
+  const maxDistance = Number.isFinite(opts.maxDistance) ? Number(opts.maxDistance) : Infinity;
+  const list = (items ?? []).filter((i) => i && Number.isFinite(i.x) && Number.isFinite(i.y) && Number.isFinite(i.w) && Number.isFinite(i.h));
+  const nearest = new Map();
+  const axes = [['x', 'y', 'w', 'h'], ['y', 'x', 'h', 'w']];
+  for (let i = 0; i < list.length; i += 1) {
+    for (let j = i + 1; j < list.length; j += 1) {
+      const a = list[i];
+      const b = list[j];
+      // 完全重合的两个矩形是**重复图层**（Figma 实例的 id 还会重复，如 `I37:2804;3`），
+      // 它们之间的"间距 0"不是设计意图，只会把真正的间距挤出榜首。
+      if (a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h) continue;
+      for (const [axis, other, size, otherSize] of axes) {
+        // 另一轴必须有重叠，否则不是"相邻"，是斜对角
+        const low = Math.max(a[other], b[other]);
+        const high = Math.min(a[other] + a[otherSize], b[other] + b[otherSize]);
+        if (high <= low) continue;
+        let left;
+        let right;
+        if (a[axis] + a[size] <= b[axis]) { left = a; right = b; } else if (b[axis] + b[size] <= a[axis]) { left = b; right = a; } else continue; // 该轴本身重叠 → 无间距可言
+        const distance = round2(right[axis] - left[axis] - left[size]);
+        if (distance > maxDistance) continue;
+        const gap = {
+          from: left.id ?? null,
+          to: right.id ?? null,
+          // 名字必须带上：**Figma 导出的 id 会重复**（`I37:2804;3` 这种），
+          // 只给 id 的话输出里会出现"自己到自己"，调用方无法分辨是哪个图层。
+          fromName: left.name ?? null,
+          toName: right.name ?? null,
+          axis,
+          distance,
+          overlap: { start: round2(low), end: round2(high) },
+        };
+        for (const key of [`${gap.from}|${axis}|+`, `${gap.to}|${axis}|-`]) {
+          const cur = nearest.get(key);
+          if (!cur || distance < cur.distance) nearest.set(key, gap);
+        }
+      }
+    }
+  }
+  // 去重：同一条间距可能被两个节点各记一次（互为最近邻），只留一条
+  const uniq = new Map();
+  for (const g of nearest.values()) {
+    const key = `${g.from}|${g.to}|${g.axis}|${g.distance}|${g.overlap.start}|${g.overlap.end}`;
+    if (!uniq.has(key)) uniq.set(key, g);
+  }
+  return [...uniq.values()].sort((a, b) => a.axis.localeCompare(b.axis) || a.distance - b.distance);
+}
+
+/** B4 的文本渲染：每个节点每个方向只列**最近的一条**（全列会 O(N²)，没人看得完）。 */
+export function renderGaps(gaps, limit = 60) {
+  const L = [];
+  L.push(`## 几何间距（${gaps.length} 条；只在另一轴有重叠的相邻元素之间算，x/y 各自独立）`);
+  L.push('> 用途：还原时**直接抄间距**，不用拿坐标手算。');
+  L.push('> 「重叠」= 两条边在另一轴上的共同区间 —— 没有重叠说明是斜对角，那种距离不能当间距用。');
+  L.push('');
+  L.push('| 从 | 到 | 轴 | 间距 | 重叠区间 |');
+  L.push('|---|---|---|---|---|');
+  const nm = (id, name) => `${name || '(无名)'}${id ? ` \`${String(id).slice(0, 18)}\`` : ''}`;
+  for (const g of gaps.slice(0, limit)) L.push(`| ${nm(g.from, g.fromName)} | ${nm(g.to, g.toName)} | ${g.axis} | ${g.distance} | ${g.overlap.start}~${g.overlap.end} |`);
+  if (gaps.length > limit) L.push(`| … | | | 其余 ${gaps.length - limit} 条略 | |`);
+  return L.join('\n');
+}
+
+/** B2 的文本渲染。 */
+export function renderFonts(fonts, meta = {}) {
+  const L = [];
+  L.push(`# 字体需求（${fonts.length} 个字体族）${meta.name ? ` —— ${meta.name}` : ''}`);
+  L.push('> 交付给前端时**照着这张表装字体**：漏装 = 整页回退到系统字体，排版全变。');
+  L.push('> `可用性` 一律是 `not_checked` —— 本插件**不检测本机字体**（跨平台枚举不可靠），不假装校验过。');
+  L.push('');
+  L.push('| 字体族 | 字重 | 字号 | 文本层数 | 样例图层 id |');
+  L.push('|---|---|---|---|---|');
+  for (const f of fonts) {
+    L.push(`| ${f.family} | ${f.weights.length ? f.weights.join('/') : '—'} | ${f.sizes.length ? f.sizes.join('/') : '—'} | ${f.nodeCount} | ${f.sampleNodeIds.slice(0, 3).join('、') || '—'} |`);
+  }
+  return L.join('\n');
+}
+
+/* ==========================================================================
+ * 3d. A1 · 读产品文档（PRD / Axure 原型）+ A3 · DDS schema（可选增强）
+ * ========================================================================== */
+
+/** 选中要读的页面：给 pageId → 精确；给 pageName → 包含匹配；都不给 → 只返回页面树。 */
+export function selectProductPages(pages, { pageId, pageName } = {}) {
+  const list = pages ?? [];
+  if (pageId) {
+    const hit = list.filter((p) => String(p.pageId) === String(pageId));
+    if (hit.length === 0) {
+      throw new LanhuError(`页面树里没有 pageId=${pageId} 这一页。`, {
+        code: 'PAGE_NOT_FOUND',
+        hint: `该文档共 ${list.length} 个页面节点。先用不带 pageId 的调用看页面树，或改用 pageName 模糊匹配。`,
+      });
+    }
+    return hit;
+  }
+  if (pageName) {
+    const hit = list.filter((p) => String(p.pageName ?? '').includes(pageName));
+    if (hit.length === 0) throw new LanhuError(`没有名称包含「${pageName}」的页面。`, { code: 'PAGE_NOT_FOUND' });
+    return hit;
+  }
+  return [];
+}
+
+/** 读一页的正文：data.js（原生控件，可能为空）+ HTML 可见文本（实测正文只在这里）。 */
+export async function fetchProductPage(page, opts = {}) {
+  const entry = opts.pagesIndex?.[page.url] ?? null;
+  if (!entry) return { ...page, readable: false, reason: '该页在 pages 索引里没有条目（通常是 Folder 节点）' };
+  const out = { ...page, readable: true, dataBytes: 0, htmlBytes: 0, objects: null, annotations: [], text: [] };
+  // data.js：原生 Axure 控件（本项目实测多为空，但别的稿可能有 —— 有就用）
+  if (entry.dataJs?.sign_md5) {
+    try {
+      const { text } = await fetchTextUrl(`${AXURE_CDN}/${entry.dataJs.sign_md5}`, opts);
+      const parsed = parseAxureJs(text);
+      const ex = extractAxureObjects(parsed);
+      out.objects = { count: ex.objectCount, kept: ex.kept.slice(0, Number(opts.objectLimit ?? 40)) };
+      out.annotations = ex.annotations;
+      out.dataBytes = text.length;
+    } catch (e) { out.dataError = e.message ?? String(e); }
+  }
+  // HTML：**正文的真正来源**
+  if (entry.html?.sign_md5) {
+    try {
+      const { text } = await fetchTextUrl(`${AXURE_CDN}/${entry.html.sign_md5}`, opts);
+      out.htmlBytes = text.length;
+      out.text = extractHtmlText(text, { limit: Number(opts.textLimit ?? 120) });
+    } catch (e) { out.htmlError = e.message ?? String(e); }
+  }
+  return out;
+}
+
+/** A1 的文本渲染。 */
+export function renderProductDoc(result) {
+  const L = [];
+  L.push(`# 产品文档（原型）${result.doc?.name ? ` —— ${result.doc.name}` : ''}`);
+  L.push('> ⚠️ 这是**产品文档 / 原型（Axure）**，回答"业务规则、字段、跳转"；**不是设计稿**（色值/字号/圆角请用 lanhu_read_design）。');
+  if (result.project) L.push(`> 项目：${result.project.name ?? '—'}${result.project.folderName ? `（${result.project.folderName}）` : ''}${result.project.creatorName ? ` · 创建者 ${result.project.creatorName}` : ''}`);
+  L.push(`> 版本：${result.version?.id ?? '—'}${result.version?.isLatest === false ? `（**不是最新版**，最新 ${result.version.latestId}）` : '（最新版）'} · 共 ${result.version?.count ?? '?'} 个版本`);
+  L.push('');
+  L.push(`## 页面树（${result.pageCount} 个节点，${result.wireframeCount} 个可读页）`);
+  L.push('| 层级 | 类型 | 页面 | pageId |');
+  L.push('|---|---|---|---|');
+  for (const p of result.pages.slice(0, Number(result.pageTreeLimit ?? 200))) {
+    L.push(`| ${'  '.repeat(p.level)}${p.level} | ${p.type ?? '—'} | ${p.path} | ${p.pageId ?? '—'} |`);
+  }
+  if (result.pageCount > (result.pageTreeLimit ?? 200)) L.push(`| … | | 其余 ${result.pageCount - (result.pageTreeLimit ?? 200)} 个节点略 | |`);
+  if (result.content?.length) {
+    L.push('');
+    L.push(`## 正文（${result.content.length} 页）`);
+    for (const c of result.content) {
+      L.push(`### ${c.path}（pageId ${c.pageId}）`);
+      if (!c.readable) { L.push(`（不可读：${c.reason}）`); continue; }
+      if (c.annotations?.length) L.push(`**页级标注**：${c.annotations.join(' / ')}`);
+      if (c.objects?.kept?.length) {
+        L.push(`**原生控件**（${c.objects.count} 个，列前 ${c.objects.kept.length}）：`);
+        for (const o of c.objects.kept) L.push(`- [${o.type ?? '?'}] ${o.text ? `「${o.text}」` : (o.label ? o.label : '(无文本)')}${o.annotations?.length ? ` ⚠️标注：${o.annotations.join(' / ')}` : ''}`);
+      } else if (c.dataError || !c.dataBytes) {
+        L.push('**原生控件**：data.js 里没有控件数据（实测这套原型是矢量/图片导出，正文只在 HTML）。');
+      }
+      if (c.text?.length) {
+        L.push(`**正文文本**（${c.text.length} 条，取自页面 HTML）：`);
+        L.push(c.text.map((t) => `- ${t}`).join('\n'));
+      } else if (c.htmlError) L.push(`（HTML 读取失败：${c.htmlError}）`);
+      L.push('');
+    }
+  }
+  return L.join('\n');
+}
+
+/**
+ * **A1 · 读产品文档**：页面树 + 命中页的正文。
+ *
+ * `pageId` 精确匹配优先（跨版本稳定），`pageName` 模糊匹配次之；**都不给就只返回页面树** ——
+ * 219 个页面节点全量抓正文没有意义，让调用方先看树再选页。
+ */
+export async function readProductDoc(args = {}) {
+  const { cookie } = args;
+  const parsed = args.url ? parseProductUrl(args.url) : {};
+  const projectId = args.projectId ?? parsed.projectId;
+  const teamIdIn = args.teamId ?? parsed.teamId;
+  const docIdIn = args.docId ?? parsed.docId;
+  const pageIdIn = args.pageId ?? parsed.pageId;
+  const versionIn = args.version ?? parsed.versionId;
+  if (!projectId) throw new LanhuError('需要 projectId（或一条产品文档链接 url）。');
+
+  const picked = await pickAccount({ ...args, projectId, imageId: docIdIn, teamId: teamIdIn });
+  const acct = picked.alias;
+  const ao = { cookie, account: acct };
+
+  const listed = await productDocuments(projectId, teamIdIn, ao);
+  const project = await multiInfo(projectId, teamIdIn, ao).catch(() => null);
+  if (listed.axureDocs.length === 0) {
+    throw new LanhuError(`项目 ${projectId} 下没有 axure 原型文档（共 ${listed.total} 个其它类型资源）。`, {
+      code: 'DOC_NOT_FOUND',
+      hint: '若你要读的是**设计稿**，请用 lanhu_read_design / lanhu_read_blocks。',
+    });
+  }
+  const docId = docIdIn ?? listed.axureDocs[0].docId;
+  const doc = listed.axureDocs.find((d) => d.docId === docId) ?? null;
+  if (!doc) {
+    throw new LanhuError(`项目下没有 docId=${docId} 的原型文档。`, {
+      code: 'DOC_NOT_FOUND',
+      hint: `可选：${listed.axureDocs.map((d) => `${d.docId}(${d.name})`).join('；')}`.slice(0, 600),
+    });
+  }
+
+  const { detail, tree } = await fetchDesignTree(projectId, docId, {
+    ...ao, version: versionIn, teamId: teamIdIn, pageId: pageIdIn, expect: 'prototype',
+  });
+  const pages = flattenSitemap(tree.sitemap?.rootNodes ?? []);
+  const selected = selectProductPages(pages, { pageId: pageIdIn, pageName: args.pageName });
+  const limit = Number.isFinite(Number(args.limit)) && Number(args.limit) > 0 ? Number(args.limit) : 1;
+  const chosen = selected.slice(0, limit);
+  const content = [];
+  for (const p of chosen) content.push(await fetchProductPage(p, { ...ao, pagesIndex: tree.pages, textLimit: args.textLimit, objectLimit: args.objectLimit }));
+
+  const versionInfo = {
+    id: detail.versionId,
+    requested: detail.versionRequested,
+    isLatest: detail.versionIsLatest,
+    count: detail.versionCount,
+    latestId: detail.versionLatestId,
+    latestAt: detail.latestVersionAt,
+  };
+  const result = {
+    project,
+    doc,
+    docCount: listed.axureDocs.length,
+    version: versionInfo,
+    pageCount: pages.length,
+    wireframeCount: pages.filter((p) => p.type === 'Wireframe').length,
+    pages,
+    selectedCount: selected.length,
+    content,
+    account: acct,
+    accountBy: picked.by ?? null,
+  };
+  result.text = renderProductDoc({ ...result, pageTreeLimit: args.pageTreeLimit });
+  result.textBytes = Buffer.byteLength(result.text, 'utf8');
+  return result;
+}
+
+/**
+ * **A3 · DDS schema（可选降级，绝不当主路径）**。
+ *
+ * ⚠️ 为什么必须"可选 + 失败如实说明"：这条通道是**社区互相扒出来的非官方接口**
+ *    （另一个域名 `dds.lanhuapp.com`、独立 Cookie、还有一段硬编码的 Basic 认证头），
+ *    与官方无关、**随时可能失效**。它失败了不能影响主流程，更不能假装成功。
+ *
+ * 成功时返回 `{ ok:true, source:'dds', dataResourceUrl, schema }`；
+ * 任何一步失败都返回 `{ ok:false, source:'dds', stage, error }` —— **由调用方决定回退到现有解析**。
+ */
+export async function ddsSchema(versionId, opts = {}) {
+  if (!versionId) return { ok: false, source: 'dds', stage: 'input', error: '需要 versionId（版本 id，不是 imageId）。' };
+  const cookie = opts.ddsCookie ?? process.env.DDS_COOKIE ?? resolveCookie(opts.cookie, { account: opts.account }).value;
+  if (!cookie) return { ok: false, source: 'dds', stage: 'cookie', error: '没有可用 Cookie（DDS_COOKIE 环境变量或当前账号 Cookie）。' };
+  const headers = {
+    Cookie: cookie,
+    Referer: `${DDS_BASE_URL}/`,
+    Accept: 'application/json, text/plain, */*',
+    // 蓝湖 DDS 前端自己用的 Basic 头（base64 of "undefined:"）——照社区实测值带上，不带会被拒
+    Authorization: 'Basic dW5kZWZpbmVkOg==',
+  };
+  try {
+    const res = await fetch(`${DDS_BASE_URL}/api/dds/image/store_schema_revise?version_id=${encodeURIComponent(versionId)}`, {
+      headers, signal: AbortSignal.timeout(opts.timeout ?? DEFAULT_TIMEOUT),
+    });
+    if (!res.ok) return { ok: false, source: 'dds', stage: 'store_schema_revise', error: `HTTP ${res.status}` };
+    const json = JSON.parse(await res.text());
+    if (!isSuccessCode(json?.code)) return { ok: false, source: 'dds', stage: 'store_schema_revise', error: `code=${json?.code} ${json?.msg ?? ''}`.trim() };
+    const url = json?.data?.data_resource_url;
+    if (!url) return { ok: false, source: 'dds', stage: 'store_schema_revise', error: '未返回 data_resource_url' };
+    const sres = await fetch(url, { headers: { Referer: `${DDS_BASE_URL}/`, Accept: '*/*' }, signal: AbortSignal.timeout(opts.timeout ?? DEFAULT_TIMEOUT) });
+    if (!sres.ok) return { ok: false, source: 'dds', stage: 'fetch_schema', error: `HTTP ${sres.status}`, dataResourceUrl: url };
+    const schema = JSON.parse(await sres.text());
+    return { ok: true, source: 'dds', dataResourceUrl: url, schema };
+  } catch (e) {
+    return { ok: false, source: 'dds', stage: 'network', error: e?.message ?? String(e) };
+  }
 }
 
 /* ==========================================================================
@@ -1787,12 +2633,15 @@ export function renderRegion(layers, opts = {}) {
  */
 export async function readDesign(args = {}) {
   const { projectId, imageId, url, format = 'summary', cookie } = args;
+  // args.dds：可选开启 DDS schema 增强（见下方 A3 段）
   const target = resolveTarget({ projectId, imageId, url });
 
   // 没显式指定账号时**自动判定**：别的 AI 只拿到一条链接，不该要求它知道这属于哪个账号。
   const picked = await pickAccount({ ...args, projectId: target.projectId, imageId: target.imageId, teamId: target.teamId });
   const acct = picked.alias;
-  const { detail, tree, bytes } = await fetchDesignTree(target.projectId, target.imageId, { cookie, account: acct });
+  const { detail, tree, bytes } = await fetchDesignTree(target.projectId, target.imageId, {
+    cookie, account: acct, version: args.version, teamId: target.teamId, pageId: args.pageId,
+  });
   const artboard = tree.artboard ?? tree;
   const layers = flattenArtboard(artboard);
   const tokens = collectTokens(layers);
@@ -1824,7 +2673,34 @@ export async function readDesign(args = {}) {
     // 用了哪个账号、怎么定出来的（别的 AI 并不知道链接属于谁，这层透明度必须有）
     account: acct ?? null,
     accountBy: picked.by ?? null,
+    // 版本透明度（B1）：不指定 version 时拿到的是 latest，**必须让调用方知道这一点**，
+    // 否则"我照着这版做的"会在稿子更新后悄悄失去依据。
+    version: {
+      id: detail.versionId ?? null,
+      requested: detail.versionRequested ?? 'latest',
+      isLatest: detail.versionIsLatest ?? null,
+      count: detail.versionCount ?? null,
+      latestId: detail.versionLatestId ?? null,
+      latestAt: detail.latestVersionAt ?? null,
+      relocatedFrom: detail.relocatedFrom ?? null,
+    },
   };
+
+  // A3 · DDS schema（**可选增强，默认关闭**）。
+  // ⚠️ 这是社区实测的非官方通道（另域 + 独立 Cookie + 硬编码 Basic 头），随时可能失效。
+  //    所以：默认不碰；开了就如实标注来源；**失败只记原因，绝不影响下面的常规解析**。
+  if (args.dds) {
+    const d = await ddsSchema(detail.versionId, { cookie, account: acct });
+    base.dds = d.ok
+      ? { source: 'dds', ok: true, dataResourceUrl: d.dataResourceUrl, schema: d.schema }
+      : {
+        source: 'dds',
+        ok: false,
+        stage: d.stage,
+        error: d.error,
+        note: 'DDS 是社区实测的**非官方**通道（另域 dds.lanhuapp.com + 独立 Cookie），随时可能失效；失败不影响本结果——下面的数据全部来自常规解析。',
+      };
+  }
 
   // 区域模式：按 y（或 x0,y0,x1,y1）过滤，直接给可用的图层表（含内边距）
   if (args.region) {
@@ -1854,7 +2730,31 @@ export async function readDesign(args = {}) {
       ro.toBox = box(args.toBox, 'toBox');
     }
     const r = renderRegion(layers, ro);
-    return { ...base, format: 'region', regionCount: r.count, text: r.text, textBytes: Buffer.byteLength(r.text, 'utf8') };
+    // B4 · 几何间距：只在**另一轴有重叠**的元素之间算最近边距（斜对角的距离在还原时没有意义）。
+    // 过滤条件与 renderRegion 保持一致（可见 + 落在区域 + 宽度阈值），否则间距会算到区域外的元素上。
+    // ⚠️ 默认值必须与 renderRegion **逐字一致**（-Infinity/Infinity）：
+    //    只给 `region:'200,600'` 时 ro.x0/x1 是 undefined，写成 `l.x >= ro.x0` 会把**所有**元素滤掉，
+    //    于是间距恒为 0 条 —— 不报错、看着像"这里确实没间距"（实测踩过）。
+    const rx0 = ro.x0 ?? -Infinity; const rx1 = ro.x1 ?? Infinity;
+    const ry0 = ro.y0 ?? -Infinity; const ry1 = ro.y1 ?? Infinity;
+    const rminW = ro.minWidth ?? 0;
+    const hits = layers
+      .filter((l) => l.visible !== false)
+      .filter((l) => l.y >= ry0 && l.y <= ry1 && l.x >= rx0 && l.x <= rx1 && l.w >= rminW)
+      .map((l) => ({ id: l.id, name: l.name, x: l.x, y: l.y, w: l.w, h: l.h }));
+    const gaps = geometricGaps(hits, { maxDistance: args.gapMaxDistance });
+    const text = gaps.length ? `${r.text}\n\n${renderGaps(gaps)}` : r.text;
+    return {
+      ...base, format: 'region', regionCount: r.count, gaps, gapCount: gaps.length,
+      text, textBytes: Buffer.byteLength(text, 'utf8'),
+    };
+  }
+
+  // B2 · 字体需求清单（"要装哪些字体、各用多少处、涉及哪些字重"）
+  if (format === 'fonts') {
+    const fonts = fontRequirements(layers);
+    const text = renderFonts(fonts, meta);
+    return { ...base, format: 'fonts', fontCount: fonts.length, fonts, text, textBytes: Buffer.byteLength(text, 'utf8') };
   }
 
   if (format === 'tokens') {
@@ -1895,7 +2795,9 @@ export async function readBlocks(args = {}) {
   // 同 readDesign：没指定账号就按链接自动判定
   const picked = await pickAccount({ ...args, projectId: target.projectId, imageId: target.imageId, teamId: target.teamId });
   const acct = picked.alias;
-  const { detail, tree, bytes } = await fetchDesignTree(target.projectId, target.imageId, { cookie: args.cookie, account: acct });
+  const { detail, tree, bytes } = await fetchDesignTree(target.projectId, target.imageId, {
+    cookie: args.cookie, account: acct, version: args.version, teamId: target.teamId, pageId: args.pageId,
+  });
   const artboard = tree.artboard ?? tree;
   const layers = flattenArtboard(artboard);
   let blocks = buildBlocks(layers);
@@ -2228,7 +3130,9 @@ export async function downloadSlices(args = {}) {
   const target = resolveTarget({ projectId, imageId, url });
   const picked = await pickAccount({ ...args, projectId: target.projectId, imageId: target.imageId, teamId: target.teamId });
   const acct = picked.alias;
-  const { detail, tree } = await fetchDesignTree(target.projectId, target.imageId, { cookie, account: acct });
+  const { detail, tree } = await fetchDesignTree(target.projectId, target.imageId, {
+    cookie, account: acct, version: args.version, teamId: target.teamId, pageId: args.pageId,
+  });
   const urls = [...new Set((tree.assets ?? []).filter((u) => typeof u === 'string'))];
 
   if (urls.length === 0) {
@@ -2296,6 +3200,34 @@ export async function downloadSlices(args = {}) {
     warnings.push(`ℹ️ 其中 ${svgCount} 张是 **SVG 矢量图**（mode=vector）：直接引用原文件或内联进页面，**别栅格化成 JPG/PNG**（会丢清晰度）；它们不涉及 alpha 合成。`);
   }
 
+  // B3 · 切图密度：`实际像素 ÷ 渲染尺寸` < 目标倍率 就是**素材本身不够清晰**。
+  // 配对只在"渲染尺寸 × sliceScale = 期望像素"**唯一命中**时成立（实测 tree.assets 只有裸 URL，
+  // 没有 render_bounds，也没有与图层 id 的对应关系）—— 宁可留 null 也不配错。
+  const sliceScale = tree.meta?.sliceScale ?? null;
+  const targetDpr = Number(args.targetDpr ?? sliceScale ?? 2) || 2;
+  const layerList = flattenArtboard(tree.artboard ?? tree);
+  const pairs = matchAssetsToLayers(
+    files.map((f) => ({ url: f.url, width: f.width, height: f.height })),
+    layerList, sliceScale,
+  );
+  for (let i = 0; i < files.length; i += 1) {
+    const pair = pairs[i] ?? {};
+    const d = assetDensity({
+      pixelWidth: files[i].width, pixelHeight: files[i].height,
+      renderWidth: pair.renderWidth, renderHeight: pair.renderHeight,
+      isVector: files[i].format === 'svg', targetDpr,
+    });
+    files[i] = { ...files[i], matchedLayerId: pair.layerId ?? null, matchedLayerName: pair.layerName ?? null, matchReason: pair.reason ?? null, density: d };
+  }
+  const limited = files.filter((f) => f.density?.resolutionLimited && f.density?.effectiveDensity);
+  if (limited.length) {
+    warnings.push([
+      `⚠️ ${limited.length} 张切图**分辨率不够**（有效密度 < 目标 ${targetDpr}×）：素材本身就不清晰，改引用方式没用。`,
+      ...limited.slice(0, 6).map((f) => `   · ${f.file}  ${f.density.effectiveDensity.x}×${f.density.effectiveDensity.y}（${f.width}px / 渲染 ${f.matchedLayerName ?? '?'}）`),
+      '   要么让设计师重导 @2x/@3x，要么接受它在高分屏上发虚。',
+    ].join('\n'));
+  }
+
   const mapping = {
     name: detail.name,
     imageId: target.imageId,
@@ -2307,6 +3239,13 @@ export async function downloadSlices(args = {}) {
     warnings,
     /** 含半透明切图清单（文件 + alpha 范围）—— 给程序化消费用 */
     translucent: translucent.map((f) => ({ file: f.file, alphaRange: f.alphaRange })),
+    /** 版本透明度（B1）：切图也要能追溯"这是哪一版导出的" */
+    version: { id: detail.versionId ?? null, requested: detail.versionRequested ?? 'latest', isLatest: detail.versionIsLatest ?? null, count: detail.versionCount ?? null },
+    /** B3 判据的输入：设计稿自带的切图倍率与本次目标倍率 */
+    sliceScale,
+    targetDpr,
+    /** B3 汇总：`null`=一张都没评估（本通道缺 render_bounds），`[]`=评估过且都达标。见 densityLimitedOf */
+    densityLimited: densityLimitedOf(files, limited),
     unique: seenHash.size,
     total: urls.length,
     files,
@@ -3613,6 +4552,8 @@ export async function main(argv = process.argv.slice(2)) {
           region: args.region, minWidth: args['min-width'],
           limit: args.limit === undefined ? undefined : Number(args.limit),
           mapBox: args['map-box'], toBox: args['to-box'],
+          version: args.version, gapMaxDistance: args['gap-max-distance'] === undefined ? undefined : Number(args['gap-max-distance']),
+          dds: Boolean(args.dds),
           cookie, outDir: args.out,
         });
         if (args.json) printJson(r);
@@ -3630,6 +4571,7 @@ export async function main(argv = process.argv.slice(2)) {
           minWidth: args['min-width'],
           limit: args.limit === undefined ? undefined : Number(args.limit),
           includeNoise: Boolean(args.all),
+          version: args.version,
           cookie,
         });
         if (args.json) printJson(r);
@@ -3637,6 +4579,42 @@ export async function main(argv = process.argv.slice(2)) {
           console.log(r.text);
           console.log('');
           console.log(`— blocks 模式 | ${r.layerCount} 层 → ${r.blockCount} 块（碎片 ${r.noiseCount}） | 输出 ${kb(r.text)}`);
+        }
+        return r;
+      }
+      case 'product-docs': {
+        // 产品文档（原型）—— 与 read/blocks 是**两套东西**，命令名分开，避免拿错
+        const parsed = args.url ? parseProductUrl(args.url) : {};
+        const projectId = args.project ?? parsed.projectId;
+        const teamId = args.team ?? parsed.teamId;
+        if (!projectId || !teamId) throw new LanhuError('用法：node lanhu.mjs product-docs --url "<原型链接>"（链接里带 tid/pid），或 --project <pid> --team <tid>');
+        const listed = await productDocuments(projectId, teamId, { cookie });
+        const info = await multiInfo(projectId, teamId, { cookie }).catch(() => null);
+        if (args.json) printJson({ ...listed, project: info });
+        else {
+          console.log(`# 产品文档（原型）${info?.name ? ` —— ${info.name}` : ''}`);
+          if (info) console.log(`> 项目：${info.folderName ? `${info.folderName} / ` : ''}${info.name ?? '—'}${info.creatorName ? ` · 创建者 ${info.creatorName}` : ''}`);
+          console.log(`> 共 ${listed.total} 个资源，其中 ${listed.axureDocs.length} 个是 axure 原型文档（**不是设计稿**）`);
+          console.log('');
+          console.log('| # | 名称 | docId | 最新版本 | 版本数 | 更新时间 |');
+          console.log('|---|---|---|---|---|---|');
+          listed.axureDocs.forEach((d, i) => console.log(`| ${i + 1} | ${d.name} | ${d.docId} | ${d.latestVersion ?? '—'} | ${d.lastVersionNum ?? '—'} | ${d.updateTime ?? '—'} |`));
+        }
+        return listed;
+      }
+      case 'product-doc': {
+        const r = await readProductDoc({
+          url: args.url, projectId: args.project, docId: args.doc, teamId: args.team,
+          pageId: args['page-id'] ?? args.page, pageName: args['page-name'],
+          version: args.version,
+          limit: args.limit === undefined ? 1 : Number(args.limit),
+          cookie,
+        });
+        if (args.json) printJson({ ...r, text: undefined });
+        else {
+          console.log(r.text);
+          console.log('');
+          console.log(`— 产品文档（原型） | ${r.pageCount} 个页面节点（${r.wireframeCount} 可读） | 读正文 ${r.selectedCount} 页 | 输出 ${kb(r.text)}`);
         }
         return r;
       }
@@ -3802,6 +4780,12 @@ export async function main(argv = process.argv.slice(2)) {
            （x/y 各自独立缩放，**非等比** —— 长宽比不同的两个坐标系也能对上）
   blocks   [--url "<蓝湖链接>" | --project <id> --image <id>] [--region y0,y1] [--kind card,pill] [--min-width N] [--all]
            块级清单：卡片/胶囊/文本/图片/分割线，每块六项属性（圆角·大小·文字色·字号·底色·边框）
+  product-docs --url "<原型链接>" | --project <pid> --team <tid>
+           列**产品文档（Axure 原型 / PRD）**——不是设计稿。含 docId / 最新版本 / 版本数 / 更新时间
+  product-doc  --url "<原型链接>" [--page-id <id>] [--page-name <名>] [--limit N] [--version <id>]
+           读原型的页面树 + 命中页正文（**先不带 --page-id 看树**，一份原型常有上百个节点）
+           --page-id 跨版本稳定，推荐；正文取自页面 HTML（data.js 里常为空）
+  read/blocks/product-doc/slices 均可加 --version <版本id>（默认 latest；给错会报错，不静默回退）
   log      [--limit N]                   插件使用记录（工具调用 / 面板读取）
   accounts                                列账号（公司 / 团队 / 有效期 / 默认）
            --add --alias <别名> [--company "<公司>"] [--note "…"] [--cookie "<粘贴>" | --clipboard]

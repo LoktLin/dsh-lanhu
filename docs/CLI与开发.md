@@ -47,7 +47,7 @@ node lanhu.mjs cookie --clipboard --dry-run  # 只看解析结果，不写入
 ## 本地自检
 
 ```bash
-node test/selfcheck.mjs          # 257 项，纯离线、秒级
+node test/selfcheck.mjs          # 454 项，纯离线、秒级
 node test/selfcheck.mjs --json   # 机器可读
 ```
 

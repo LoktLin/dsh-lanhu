@@ -7,8 +7,8 @@
 > **没有它**：AI 写页面前只能看设计稿**截图**，色值和字号靠视觉估算（OCR 小字经常错）。
 > **有了它**：设计稿的真实数值直接进上下文 —— 等于把「设计标注」喂给模型；还能反过来拿它**自动验收**页面还原度。
 
-**版本 `0.1.1`**（见 [CHANGELOG](CHANGELOG.md)） · MIT
-适用于 [DeepSeek Harness](https://github.com/deepseek-ai)（DSH）Web GUI，需要 **Node ≥ 20**。自带 13 个原生工具 + 侧边面板 + CLI。
+**版本 `0.2.0`**（见 [CHANGELOG](CHANGELOG.md)） · MIT
+适用于 [DeepSeek Harness](https://github.com/deepseek-ai)（DSH）Web GUI，需要 **Node ≥ 20**。自带 15 个原生工具 + 侧边面板 + CLI。
 
 > ⚠️ **免责与数据说明**
 >
@@ -23,7 +23,7 @@
 
 | 能力 | 说明 |
 |---|---|
-| **13 个原生工具** | 参数带 schema 校验；不用拼 shell 命令调脚本 |
+| **15 个原生工具** | 参数带 schema 校验；不用拼 shell 命令调脚本 |
 | **贴链接就行** | 不用手拆 `tid/pid/image_id`，**也不用知道稿子属于哪个账号**（自动判定，零请求优先） |
 | **块级清单** | 把几百个图层收敛成「人一眼能核对」的块：六项属性 + **字体族** + **行高·字距** + **多段渐变全 stop** |
 | **区域抠图 + 坐标映射** | 按 `y` 区间取值；能把设计稿坐标**直接映射**到你自己 SVG 的 viewBox（非等比，两套坐标系也能对） |
@@ -32,7 +32,7 @@
 | **侧边面板** | 块级 / 账号 / 记录，三个 Tab，不用敲命令 |
 | **多账号** | 一账号一套 Cookie；贴链接自动判归属（索引命中零请求） |
 | **零运行时依赖** | 真机验收才需要 `puppeteer-core`（`optionalDependencies`，不装也能用） |
-| **离线自检 257 项** | 秒级、零网络；改完代码先跑它（另有**文档绊线** `test/readme-test.mjs` 24 项） |
+| **离线自检 454 项** | 秒级、零网络；改完代码先跑它（另有**文档绊线** `test/readme-test.mjs` 24 项） |
 
 ---
 
@@ -47,6 +47,9 @@
 | **③ 验收** | `lanhu_verify_blocks {"pageUrl":"http://localhost:5173/","url":"<蓝湖链接>"}` | 每个可见块与页面的**四态报告**（✅ 完全匹配 / 🟡 容差内 / ❌ 不匹配 / ⚪ 无法比对）+ **可直接抄的建议改法** |
 
 **在 DSH 会话里更简单**：把链接直接丢给 agent，它会自己挑工具。**多账号、三级 id、Cookie 归属，调用方一概不用管。**
+
+> **要看需求 / 原型（PRD）？** `lanhu_read_product_doc {"url":"<蓝湖原型链接>"}` —— 页面树 + 命中页正文（业务规则、字段、跳转）。
+> 那是**产品文档（Axure 原型）**，不是设计稿；设计稿的色值字号仍走 `lanhu_read_design` / `lanhu_read_blocks`。先列文档用 `lanhu_list_product_documents`。
 
 **四条铁律**（先记住，能省掉大部分返工；每条的具体做法在对应 `docs/` 里，**这里只留一句，细节不复制**）：
 
@@ -87,7 +90,7 @@
 
 <!-- BEGIN GENERATED:tools -->
 
-**13 个工具。** 下面每一个字都来自 AI 在 schema 里看到的那份 —— 本节由 `node tools/gen-readme-tools.mjs --write` 生成，**别手改**；改了工具忘了跑生成器，`test/readme-test.mjs` 会**逐字比对**并报红。
+**15 个工具。** 下面每一个字都来自 AI 在 schema 里看到的那份 —— 本节由 `node tools/gen-readme-tools.mjs --write` 生成，**别手改**；改了工具忘了跑生成器，`test/readme-test.mjs` 会**逐字比对**并报红。
 
 #### `lanhu_check_auth`
 
@@ -143,13 +146,16 @@
 | `projectId` | `string` | 否 | — | 项目 UUID（与 imageId 搭配） |
 | `imageId` | `string` | 否 | — | 设计稿 id（与 projectId 搭配） |
 | `url` | `string` | 否 | — | 蓝湖链接（与 projectId+imageId 二选一） |
-| `format` | `string` | 否 | `summary` / `full` / `tokens` | summary=紧凑文本（默认，含色板/字号/关键容器/文本层）；full=全量图层落盘 JSON 并返回路径；tokens=仅色板/字号/圆角统计 |
+| `format` | `string` | 否 | `summary` / `full` / `tokens` / `fonts` | summary=紧凑文本（默认，含色板/字号/关键容器/文本层）；full=全量图层落盘 JSON 并返回路径；tokens=仅色板/字号/圆角统计；fonts=**字体需求清单**（要装哪些字体、各用多少处、涉及哪些字重，交给前端直接照装） |
 | `outDir` | `string` | 否 | — | 仅 format=full 时生效：落盘目录 |
 | `region` | `string` | 否 | — | 按区域过滤：如 "95,215" 取 y∈[95,215]，或 "x0,y0,x1,y1"。直接输出可用图层表（含相对父容器的内边距），替代手写抠图脚本 |
 | `minWidth` | `integer` | 否 | — | 配合 region：只保留宽度 ≥ 该值的层 |
 | `limit` | `integer` | 否 | — | 配合 region：最多列多少层（默认 80）。层数多的稿子会被截断，要看全量就传大一点（如 900），表头会标注是否截断 |
 | `mapBox` | `string` | 否 | — | 配合 region：设计稿参照框 "x0,y0,x1,y1"（如地图区域总 bbox）。与 toBox 同时给时，输出增加映射后的坐标列 |
 | `toBox` | `string` | 否 | — | 配合 region：目标参照框 "X0,Y0,X1,Y1"（如本地自绘 SVG 的内容 bbox）。x/y 各自独立缩放（非等比），长宽比不同也能对 |
+| `version` | `string` | 否 | — | 版本 id（默认取最新版 latest）。**设计稿会更新，不指定版本时"代码与稿子是否同一版"无从判断**；给了具体 id 就必须命中，命中不了会明确报错、不会静默回退到最新版。结果里的 version 字段会写明实际用了哪一版、是否最新 |
+| `gapMaxDistance` | `number` | 否 | — | 配合 region：几何间距只保留 ≤ 该值的（不传则全留）。间距=**只在另一轴有重叠**的相邻元素之间的最近边距，可直接抄进 CSS，不用拿坐标手算 |
+| `dds` | `boolean` | 否 | — | 默认关闭。开启后额外尝试取蓝湖 **DDS（设计数据服务）** 的 schema，结果以 source:"dds" 标注。⚠️ 那是社区实测的**非官方**通道（另域 + 独立 Cookie），随时可能失效——**失败只如实记录原因，不影响常规解析结果**，也**不要把它当主路径** |
 | `account` | `string` | 否 | — | 可选：指定蓝湖账号别名（多账号场景，如 acme）。不给时会按链接里的团队 id 自动判定，再退到默认账号。先用 lanhu_accounts 看有哪些账号。 |
 
 #### `lanhu_read_blocks`
@@ -166,6 +172,35 @@
 | `minWidth` | `number` | 否 | — | 可选：只保留宽度 ≥ 该值的块 |
 | `limit` | `number` | 否 | — | 文本清单最多列多少块（默认 80） |
 | `includeNoise` | `boolean` | 否 | — | 是否包含系统 UI / 图形碎片块（默认折叠） |
+| `version` | `string` | 否 | — | 版本 id（默认 latest）；与 read_design 同义。设计稿更新后要复现"当时那一版"就传它 |
+| `account` | `string` | 否 | — | 可选：指定蓝湖账号别名（多账号场景，如 acme）。不给时会按链接里的团队 id 自动判定，再退到默认账号。先用 lanhu_accounts 看有哪些账号。 |
+
+#### `lanhu_list_product_documents`
+
+列出蓝湖项目下的**产品文档**（也叫原型 / PRD —— Axure 导出，`docType=axure`）。**这不是设计稿**：设计稿回答"什么颜色、几 px 圆角"，产品文档回答"业务规则、字段、跳转"。当用户给的是**原型链接**（URL 里带 `docType=axure`），或要看需求文档/PRD/原型、要定位某一步的业务规则时用它；顺带返回项目名/文件夹/创建者。设计稿请用 lanhu_list_designs。拿到 docId 后交给 lanhu_read_product_doc 读页面树与正文。
+
+| 参数 | 类型 | 必填 | 取值 | 说明 |
+|---|---|---|---|---|
+| `url` | `string` | 否 | — | 蓝湖原型链接（整条粘贴，自动解析 tid/pid/docId/pageId） |
+| `teamId` | `string` | 否 | — | 团队 UUID（与 projectId 搭配；给了 url 可不传） |
+| `projectId` | `string` | 否 | — | 项目 UUID（与 teamId 搭配） |
+| `account` | `string` | 否 | — | 可选：指定蓝湖账号别名（多账号场景，如 acme）。不给时会按链接里的团队 id 自动判定，再退到默认账号。先用 lanhu_accounts 看有哪些账号。 |
+
+#### `lanhu_read_product_doc`
+
+读蓝湖**产品文档（Axure 原型 / PRD）**的页面树与正文 —— 需求文档、原型交互、业务规则的来源。**不是设计稿**（色值/字号/圆角用 lanhu_read_design）。返回：页面树（层级/path/类型/pageId）+ 命中页的正文文本。**先不带 pageId 调一次看页面树**（一份原型常有上百个节点），再按 pageId（**跨版本稳定**）或 pageName 精确取正文。正文实测取自页面 HTML（data.js 里的原生控件多为空 —— 因为原型常以矢量/图片导出，只解析 data.js 会得出"这页没内容"的假结论）。
+
+| 参数 | 类型 | 必填 | 取值 | 说明 |
+|---|---|---|---|---|
+| `url` | `string` | 否 | — | 蓝湖原型链接（整条粘贴，URL 里的 pageId 会被自动选中） |
+| `projectId` | `string` | 否 | — | 项目 UUID（与 docId 搭配） |
+| `docId` | `string` | 否 | — | 产品文档 id（= 原型链接里的 docId / image_id）。不给则取项目下第一份 axure 文档 |
+| `teamId` | `string` | 否 | — | 团队 UUID（多账号自动判定失败时显式给） |
+| `pageId` | `string` | 否 | — | 页面 id（**跨版本稳定**，推荐用它）。不给则不取正文，只回页面树 |
+| `pageName` | `string` | 否 | — | 按页面名模糊匹配（pageId 的备选） |
+| `version` | `string` | 否 | — | 版本 id（默认 latest）。原型也会更新，要复现"当时那一版"就传它 |
+| `limit` | `integer` | 否 | — | 最多读几页正文（默认 1，避免一次拉爆） |
+| `textLimit` | `integer` | 否 | — | 每页最多取多少条正文文本（默认 120） |
 | `account` | `string` | 否 | — | 可选：指定蓝湖账号别名（多账号场景，如 acme）。不给时会按链接里的团队 id 自动判定，再退到默认账号。先用 lanhu_accounts 看有哪些账号。 |
 
 #### `lanhu_accounts`
@@ -203,6 +238,8 @@
 | `imageId` | `string` | 否 | — | 设计稿 id |
 | `url` | `string` | 否 | — | 蓝湖链接（与前两者二选一） |
 | `outDir` | `string` | 否 | — | 输出目录（默认 <cwd>/assets/lanhu） |
+| `version` | `string` | 否 | — | 版本 id（默认 latest）。切图也要能追溯"这是哪一版导出的" |
+| `targetDpr` | `number` | 否 | — | 目标倍率（默认取设计稿自带的 sliceScale，没有则 2）。mapping.json 里每张图带 effectiveDensity（实际像素 ÷ 渲染尺寸），**小于它就说明素材本身不够清晰**——改引用方式没用，得让设计师重导 |
 | `account` | `string` | 否 | — | 可选：指定蓝湖账号别名（多账号场景，如 acme）。不给时会按链接里的团队 id 自动判定，再退到默认账号。先用 lanhu_accounts 看有哪些账号。 |
 
 #### `lanhu_verify_spec`
@@ -235,7 +272,7 @@
 
 #### `lanhu_cookie_set`
 
-更新蓝湖 Cookie。**直接粘贴浏览器里复制的内容即可**：F12 → Network → 任意 lanhuapp.com 请求 → 右键 → Copy as cURL → 把整段贴进来（会自动解析出 Cookie，不用手工抠串）。也接受 "Cookie: ..." 原始请求头或裸 Cookie 串。写前用真实请求校验，再落盘到 ~/.dsh/lanhu/cookie（600）。
+更新蓝湖 Cookie。**直接粘贴浏览器里复制的内容即可**：F12 → Network → 任意 lanhuapp.com 请求 → 右键 → Copy as cURL → 把整段贴进来（会自动解析出 Cookie，不用手工抠串）。也接受 "Cookie: ..." 原始请求头或裸 Cookie 串。写前用真实请求校验；**传 `account` 就写进那个账号**（`~/.dsh/lanhu/cookies/<alias>`），不传则落盘到默认的 `~/.dsh/lanhu/cookie`（均 600）。
 
 | 参数 | 类型 | 必填 | 取值 | 说明 |
 |---|---|---|---|---|
@@ -252,7 +289,7 @@
 ```bash
 # ① 装进 profile（<plugin-dir> = 本仓库在你机器上的路径）
 dsh plugin --profile web add <plugin-dir>
-# ② 重启 dsh web —— 13 个工具即对全部会话可见
+# ② 重启 dsh web —— 15 个工具即对全部会话可见
 ```
 
 开发态用软链（改代码立即生效，但 **Host 代码仍需重启 `dsh web`**）：
@@ -285,6 +322,7 @@ cd <plugin-dir> && npm i puppeteer-core   # 只装这一个（它是 optional �
 | 你手上在做的事 | 读哪个文件 |
 |---|---|
 | 读设计稿 / 抠某个区域 / 把坐标搬进自己的坐标系 | [docs/读稿.md](docs/读稿.md) |
+| 读**产品文档 / 原型（PRD）** / 原型和设计稿分不清 | [docs/产品文档.md](docs/产品文档.md) |
 | 还原完要验收 / 导出切图 | [docs/验收.md](docs/验收.md) |
 | 用侧边面板 / 配多账号 / Cookie 失效了 | [docs/面板与账号.md](docs/面板与账号.md) |
 | 用命令行 / 跑自检 / 踩到限制 | [docs/CLI与开发.md](docs/CLI与开发.md) |
@@ -298,7 +336,7 @@ cd <plugin-dir> && npm i puppeteer-core   # 只装这一个（它是 optional �
 > exact structured data (coordinates, colours, font size/weight/family, line-height, letter-spacing,
 > corner radius, stroke, gradients, text, layer opacity) and feeds it to the coding agent, so it stops
 > guessing values from a screenshot. It can also verify a built page against the same spec.
-> **13 tools + a sidebar panel + a CLI**, MIT, macOS/Windows, DSH Web GUI, Node ≥ 20.
+> **15 tools + a sidebar panel + a CLI**, MIT, macOS/Windows, DSH Web GUI, Node ≥ 20.
 > The Chinese sections above are the full manual; this section is the one-screen entry point.
 
 **30-second quick start**
@@ -309,7 +347,7 @@ cd <plugin-dir> && npm i puppeteer-core   # 只装这一个（它是 optional �
 | **② Read the artboard** | `lanhu_read_blocks {"url":"<lanhu link>"}` | a block-level list (a few hundred layers collapsed into reviewable blocks): six properties + font family + line-height/letter-spacing + every gradient stop. No need to split `tid/pid/image_id` by hand — the owning account is detected automatically |
 | **③ Verify** | `lanhu_verify_blocks {"pageUrl":"http://localhost:5173/","url":"<lanhu link>"}` | a four-state report per visible block (✅ exact / 🟡 within tolerance / ❌ mismatch / ⚪ not comparable) with **fixes you can copy verbatim** |
 
-**The 13 tools, one line each**
+**The 15 tools, one line each**
 
 | Tool | What it is for |
 |---|---|
@@ -318,6 +356,8 @@ cd <plugin-dir> && npm i puppeteer-core   # 只装这一个（它是 optional �
 | **`lanhu_search`** | Search artboards / projects / PRDs by name when you don't know where it lives |
 | **`lanhu_read_design`** | The layer tree: `summary` (default, compact text) / `full` (JSON to disk) / `tokens` (stats); `region` extracts an area, `mapBox` + `toBox` map coordinates into your own coordinate system |
 | **`lanhu_read_blocks`** | The block-level list — checking radii, dividers and near-miss colours **starts here** |
+| **`lanhu_list_product_documents`** | List the project's **PRD / prototype (Axure)** documents — separate from design artboards |
+| **`lanhu_read_product_doc`** | A prototype's page tree plus the body text of one page (business rules, fields, navigation) |
 | **`lanhu_download_slices`** | Download slices plus `mapping.json` (size / mode / alpha range per image) |
 | **`lanhu_verify_spec`** | Text-layer verification via `getComputedStyle` (colour / size / weight / **font family** / radius) |
 | **`lanhu_verify_blocks`** | Block-level comparison of six properties + font family, with a four-state report |
@@ -327,7 +367,7 @@ cd <plugin-dir> && npm i puppeteer-core   # 只装这一个（它是 optional �
 
 **Install essentials**
 
-1. `dsh plugin --profile web add <plugin-dir>`, then **restart `dsh web`** — the 13 tools become visible to every session.
+1. `dsh plugin --profile web add <plugin-dir>`, then **restart `dsh web`** — the 15 tools become visible to every session.
 2. For development, symlink the package into the web profile's `node_modules` **and** add `"dsh-lanhu"` to `dsh.profile.bundles` — without the bundles entry the plugin is not loaded at all.
 3. `lanhu_verify_spec` needs a browser engine: `npm i puppeteer-core` (it is an optional dependency — everything else works without it). **On macOS 12 or older, always use puppeteer-core**; Playwright's Chromium cannot be installed there.
 

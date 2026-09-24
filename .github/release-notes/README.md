@@ -15,12 +15,12 @@
    > 漏改一处就红。以前这步是纯靠人核的。
 2. **改了工具就跑生成器**：`node tools/gen-readme-tools.mjs --write`
    （README 的「每个工具的完整说明」是从 `lib/index.js` 的 `TOOLS` 生成的，`readme-test` 逐字比对。）
-3. **跑自检**：`node test/selfcheck.mjs` —— 257 项，**纯离线、秒级**，改完代码先跑它。
-   `node test/readme-test.mjs` —— 24 项**文档绊线**：生成块是否最新 / `docs/` 链接是否存在且无孤立文件 /
+3. **跑自检**：`node test/selfcheck.mjs` —— 454 项，**纯离线、秒级**，改完代码先跑它。
+   `node test/readme-test.mjs` —— 32 项**文档绊线**：生成块是否最新 / `docs/` 链接是否存在且无孤立文件 /
    版本号五处是否一致 / 发布说明格式与公开纪律（不含本机路径）。
    （可选）插件脚手架自检：`node <dsh-plugin-mac 技能目录>/scripts/selftest.mjs --plugin .` —— 16 项，
    覆盖工具形状 / 路由信封 / lossless JSON / 本机守卫 / 槽位注册与回收。
-   顺手核对 README 里写死的项数（**257 / 16**）有没有过期。
+   顺手核对 README 里写死的项数（**454 / 16**）有没有过期。
 4. **写发布说明**：照上一个版本的文件格式新建 `v<新版本>.md`。
 5. **提交并推送**：`git add -A && git commit -m "release: v<版本>" && git push origin main`。
 6. **打 tag 并推送**（除了 `main`，这是唯一要推的东西）：
@@ -57,6 +57,7 @@
 - 面板里有一条**死路由** `/lanhu/verify-blocks`：后端与 `recordUsage` 都写好了，
   注释写着「面板『块级』Tab 的『与页面比对』按钮用」，但那个按钮**从来没做**；`/lanhu/who` 同样没有前端入口。
   要么接上、要么删掉 —— **别留着当"以后再说"**。
-- `test/selfcheck.mjs` 的 `DESC_MUST` 只断言「工具描述里提到了某个能力」，
-  **不断言「声明的参数真的传给了实现」** —— `0.1.1` 修的那个 bug（`limit`/`mapBox`/`toBox` 声明了却收不到）
-  就是从这条缝里活下来的。补这条守卫需要解析源码或给实现注入桩，不是几行能写完的。
+- ~~`test/selfcheck.mjs` 不断言「声明的参数真的传给了实现」~~ —— **0.2.0 已补**：
+  按源码区间逐字检查**全部 15 个工具的全部声明参数**（83 个），带显式白名单
+  （`lanhu_accounts` / `lanhu_who` 的 `account` 属**注入但不适用**，不是漏传）。
+  变异测试过了：把任一处 `args.x` 改掉就红（实测 `lanhu_read_design.limit` → 红）。

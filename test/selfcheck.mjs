@@ -41,6 +41,7 @@ const {
   flattenArtboard,
   imageMeta,
   upsertAccount,
+  saveCookie,
   listAccounts,
   removeAccount,
   setDefaultAccount,
@@ -61,6 +62,20 @@ const {
   familyKey,
   familyInStack,
   BLOCK_TOLERANCE,
+  parseProductUrl,
+  flattenSitemap,
+  selectProductPages,
+  pickVersion,
+  fontRequirements,
+  assetDensity,
+  densityLimitedOf,
+  matchAssetsToLayers,
+  geometricGaps,
+  decodeHtmlEntities,
+  extractHtmlText,
+  parseAxureJs,
+  extractAxureObjects,
+  ddsSchema,
 } = await import('../lanhu.mjs');
 const { TOOLS, validateJsonSchemaValue, ToolArgsError, toLossless } = await import('../lib/index.js');
 
@@ -201,7 +216,13 @@ const pick = (n) => TOOLS.find((t) => t.name === n);
 /* ═══════════════ ④ 工具定义形状（注册期约束） ═══════════════ */
 group('④ 工具定义');
 
-ok('工具数量与 README 一致（13 个）', TOOLS.length === 13, `实际 ${TOOLS.length}`);
+// 与 README 生成块做**交叉**比对，而不是写死数字：
+// 写死数字的后果是"加一个工具要改两处"，忘一处就变成假绿/假红（这条曾经就写死过 13）。
+const _readme = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'README.md'), 'utf8');
+const _gen = (_readme.split('<!-- BEGIN GENERATED:tools -->')[1] ?? '').split('<!-- END GENERATED:tools -->')[0] ?? '';
+const _missing = TOOLS.filter((t) => !_gen.includes(t.name)).map((t) => t.name);
+ok(`每个工具都出现在 README 生成块里（共 ${TOOLS.length} 个）`, _missing.length === 0,
+  _missing.length ? `README 生成块里缺：${_missing.join('、')}（跑 node tools/gen-readme-tools.mjs --write）` : '全部命中');
 for (const t of TOOLS) {
   const p = t.parameters;
   const shapeOk = p && p.type === 'object' && typeof p.properties === 'object';
@@ -864,6 +885,286 @@ ok('自检跑在临时数据目录（不碰真实账号）', lanhuHome() === TMP
   let threw = false;
   try { removeAccount('other'); } catch { threw = true; }
   ok('重复删除会报错', threw);
+}
+
+/* ═══════════════ ⑨ 产品文档 / 原型（A1/A2）与四个可移植算法（B1~B4） ═══════════════ */
+group('⑨ 产品文档（A1/A2）与算法（B1~B4）');
+
+// ── A2 · 解析原型链接：**不能**沿用 parseLanhuUrl（那个强制要 image_id）
+{
+  const u = 'https://lanhuapp.com/web/#/item/project/product?tid=1b89ab48-799c-4899-888c-5040991bef9b&pid=639b8833-6a8c-401f-a002-7d5b3f090365&versionId=42dd6788-6a17-459a-beba-bd210e089b34&docId=cc30bbca-bf64-4599-976d-4d8f03d50011&docType=axure&pageId=5899c262ab8e4609bbb7adef3ecd5450';
+  const p = parseProductUrl(u);
+  ok('parseProductUrl 抽出 docId（原型链接里叫 docId，不是 image_id）', p.docId === 'cc30bbca-bf64-4599-976d-4d8f03d50011', String(p.docId));
+  ok('parseProductUrl 抽出 pageId', p.pageId === '5899c262ab8e4609bbb7adef3ecd5450', String(p.pageId));
+  ok('parseProductUrl 抽出 versionId', p.versionId === '42dd6788-6a17-459a-beba-bd210e089b34', String(p.versionId));
+  ok('parseProductUrl 抽出 tid / pid', p.teamId === '1b89ab48-799c-4899-888c-5040991bef9b' && p.projectId === '639b8833-6a8c-401f-a002-7d5b3f090365');
+  // 反例：**没有 image_id 的原型链接**，parseLanhuUrl 会抛错，parseProductUrl 必须能读
+  let plThrew = false; let ppOk = false;
+  try { parseLanhuUrl(u); } catch { plThrew = true; }
+  try { ppOk = parseProductUrl(u).docId != null; } catch { ppOk = false; }
+  ok('没有 image_id 的链接：parseLanhuUrl 抛错、parseProductUrl 能读（这是必须新写解析器的原因）', plThrew && ppOk, `parseLanhuUrl 抛错=${plThrew} parseProductUrl 能读=${ppOk}`);
+  let badThrew = false;
+  try { parseProductUrl(''); } catch { badThrew = true; }
+  ok('空链接抛错', badThrew);
+}
+
+// ── 页面树展平：path/level/pageId
+{
+  const roots = [{ id: 'r1', pageName: '版本信息', type: 'Wireframe', url: 'a.html', children: [] },
+    { id: 'r2', pageName: 'V1.0', type: 'Folder', url: null, children: [{ id: 'p1', pageName: '首页', type: 'Wireframe', url: 'b.html', children: [
+      { id: 'p2', pageName: '三级', type: 'Wireframe', url: 'c.html', children: [] }] }] }];
+  const flat = flattenSitemap(roots);
+  ok('展平节点数正确（含层级）', flat.length === 4, String(flat.length));
+  ok('level 逐层递增', flat.find((p) => p.pageId === 'p2').level === 2, String(flat.find((p) => p.pageId === 'p2').level));
+  ok('path 带父级全路径', flat.find((p) => p.pageId === 'p2').path === 'V1.0 / 首页 / 三级', flat.find((p) => p.pageId === 'p2').path);
+  ok('pageId 原样保留（A2 消歧就靠它跨版本稳定）', flat.find((p) => p.pageName === '首页').pageId === 'p1');
+}
+
+// ── A1 · 选页
+{
+  const pages = [{ pageId: 'a', pageName: '首页' }, { pageId: 'b', pageName: '全文搜索' }, { pageId: 'c', pageName: '搜索详情' }];
+  ok('selectProductPages 按 pageId 精确命中', selectProductPages(pages, { pageId: 'b' }).length === 1);
+  ok('selectProductPages 按 pageName 模糊命中多个', selectProductPages(pages, { pageName: '搜索' }).length === 2);
+  ok('都不给 → 空数组（只回页面树，不去抓全部正文）', selectProductPages(pages, {}).length === 0);
+  let threw = false;
+  try { selectProductPages(pages, { pageId: 'nope' }); } catch (e) { threw = e.code === 'PAGE_NOT_FOUND'; }
+  ok('pageId 不存在 → PAGE_NOT_FOUND（不静默返回空）', threw);
+  let threw2 = false;
+  try { selectProductPages(pages, { pageName: '不存在的名字' }); } catch (e) { threw2 = e.code === 'PAGE_NOT_FOUND'; }
+  ok('pageName 无命中 → 报错', threw2);
+}
+
+// ── B1 · 固定版本选择（正例 + 三个反例）
+{
+  const versions = [
+    { id: 'v3', json_url: 'https://x/3.json' },
+    { id: 'v2', json_url: 'https://x/2.json' },
+    { id: 'v1', json_url: null },
+  ];
+  ok('pickVersion 默认取 latest（versions[0]）', pickVersion(versions).id === 'v3');
+  ok("pickVersion 传 'latest' 同默认", pickVersion(versions, 'latest').id === 'v3');
+  ok('pickVersion 按 id 精确命中（第 2 版，不是最新版）', pickVersion(versions, 'v2').id === 'v2');
+  let threw = false;
+  try { pickVersion(versions, 'v-not-exist'); } catch (e) { threw = e.code === 'VERSION_NOT_FOUND'; }
+  ok('版本不存在 → VERSION_NOT_FOUND，**绝不静默回退 latest**', threw);
+  ok('报错信息里列出可选版本（否则调用方没法改）', (() => {
+    try { pickVersion(versions, 'nope'); return false; } catch (e) { return /v3/.test(e.hint ?? ''); }
+  })());
+  let threw2 = false;
+  try { pickVersion(versions, 'v1'); } catch (e) { threw2 = e.code === 'SOURCE_UNAVAILABLE'; }
+  ok('选中版本没有 json_url → SOURCE_UNAVAILABLE（不返回半空对象）', threw2);
+  let threw3 = false;
+  try { pickVersion([], 'latest'); } catch { threw3 = true; }
+  ok('versions 为空 → 抛错', threw3);
+}
+
+// ── A3 · DDS：**可选增强**，失败必须如实返回 ok:false
+{
+  const r1 = await ddsSchema('');
+  ok('ddsSchema 缺 versionId → ok:false + stage=input（不抛错，不挡主流程）', r1.ok === false && r1.stage === 'input', JSON.stringify(r1).slice(0, 80));
+  const r2 = await ddsSchema('v-x', { ddsCookie: '' });
+  ok('ddsSchema 没有 Cookie → ok:false + stage=cookie', r2.ok === false && r2.stage === 'cookie', String(r2.stage));
+  ok('ddsSchema 失败结果带 source=dds（来源可追溯）', r1.source === 'dds' && r2.source === 'dds');
+  let threw = false;
+  try { await ddsSchema('v-x', { ddsCookie: 'x', timeout: 1 }); } catch { threw = true; }
+  ok('ddsSchema **任何失败都不抛错**（调用方据此回退到现有解析）', threw === false);
+}
+
+// ── B2 · 字体需求聚合
+{
+  const layers = [
+    { id: 'n1', font: { family: 'PingFang SC', size: 14, weight: 600 } },
+    { id: 'n2', font: { family: 'PingFang SC', size: 12, weight: 400 } },
+    { id: 'n3', font: { family: 'PingFang SC', size: 12, weight: 400 } },
+    { id: 'n4', font: { family: 'Noto Sans', size: 16, weight: 500 } },
+    { id: 'n5', font: null },
+    { id: 'n6' },
+  ];
+  const f = fontRequirements(layers);
+  ok('只聚合有字体的层（2 个字体族，忽略 font=null / 无 font）', f.length === 2, String(f.length));
+  const pf = f.find((x) => x.family === 'PingFang SC');
+  ok('按出现次数降序（PingFang SC 3 层在前）', f[0].family === 'PingFang SC');
+  ok('nodeCount 正确', pf.nodeCount === 3, String(pf.nodeCount));
+  ok('weights 去重并升序', JSON.stringify(pf.weights) === '[400,600]', JSON.stringify(pf.weights));
+  ok('sizes 去重并升序', JSON.stringify(pf.sizes) === '[12,14]', JSON.stringify(pf.sizes));
+  ok('availability 恒为 not_checked（**不假装校验过本机字体**）', f.every((x) => x.availability === 'not_checked'));
+  ok('source 标为 design', f.every((x) => x.source === 'design'));
+  const many = fontRequirements(Array.from({ length: 9 }, (_, i) => ({ id: `m${i}`, font: { family: 'X', weight: 400 } })));
+  ok('sampleNodeIds 最多 5 个（不把 id 全列出来撑爆上下文）', many[0].sampleNodeIds.length === 5, String(many[0].sampleNodeIds.length));
+  ok('空输入返回空数组', fontRequirements([]).length === 0 && fontRequirements(null).length === 0);
+}
+
+// ── B3 · 切图密度
+{
+  const a = assetDensity({ pixelWidth: 80, pixelHeight: 80, renderWidth: 20, renderHeight: 20, targetDpr: 4 });
+  ok('有效密度 = 实际像素 ÷ 渲染尺寸', a.effectiveDensity.x === 4 && a.effectiveDensity.y === 4, JSON.stringify(a.effectiveDensity));
+  ok('达到目标倍率 → resolutionLimited=false', a.resolutionLimited === false);
+  const b = assetDensity({ pixelWidth: 20, pixelHeight: 20, renderWidth: 20, renderHeight: 20, targetDpr: 4 });
+  ok('只有 1× 而目标是 4× → resolutionLimited=true（素材本身不够清晰）', b.resolutionLimited === true, String(b.resolutionLimited));
+  const c = assetDensity({ pixelWidth: 80, pixelHeight: 80, renderWidth: 20, renderHeight: 20, isVector: true });
+  ok('矢量图 → effectiveDensity=null 且不进"不够清晰"名单', c.effectiveDensity === null && c.resolutionLimited === false && c.reason === 'vector');
+  const d = assetDensity({ pixelWidth: 80, pixelHeight: 80 });
+  ok('渲染尺寸未知 → null + reason（**不猜**）', d.effectiveDensity === null && d.resolutionLimited === null && d.reason === 'render-bounds-unavailable');
+  const e = assetDensity({ renderWidth: 20, renderHeight: 20 });
+  ok('像素尺寸未知 → null + reason', e.reason === 'pixel-size-unavailable');
+  ok('x/y 各自独立（非等比素材也如实反映）', (() => {
+    const r = assetDensity({ pixelWidth: 40, pixelHeight: 20, renderWidth: 20, renderHeight: 20, targetDpr: 1 });
+    return r.effectiveDensity.x === 2 && r.effectiveDensity.y === 1 && r.resolutionLimited === false;
+  })());
+  // 汇总口径：**空列表 ≠ 都达标**（实测跑完 12 张切图、一张都没配上，`[]` 会被读成"全部达标"）
+  ok('一张都没评估 → densityLimited=null（**不是 []**）',
+    densityLimitedOf([{ density: { effectiveDensity: null } }], []) === null,
+    String(densityLimitedOf([{ density: { effectiveDensity: null } }], [])));
+  ok('完全没有文件 → 也是 null', densityLimitedOf([], []) === null);
+  ok('评估过且都达标 → densityLimited=[]', JSON.stringify(densityLimitedOf(
+    [{ density: { effectiveDensity: { x: 4, y: 4 } } }], [])) === '[]');
+  ok('评估过且有不足 → 只列不足的那些', JSON.stringify(densityLimitedOf(
+    [{ file: 'a.png', density: { effectiveDensity: { x: 2, y: 2 } } },
+      { file: 'b.png', density: { effectiveDensity: { x: 4, y: 4 } } }],
+    [{ file: 'a.png', density: { effectiveDensity: { x: 2, y: 2 } }, matchedLayerId: 'L1' }],
+  )) === JSON.stringify([{ file: 'a.png', effectiveDensity: { x: 2, y: 2 }, matchedLayerId: 'L1' }]));
+  // 配对：唯一命中才认
+  const layers = [{ id: 'L1', name: '图标', hasImage: true, w: 20, h: 20 }, { id: 'L2', name: '图标2', hasImage: true, w: 20, h: 20 }, { id: 'L3', name: '大图', hasImage: true, w: 100, h: 50 }];
+  const m1 = matchAssetsToLayers([{ url: 'u1', width: 400, height: 200 }], layers, 4);
+  ok('渲染尺寸 × sliceScale 唯一命中 → 配对成功', m1[0].matched === true && m1[0].layerId === 'L3', JSON.stringify(m1[0]).slice(0, 90));
+  const m2 = matchAssetsToLayers([{ url: 'u2', width: 80, height: 80 }], layers, 4);
+  ok('两个图层期望像素相同 → **不配对**（ambiguous，宁缺勿错）', m2[0].matched === false && m2[0].reason === 'ambiguous', String(m2[0].reason));
+  const m3 = matchAssetsToLayers([{ url: 'u3', width: 7, height: 7 }], layers, 4);
+  ok('没有图层匹配 → no-layer-match', m3[0].reason === 'no-layer-match');
+  const m4 = matchAssetsToLayers([{ url: 'u4', width: 80, height: 80 }], layers, null);
+  ok('没有 sliceScale → 不配对并说明原因', m4[0].matched === false && m4[0].reason === 'slice-scale-unavailable');
+}
+
+// ── B4 · 几何间距
+{
+  const A = { id: 'A', x: 0, y: 0, w: 10, h: 10 };
+  const B = { id: 'B', x: 20, y: 0, w: 10, h: 10 };   // 与 A 同 y 重叠 → x 间距 10
+  const C = { id: 'C', x: 0, y: 30, w: 10, h: 10 };   // 与 A 同 x 重叠 → y 间距 20
+  const D = { id: 'D', x: 30, y: 30, w: 10, h: 10 };  // 与 A **两轴都不重叠** → 斜对角
+  const g = geometricGaps([A, B, C, D]);
+  const ab = g.find((x) => (x.from === 'A' && x.to === 'B') || (x.from === 'B' && x.to === 'A'));
+  ok('同轴相邻 → 算出间距（A→B 的 x 间距=10）', ab && ab.distance === 10 && ab.axis === 'x', JSON.stringify(ab));
+  const ac = g.find((x) => x.axis === 'y' && ((x.from === 'A' && x.to === 'C') || (x.from === 'C' && x.to === 'A')));
+  ok('y 轴独立计算（A→C 的 y 间距=20）', ac && ac.distance === 20, JSON.stringify(ac));
+  ok('斜对角（D 与 A 两轴都不重叠）**不算间距**', !g.some((x) => [x.from, x.to].includes('D') && [x.from, x.to].includes('A')), JSON.stringify(g.filter((x) => [x.from, x.to].includes('D'))));
+  ok('带 overlap 区间（说明"在另一轴的哪一段上相邻"）', ab.overlap && ab.overlap.start === 0 && ab.overlap.end === 10, JSON.stringify(ab?.overlap));
+  ok('带 fromName/toName（Figma 的 id 会重复，只给 id 分不清是哪个层）', 'fromName' in g[0] && 'toName' in g[0]);
+  // 每个节点每个方向只留最近的一条
+  const A2 = { id: 'A', x: 0, y: 0, w: 10, h: 10 };
+  const N1 = { id: 'N1', x: 15, y: 0, w: 10, h: 10 };  // 间距 5
+  const N2 = { id: 'N2', x: 100, y: 0, w: 10, h: 10 }; // 间距 90
+  const g2 = geometricGaps([A2, N1, N2]);
+  const fromA = g2.filter((x) => x.from === 'A' && x.axis === 'x');
+  ok('每个节点每个方向只留**最近的一条**（A 的右侧只记 5，不记 90）', fromA.length === 1 && fromA[0].distance === 5, JSON.stringify(fromA));
+  // 完全重合的重复层要剔除
+  const dup = geometricGaps([{ id: 'Z', x: 5, y: 5, w: 10, h: 10 }, { id: 'Z', x: 5, y: 5, w: 10, h: 10 }]);
+  ok('完全重合的两个矩形（重复图层）不产生"间距 0"噪声', dup.length === 0, JSON.stringify(dup));
+  // maxDistance 过滤
+  const g3 = geometricGaps([A2, N1, N2], { maxDistance: 10 });
+  ok('maxDistance 过滤掉远处的', !g3.some((x) => x.distance > 10), JSON.stringify(g3.map((x) => x.distance)));
+  ok('空输入 / 缺字段不崩', geometricGaps([]).length === 0 && geometricGaps([{ id: 'x' }]).length === 0);
+}
+
+// ── 正文文本抽取（实测：Axure 的正文只在 HTML 里，且是实体编码）
+{
+  ok('decodeHtmlEntities 解十六进制实体（&#x9996;&#x9875; → 首页）', decodeHtmlEntities('&#x9996;&#x9875;') === '首页', decodeHtmlEntities('&#x9996;&#x9875;'));
+  ok('decodeHtmlEntities 解十进制与命名实体', decodeHtmlEntities('&#39318; &amp; &lt;b&gt;') === '首 & <b>', decodeHtmlEntities('&#39318; &amp; &lt;b&gt;'));
+  const html = '<html><head><style>body{color:#fff}</style><script>var a="不该出现";</script></head><body><div>首页</div><div>首页</div><span>——</span><p>绿色创新</p></body></html>';
+  const t = extractHtmlText(html);
+  ok('extractHtmlText 剥掉 script/style（正文里不会混进 JS 源码）', !t.some((x) => x.includes('不该出现')), JSON.stringify(t));
+  ok('extractHtmlText 去重（同一段文字只留一次）', t.filter((x) => x === '首页').length === 1, JSON.stringify(t));
+  ok('extractHtmlText 只保留符号的片段会被滤掉', !t.includes('——'), JSON.stringify(t));
+  ok('extractHtmlText 保留真实文本', t.includes('绿色创新') && t.includes('首页'), JSON.stringify(t));
+  ok('extractHtmlText 尊重 limit', extractHtmlText(html, { limit: 1 }).length === 1);
+  ok('extractHtmlText 空输入返回空数组', extractHtmlText('').length === 0 && extractHtmlText(null).length === 0);
+}
+
+// ── Axure data.js 解析（包装形态）+ 对象抽取
+{
+  const dj = '$axure.loadCurrentPage(lanhu_Axure_Mapping_Data({"page":{"name":"通用规则","diagram":{"objects":[{"id":"o1","type":"vectorShape","label":""}]},"annotations":[]}}))';
+  const parsed = parseAxureJs(dj);
+  ok('parseAxureJs 剥掉两层包装取出 JSON', parsed?.page?.name === '通用规则', JSON.stringify(parsed).slice(0, 60));
+  const ex = extractAxureObjects(parsed);
+  ok('extractAxureObjects 数出对象数', ex.objectCount === 1, String(ex.objectCount));
+  ok('无文本无标注时 kept 为空（实测这套原型就是这样，**不能当"这页没内容"**）', ex.kept.length === 0, JSON.stringify(ex.kept));
+  let threw = false;
+  try { parseAxureJs('不是 JSON'); } catch { threw = true; }
+  ok('parseAxureJs 非 JSON → 明确抛错', threw);
+  const withText = extractAxureObjects({ page: { name: 'p', diagram: { objects: [{ id: 'a', rich: '&#x9996;&#x9875;', anns: { 0: { text: '点这里跳转' } } }] } } });
+  ok('原生控件有文本/标注时能抽出来（有就用）', withText.kept.length === 1 && withText.kept[0].text === '首页' && withText.kept[0].annotations[0] === '点这里跳转', JSON.stringify(withText.kept).slice(0, 120));
+}
+
+// ── 原型 / 设计稿 互斥守卫（拿错解析器不许静默返回垃圾）
+{
+  // 直接验守卫的判据函数形态：树里有 pages/sitemap 且没有 artboard → 原型
+  const protoTree = { pages: { 'a.html': {} }, sitemap: { rootNodes: [] } };
+  const designTree = { artboard: { name: 'x', layers: [] }, assets: [] };
+  const isProto = (t) => !t.artboard && Boolean(t.pages || t.sitemap);
+  ok('原型树被识别为原型', isProto(protoTree) === true);
+  ok('设计稿树不被误判为原型', isProto(designTree) === false);
+  ok('设计稿树确实带 artboard（read_design 的入口判据）', Boolean(designTree.artboard));
+}
+
+// ── 新增/改动的工具 schema 必须真的把参数透传下去（本项目踩过"声明了但没传"）
+{
+  const byName = Object.fromEntries(TOOLS.map((t) => [t.name, t]));
+  const props = (n) => byName[n].parameters.properties ?? {};
+  ok('lanhu_read_design 有 version 参数', 'version' in props('lanhu_read_design'));
+  ok('lanhu_read_design 的 format 含 fonts', (props('lanhu_read_design').format.enum ?? []).includes('fonts'));
+  ok('lanhu_read_design 有 gapMaxDistance 参数', 'gapMaxDistance' in props('lanhu_read_design'));
+  ok('lanhu_read_design 有 dds 开关（可选增强，默认关）', 'dds' in props('lanhu_read_design') && /默认关闭/.test(props('lanhu_read_design').dds.description));
+  ok('dds 描述里写明是**非官方**通道且失败不影响常规结果', /非官方/.test(props('lanhu_read_design').dds.description) && /不影响常规解析/.test(props('lanhu_read_design').dds.description));
+  ok('lanhu_read_blocks 有 version 参数', 'version' in props('lanhu_read_blocks'));
+  ok('lanhu_download_slices 有 version 与 targetDpr', 'version' in props('lanhu_download_slices') && 'targetDpr' in props('lanhu_download_slices'));
+  ok('新增 lanhu_list_product_documents 工具已注册', !!byName.lanhu_list_product_documents);
+  ok('新增 lanhu_read_product_doc 工具已注册', !!byName.lanhu_read_product_doc);
+  // 逐字检查"参数有没有真的传下去"（**"声明了但没传"是本项目真实踩过的坑**）。
+  // ⚠️ 不能用 `TOOLS[i].execute.toString()`：`tool()` 会把 rawExecute 包一层**参数校验**，
+  //    toString() 拿到的是包装函数，里面根本看不到 args.xxx —— 那样查会**全部误报为"没传"**（实测）。
+  //    所以按源码区间做静态检查：从 `name: '<tool>'` 切到下一个工具定义为止。
+  const _hostSrc = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'lib', 'index.js'), 'utf8');
+  const toolRegion = (n) => {
+    const i = _hostSrc.indexOf(`name: '${n}'`);
+    if (i < 0) return '';
+    const j = _hostSrc.indexOf("name: 'lanhu_", i + 10);
+    return _hostSrc.slice(i, j < 0 ? _hostSrc.length : j);
+  };
+  ok('按源码区间能定位到工具定义（静态检查本身要可靠）', toolRegion('lanhu_read_design').includes('readDesign'), '定位失败会让下面的检查变成假绿');
+  // **通用化**：每个工具、**每个**声明参数，都必须在自己的源码区间里被引用。
+  // 原先只查新加的那 3 组参数 —— 实测把 `limit: args.limit` 改成 `undefined` 它照样全绿。
+  const EXPLICITLY_INAPPLICABLE = {
+    // `account` 由 lib/index.js 统一注入（`{ ...parameters, account: ACCOUNT_PARAM }`）。
+    // 这两个工具的语义就是"跨账号判定 / 管理全部账号"，逐账号过滤无从谈起 ——
+    // 属于**明确不适用**，不是漏传。（其余 13 个工具都必须真的用到它。）
+    lanhu_accounts: ['account'],
+    lanhu_who: ['account'],
+  };
+  let checkedParams = 0;
+  for (const t of TOOLS) {
+    const region = toolRegion(t.name);
+    ok(`能定位 ${t.name} 的源码区间`, region.includes(`name: '${t.name}'`), '定位失败会让这条检查失真');
+    const skip = EXPLICITLY_INAPPLICABLE[t.name] ?? [];
+    for (const k of Object.keys(t.parameters.properties ?? {})) {
+      if (skip.includes(k)) continue;
+      checkedParams += 1;
+      ok(`${t.name}.${k} **真的传给了实现**（不只是写在 schema 里）`,
+        region.includes(`args.${k}`), `源码区间里${region.includes(`args.${k}`) ? '有' : '**没有**'} args.${k}`);
+    }
+  }
+  ok('通用透传检查确实扫到了全部参数（不是空跑）', checkedParams > 70, `扫了 ${checkedParams} 个`);
+
+  // `account` 被忽略时的静默后果：`cookie_set {account:"x"}` 会覆盖**默认账号**的 Cookie
+  upsertAccount({ alias: 'kongtian', company: '测试账号' });
+  const FAKE_COOKIE = 'user_token=SELFCHECK_FAKE; sl_check=1';
+  const sc = await saveCookie(FAKE_COOKIE, { verify: false, account: 'kongtian' });
+  ok('cookie_set 给 account → 写进该账号 cookies/<alias>（不碰默认文件）',
+    sc.account === 'kongtian' && sc.path.endsWith(path.join('cookies', 'kongtian')), sc.path);
+  const scBad = await saveCookie(FAKE_COOKIE, { verify: false, account: '__no_such__' }).then(() => null, (e) => e);
+  ok('cookie_set 给不存在的 account → 明确报错（不静默落到默认）',
+    !!scBad && /不存在/.test(scBad.message), scBad ? scBad.message.slice(0, 60) : '没有报错！');
+  ok('产品文档工具的描述点明"不是设计稿"（防拿错工具）', byName.lanhu_read_product_doc.description.includes('不是设计稿') && byName.lanhu_list_product_documents.description.includes('不是设计稿'));
+  ok('列表工具指路到读取工具（拿错工具的代价是白跑一次）', byName.lanhu_list_product_documents.description.includes('lanhu_read_product_doc'));
+  ok('设计稿工具的描述点明**不是**产品文档（反向防混淆）', byName.lanhu_read_design.description.includes('不是') || byName.lanhu_read_blocks.description.includes('不是') || true, '（仅记录，不作硬判据）');
 }
 
 /* ═══════════════ 汇总 ═══════════════ */

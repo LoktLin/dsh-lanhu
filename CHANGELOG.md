@@ -4,6 +4,90 @@
 >
 > 每条都来自真实使用反馈与实测复现；括号里的日期是修复落地的日期。
 
+## 0.2.0 —— 补齐产品文档（PRD/原型）读取 + 四个可移植算法（2026-09-24）
+
+> 思路吸收自社区第三方项目 [`dsphper/lanhu-mcp`](https://github.com/dsphper/lanhu-mcp)（MIT）——
+> **独立实现，未逐行搬代码**。它的价值在于多读了几个接口、并把几段算法做得很干净。
+
+### 新增能力
+
+**A1 · 产品文档（PRD / Axure 原型）** —— 这是此前**完全缺失**的一块
+
+- 新工具 `lanhu_list_product_documents`：列项目下的原型文档（docId / 名称 / 更新时间 / 最新版本 / 版本数 / 是否已替换）+ 项目名与文件夹。
+- 新工具 `lanhu_read_product_doc`：页面树（层级 / path / 类型 / pageId）+ 命中页正文。
+- 实测某份原型 **219 个页面节点 / 183 个可读页 / 102 个版本**，正文取到 35 条真实业务规则。
+
+**A2 · docId 失效自动找回**（`read_design` / `read_blocks` / `read_product_doc` 共用）
+
+- 原型被重新上传后旧 docId 报 `code=10009`。现在会自动用 `product_documents` 找回当前有效文档：
+  1 份直接用；多份按 **`pageId` 跨版本稳定**这一特性消歧；仍定不下来则报错并**列出全部候选**。
+
+**B1 · 固定版本读取**
+
+- `read_design` / `read_blocks` / `read_product_doc` / `download_slices` 新增 `version` 参数。
+- 结果里新增 `version` 字段（id / requested / isLatest / count / latestId / latestAt），
+  **让"代码对应的是哪一版"变成可查的事实**。
+- 传了具体版本而命中不了 → `VERSION_NOT_FOUND` 并列出可选 id，**绝不静默回退 latest**。
+
+**B2 · 字体需求聚合**（`read_design` 的 `format: 'fonts'`）
+
+- 聚合每个字体族的字重、字号、文本层数、样例图层 id。
+- `availability` 恒为 `not_checked` —— **本插件不检测本机字体**，不假装校验过。
+
+**B3 · 切图密度判定**（接进 `download_slices` 的 `mapping.json`）
+
+- `effectiveDensity = 实际像素 ÷ 渲染尺寸`；`resolutionLimited = min(density) < targetDpr`。
+- 目标倍率默认取设计稿自带的 `meta.sliceScale`（实测某稿是 4）。
+- 素材不够清晰时会直接打印警告 —— 把 README 那条「别信图片预览」从**定性提醒**变成**可判定数值**。
+- ⚠️ **实测未落地**：配对只在「渲染尺寸 × sliceScale = 期望像素」**唯一命中**时成立，
+  而实测那份稿 **12 张切图配到 0 张** —— 两个原因，都不是能靠放宽阈值解决的：
+  1. 素材带额外留白：图层 `48×56`×4 应为 `192×224`，实际素材是 `200×244`；
+  2. 同尺寸图层重复：4 个 `20×20` 图层都对应 `80×80`，按「唯一才认」必须拒绝。
+- 根因在**数据**：竞品那套算得出密度，是因为它的数据通道带 `asset.render_bounds`；
+  我们这条通道的 `tree.assets` 是**裸 URL 数组**，既无边界也无与图层的对应关系。
+  所以本版 B3 的实际效果是**全为 `null` + 写明原因**（`matchReason`），**不产出错误的密度值**。
+  要真正用上，得先有 `render_bounds` 这一字段（或让调用方显式提供渲染边界）。
+  - **汇总口径改对**：`densityLimited` 原先恒定给 `[]` —— 而"一张都没配上"时读者会把它读成
+    **"全部达标"**，正好是反的。现在 **`null` = 一张都没评估，`[]` = 评估过且都达标**；
+    抽成纯函数 `densityLimitedOf`，由自检 4 条断言 + 变异测试守住（改回恒定 `[]` 会红 2 条）。
+
+**B4 · 几何间距**（区域模式下输出）
+
+- 只在**另一轴有重叠**的相邻元素之间算最近边距，x/y 各自独立，每个节点每个方向只留最近一条。
+- 输出带 `fromName` / `toName` / `overlap` 区间，可直接抄进 CSS —— 替代「拿相邻块坐标相减」的手工做法。
+
+### 修的问题（本次自己踩出来的）
+
+- **拿设计稿解析器读原型会静默返回「1 层」垃圾**：新增互斥守卫，识别出原型树时报
+  `PROTOTYPE_NOT_DESIGN` 并指路到 `lanhu_read_product_doc`（反向同理，报 `DESIGN_NOT_PROTOTYPE`）。
+- **A2 的多候选消歧一度被上面这个守卫生效后打死**（循环里逐个试读原型文档时吃了 `PROTOTYPE_NOT_DESIGN`，
+  被 `catch` 吞掉 → 消歧恒不命中且不报错）。已显式传 `expect: 'prototype'`。
+- **B4 的过滤默认值与 `renderRegion` 不一致**：只给 `region:'200,600'` 时 `x0/x1` 是 undefined，
+  原写法会把所有元素滤掉 → 间距恒为 0 条（看着像"这里确实没间距"）。已对齐 `-Infinity/Infinity`。
+- **B4 输出出现"自己到自己、间距 0"**：Figma 导出的 id 会重复（如 `I37:2804;3`）。
+  已补名字字段、剔除完全重合的重复层、并按 (from,to,axis,distance,overlap) 去重。
+- **`apiRequest` 无网络重试**：蓝湖域名偶发超时。现在只对**网络层失败**重试 3 次，
+  HTTP 4xx/5xx 与业务 code 一律不重试（否则会把"登录失效"拖成三次慢失败）。
+- **自检里硬编码的「工具数量 13 个」** 改成从 README 生成块反查 —— 加工具不再需要改两处。
+- **`product_documents` 的时间是 RFC 2822**（`Sat, 12 Sep 2026 22:30:43 GMT`），
+  与其它接口的 ISO8601 不是一套，已单独解析。
+
+### A3 · DDS schema（可选增强，默认关闭）
+
+- `read_design` 新增 `dds: true` 开关：额外尝试取蓝湖 **DDS（设计数据服务）** 的 schema，结果以 `source: 'dds'` 标注。
+- ⚠️ 那是**社区实测的非官方通道**（另域 `dds.lanhuapp.com` + 独立 Cookie + 硬编码 Basic 头），随时可能失效：
+  **默认不碰；失败只如实记录 `stage` 与 `error`，绝不影响常规解析结果**，也不作为主路径。
+- 实测**通道可达**（拿到蓝湖真实响应），但试过的 4 张稿/版本一律回 `code=10011 版本数据不存在`
+  —— **成功路径未验证**（见「未验证项」）。
+
+### 自检
+
+- `test/selfcheck.mjs`：**257 → 354 项，全绿**。新增 ⑨ 组覆盖 A1/A2/B1~B4 的正反例。
+- 其中「参数有没有真的传给实现」一项用了**源码区间静态检查**：
+  `TOOLS[i].execute.toString()` 拿到的是 `tool()` 的**校验包装函数**，看不到 `args.xxx`，
+  用它查会**全部误报为"没传"**（实测）。已用变异测试确认绊线真会红。
+- `test/readme-test.mjs`：全绿（工具块已用 `gen-readme-tools.mjs --write` 重生成）。
+
 ## 0.1.1 —— 修一个静默 bug：`lanhu_read_design` 有三个参数收不到（2026-09-21）
 
 | 参数 | schema 声明 | 工具 execute 实际传 | CLI `lanhu read` |
