@@ -16,7 +16,7 @@
 > **没有它**：AI 写页面前只能看设计稿**截图**，色值和字号靠视觉估算（OCR 小字经常错）。
 > **有了它**：设计稿的真实数值直接进上下文 —— 等于把「设计标注」喂给模型；还能反过来拿它**自动验收**页面还原度。
 
-**版本 `0.2.1`**（见 [CHANGELOG](CHANGELOG.md)） · MIT
+**版本 `0.3.0`**（见 [CHANGELOG](CHANGELOG.md)） · MIT
 适用于 [DeepSeek Harness](https://github.com/deepseek-ai)（DSH）Web GUI，需要 **Node ≥ 20**。自带 15 个原生工具 + 侧边面板 + CLI。
 
 > ⚠️ **免责与数据说明**
@@ -38,10 +38,11 @@
 | **区域抠图 + 坐标映射** | 按 `y` 区间取值；能把设计稿坐标**直接映射**到你自己 SVG 的 viewBox（非等比，两套坐标系也能对） |
 | **切图导出带 alpha 报告** | 每张图给 `尺寸 / mode / alpha 范围`，**半透明当场告警**（避免整屏发灰） |
 | **两种验收** | 文本层逐字段比对 + 块级**四态报告**（含可直接抄的建议改法） |
+| **原型（PRD）也能读** | 页面树 + 正文业务规则；**没有设计稿、只有原型的项目**还能读原型里的色值/字号/坐标（`format:"layers"`，与设计稿同一张块级表） |
 | **侧边面板** | 块级 / 账号 / 记录，三个 Tab，不用敲命令 |
 | **多账号** | 一账号一套 Cookie；贴链接自动判归属（索引命中零请求） |
 | **零运行时依赖** | 真机验收才需要 `puppeteer-core`（`optionalDependencies`，不装也能用） |
-| **离线自检 459 项** | 秒级、零网络；改完代码先跑它（另有**文档绊线** `test/readme-test.mjs` 24 项） |
+| **离线自检 530 项** | 秒级、零网络；改完代码先跑它（另有**文档绊线** `test/readme-test.mjs`：生成块 / `docs/` 链接与孤立文件 / 版本号五处 / 发布说明格式 / 写死的数字） |
 
 ---
 
@@ -79,6 +80,9 @@
 
 > **要看需求 / 原型（PRD）？** `lanhu_read_product_doc {"url":"<蓝湖原型链接>"}` —— 页面树 + 命中页正文（业务规则、字段、跳转）。
 > 那是**产品文档（Axure 原型）**，不是设计稿；设计稿的色值字号仍走 `lanhu_read_design` / `lanhu_read_blocks`。先列文档用 `lanhu_list_product_documents`。
+>
+> **原型里也有样式值**：加 `"format":"layers"` 就能拿到该页的色值 / 字号 / 坐标 / 描边 / 渐变（**与设计稿同一张块级表**）——
+> 没有设计稿、只有原型的项目靠这个。⚠️ 原型样式是设计者随手填的，**有设计稿时以设计稿为准**；详见 [docs/原型样式.md](docs/原型样式.md)。
 
 **四条铁律**（先记住，能省掉大部分返工；每条的具体做法在对应 `docs/` 里，**这里只留一句，细节不复制**）：
 
@@ -217,7 +221,7 @@
 
 #### `lanhu_read_product_doc`
 
-读蓝湖**产品文档（Axure 原型 / PRD）**的页面树与正文 —— 需求文档、原型交互、业务规则的来源。**不是设计稿**（色值/字号/圆角用 lanhu_read_design）。返回：页面树（层级/path/类型/pageId）+ 命中页的正文文本。**先不带 pageId 调一次看页面树**（一份原型常有上百个节点），再按 pageId（**跨版本稳定**）或 pageName 精确取正文。正文实测取自页面 HTML（data.js 里的原生控件多为空 —— 因为原型常以矢量/图片导出，只解析 data.js 会得出"这页没内容"的假结论）。
+读蓝湖**产品文档（Axure 原型 / PRD）**的页面树与正文 —— 需求文档、原型交互、业务规则的来源。**不是设计稿**（色值/字号/圆角用 lanhu_read_design）。返回：页面树（层级/path/类型/pageId）+ 命中页的正文文本。**先不带 pageId 调一次看页面树**（一份原型常有上百个节点），再按 pageId（**跨版本稳定**）或 pageName 精确取正文。`format:"layers"` 取**样式图层/块级清单**（项目只有原型、没有设计稿时靠它照着实现）。正文实测取自页面 HTML（data.js 里的原生控件多为空 —— 因为原型常以矢量/图片导出，只解析 data.js 会得出"这页没内容"的假结论）。
 
 | 参数 | 类型 | 必填 | 取值 | 说明 |
 |---|---|---|---|---|
@@ -230,6 +234,9 @@
 | `version` | `string` | 否 | — | 版本 id（默认 latest）。原型也会更新，要复现"当时那一版"就传它 |
 | `limit` | `integer` | 否 | — | 最多读几页正文（默认 1，避免一次拉爆） |
 | `textLimit` | `integer` | 否 | — | 每页最多取多少条正文文本（默认 120） |
+| `format` | `string` | 否 | `doc` / `layers` | doc（默认）= 页面树 + 正文文本（业务规则、字段、跳转）。layers = **该页的样式图层/块级清单**（坐标·色值·字号·字重·字体族·圆角·描边·渐变·透明度·切图），与 lanhu_read_blocks 输出**同一张表**。**什么时候用 layers**：项目里**没有设计稿、只有原型**时（`lanhu_list_designs` 返回 0 张）—— 那时 lanhu_read_design / lanhu_read_blocks 一点数据都拿不到，靠它才能照着实现。⚠️ 原型是交互稿，颜色/字号是设计者随手填的，**不等于最终视觉稿**；有设计稿时仍以设计稿为准。 |
+| `layerLimit` | `integer` | 否 | — | format=layers 时最多列多少块（默认 60） |
+| `includeNoise` | `boolean` | 否 | — | format=layers 时是否包含系统 UI / 图形碎片块（默认折叠） |
 | `account` | `string` | 否 | — | 可选：指定蓝湖账号别名（多账号场景，如 acme）。不给时会按链接里的团队 id 自动判定，再退到默认账号。先用 lanhu_accounts 看有哪些账号。 |
 
 #### `lanhu_accounts`
@@ -352,6 +359,7 @@ cd <plugin-dir> && npm i puppeteer-core   # 只装这一个（它是 optional �
 |---|---|
 | 读设计稿 / 抠某个区域 / 把坐标搬进自己的坐标系 | [docs/读稿.md](docs/读稿.md) |
 | 读**产品文档 / 原型（PRD）** / 原型和设计稿分不清 | [docs/产品文档.md](docs/产品文档.md) |
+| **项目没有设计稿、只有原型**，要照着它实现 | [docs/原型样式.md](docs/原型样式.md) |
 | 还原完要验收 / 导出切图 | [docs/验收.md](docs/验收.md) |
 | 用侧边面板 / 配多账号 / Cookie 失效了 | [docs/面板与账号.md](docs/面板与账号.md) |
 | 用命令行 / 跑自检 / 踩到限制 | [docs/CLI与开发.md](docs/CLI与开发.md) |
@@ -385,6 +393,11 @@ cd <plugin-dir> && npm i puppeteer-core   # 只装这一个（它是 optional �
 | **② Read the artboard** | `lanhu_read_blocks {"url":"<lanhu link>"}` | a block-level list (a few hundred layers collapsed into reviewable blocks): six properties + font family + line-height/letter-spacing + every gradient stop. No need to split `tid/pid/image_id` by hand — the owning account is detected automatically |
 | **③ Verify** | `lanhu_verify_blocks {"pageUrl":"http://localhost:5173/","url":"<lanhu link>"}` | a four-state report per visible block (✅ exact / 🟡 within tolerance / ❌ mismatch / ⚪ not comparable) with **fixes you can copy verbatim** |
 
+> **Reading requirements / prototypes (PRD)?** `lanhu_read_product_doc {"url":"<prototype link>"}` gives the page tree and
+> the body text of one page. It is a **product document (Axure prototype), not a design**. Add `"format":"layers"` for that
+> page's style values (colours / font sizes / coordinates) — the only route when a project has **no design artboards**.
+> Prototype styles are typed in by hand by the designer, so **a design always wins when one exists**. See [docs/原型样式.md](docs/原型样式.md).
+
 **The 15 tools, one line each**
 
 | Tool | What it is for |
@@ -395,7 +408,7 @@ cd <plugin-dir> && npm i puppeteer-core   # 只装这一个（它是 optional �
 | **`lanhu_read_design`** | The layer tree: `summary` (default, compact text) / `full` (JSON to disk) / `tokens` (stats); `region` extracts an area, `mapBox` + `toBox` map coordinates into your own coordinate system |
 | **`lanhu_read_blocks`** | The block-level list — checking radii, dividers and near-miss colours **starts here** |
 | **`lanhu_list_product_documents`** | List the project's **PRD / prototype (Axure)** documents — separate from design artboards |
-| **`lanhu_read_product_doc`** | A prototype's page tree plus the body text of one page (business rules, fields, navigation) |
+| **`lanhu_read_product_doc`** | A prototype's page tree plus the body text of one page (business rules, fields, navigation). Add `format:"layers"` to get that page's **styles** — colours, font sizes, coordinates, borders, gradients — so a project with **no design artboards** can still be implemented from it |
 | **`lanhu_download_slices`** | Download slices plus `mapping.json` (size / mode / alpha range per image) |
 | **`lanhu_verify_spec`** | Text-layer verification via `getComputedStyle` (colour / size / weight / **font family** / radius) |
 | **`lanhu_verify_blocks`** | Block-level comparison of six properties + font family, with a four-state report |

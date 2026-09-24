@@ -4,6 +4,9 @@
 
 ## CLI
 
+> **原型页面样式**：`node lanhu.mjs product-doc --url "<原型链接>" --format layers [--layer-limit 200]`
+> —— 输出该页的色值/字号/坐标块级清单（与设计稿同一张表）。没有设计稿、只有原型时用它。
+
 `lanhu.mjs` 零依赖，命令面与工具一一对应：
 
 ```bash
@@ -47,7 +50,7 @@ node lanhu.mjs cookie --clipboard --dry-run  # 只看解析结果，不写入
 ## 本地自检
 
 ```bash
-node test/selfcheck.mjs          # 459 项，纯离线、秒级
+node test/selfcheck.mjs          # 530 项，纯离线、秒级
 node test/selfcheck.mjs --json   # 机器可读
 ```
 

@@ -1,6 +1,6 @@
 {
   "name": "dsh-lanhu",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "蓝湖（Lanhu）设计稿读取插件 —— 把设计稿的精确色值/字号/字重/圆角/坐标/文本喂给 agent，替代靠截图估算",
   "type": "module",
   "main": "./lib/index.js",

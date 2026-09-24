@@ -1144,13 +1144,18 @@ export async function fetchDesignTree(projectId, imageId, opts = {}) {
 
 /** Axure 的 `color` 是 32 位整数。实测高字节常是 `0xFF`（不透明），也有它是真 alpha 的时候
  *  （渐变 stop 的 `color` 高字节与同项的 `opacity` 对得上，例如 0x1A ≈ 0.098）。
- *  所以：高字节非 0 当 alpha，为 0 当不透明 —— 这条是**启发式**，不是官方文档保证。 */
+ *
+ * ⚠️ 2026-09 更正：上面"为 0 当不透明"**是错的**。拿一份真实原型（439 个控件）核过：
+ *   `0x7f58a2cc` ↔ `opacity: 0.4980392156862745`（127/255 = 0.4980392156862745，**精确相等**）、
+ *   `0x4c58a2cc` ↔ 0.2980392156862745、`0x3358a2cc` ↔ 0.2 —— **129 个样本 0 个不一致**；
+ *   而高字节 `0x00` 的 101 个填充**全都配 `opacity: 0`**（真·透明）。
+ *   结论：高字节**就是 alpha**，没有例外。旧实现 `a === 0 ? 1 : …` 会把**透明当成不透明**。
+ *   （当时它没有任何调用点，所以没造成线上问题 —— 但那是个等着被踩的坑。） */
 export function argbColor(n) {
-  if (typeof n !== 'number' || !Number.isFinite(n)) return null;
-  const u = n >>> 0;
-  const a = (u >>> 24) & 0xff;
-  const hex = '#' + (u & 0xffffff).toString(16).padStart(6, '0');
-  return { hex, alpha: a === 0 ? 1 : round2(a / 255) };
+  const p = argbParts(n);
+  if (!p) return null;
+  const hex = '#' + [p.r, p.g, p.b].map((v) => v.toString(16).padStart(2, '0')).join('');
+  return { hex, alpha: p.a };
 }
 
 /** `/api/project/product_documents` 的时间是 **RFC 2822**（如 `Sat, 12 Sep 2026 22:30:43 GMT`），
@@ -1757,6 +1762,638 @@ export async function fetchProductPage(page, opts = {}) {
   return out;
 }
 
+/* ==========================================================================
+ * 3d. 原型（Axure）页面样式 —— 「没有设计稿、只有原型」的项目也要能照着实现
+ *
+ * 背景：蓝湖的项目里**可能一张设计稿都没有**，只有 Axure 原型（实测某项目
+ *   `lanhu_list_designs` 返回 0 张，原型却有 6 个页面）。那时 `read_design` 那条链
+ *   一点数据都拿不到，前端只能靠截图猜。
+ *
+ * 但原型的 `data.js` 里**样式数据是完整的**（实测一份 861 KB / 439 个控件）：
+ *   `style.fill` / `foreGroundFill` / `borderFill`（32 位整数色）、
+ *   `fontSize` / `fontName` / `fontWeight` / `lineSpacing`、`location` / `size`、
+ *   `cornerRadius`、`opacity`、`outerShadow`、`fillType:'linearGradient'` + `stops[]`、`images`。
+ *
+ * 所以这里的做法是：把控件树规范化成**与设计稿同形状的图层数组**，下游整条链直接复用 ——
+ *   `collectTokens`（色板/字号）、`classifyBlock`、`renderRegion`（块级清单）、
+ *   以及 `verify_*`（有机会连原型页一起验收）。
+ *
+ * ⚠️ 与设计稿的差别**必须如实交代**（渲染在输出里，别藏在注释里）：
+ *   · 原型是**交互稿**：颜色/字号是设计者随手填的，**不等于最终视觉稿**；
+ *   · `location` 是**相对父容器**的，本函数已逐层累加成绝对坐标（设计稿那条链本来就是绝对值）。
+ * ========================================================================== */
+
+/**
+ * 剥掉 Axure `data.js` 的外层包装，拿到里面的 JSON 对象。
+ *
+ * 实测外层是两层：`$axure.loadCurrentPage(lanhu_Axure_Mapping_Data({…}))`。
+ *
+ * ⚠️ **必须做括号配对**：JSON 字符串里会出现 `)` 和 `{`（图层名、图片路径里都有），
+ *    用 `lastIndexOf('}')` 这类土办法会切多或切少 —— 实测报
+ *    `Unexpected non-whitespace character after JSON`。这里用状态机跟踪字符串与转义。
+ */
+export function unwrapAxureDocument(text) {
+  const s = String(text ?? '');
+  if (!s.trim()) throw new LanhuError('data.js 是空的。');
+  const start = s.indexOf('{');
+  if (start < 0) {
+    throw new LanhuError('data.js 里找不到 JSON 起点（蓝湖的导出格式可能变了）。', { hint: `开头：${s.slice(0, 80)}` });
+  }
+  let depth = 0;
+  let inStr = false;
+  let esc = false;
+  for (let i = start; i < s.length; i += 1) {
+    const c = s[i];
+    if (inStr) {
+      if (esc) { esc = false; continue; }
+      if (c === '\\') { esc = true; continue; }
+      if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') { inStr = true; continue; }
+    if (c === '{') depth += 1;
+    else if (c === '}') {
+      depth -= 1;
+      if (depth === 0) {
+        const slice = s.slice(start, i + 1);
+        try {
+          return JSON.parse(slice);
+        } catch (e) {
+          throw new LanhuError(`data.js 解析失败：${e.message}`, { hint: '蓝湖的 axure 导出格式可能已变，请重新取证。' });
+        }
+      }
+    }
+  }
+  throw new LanhuError('data.js 的 JSON 括号不配对（文件可能被截断）。');
+}
+
+/**
+ * `objectPaths`：控件 id → HTML 里的 `u###`（文本就挂在 `#u###_text` 上）。
+ *
+ * ⚠️ **入参是整个文档对象**（`unwrapAxureDocument(...)` 的返回值）—— `objectPaths` 在它**顶层**，
+ *    **不在 `page` 里**。传错形状时**必须抛错**：曾经写成 `doc?.objectPaths ?? {}`，
+ *    于是传 `doc.page` 或原文 JSON 字符串都**静默返回空 Map** —— 调用方拿到 0 条还以为"这稿没有"，
+ *    正是本项目最忌讳的静默失效（实测被误用过）。
+ */
+export function axureScriptIds(doc) {
+  const paths = doc?.objectPaths;
+  if (!paths || typeof paths !== 'object' || Array.isArray(paths)) {
+    const shape = doc === null || doc === undefined ? String(doc)
+      : (typeof doc === 'string' ? 'string（原文 JSON 文本？）' : `object{${Object.keys(doc).slice(0, 5).join(',')}}`);
+    throw new LanhuError('axureScriptIds 的入参应该是 **unwrapAxureDocument(...) 的整个返回值**（`objectPaths` 在它顶层）。', {
+      code: 'AXURE_WRONG_INPUT',
+      hint: `收到的是 ${shape}。常见误用：传了 \`doc.page\`（那样没有 objectPaths）、或传了未剥壳的原文。`
+        + '正确：`axureScriptIds(unwrapAxureDocument(dataJsText))`。',
+    });
+  }
+  const out = new Map();
+  for (const [id, v] of Object.entries(paths)) {
+    if (typeof v?.scriptId === 'string') out.set(id, v.scriptId);
+  }
+  return out;
+}
+
+/** 去标签、解实体、压空白 —— 只留人看得见的文本。 */
+function htmlInnerText(fragment) {
+  return decodeHtmlEntities(String(fragment ?? '').replace(/<[^>]*>/g, ' ')).replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * 从原型页面 HTML 里取文本，并按 `u###` 建索引。
+ *
+ * ⚠️ **文本不在 data.js 里**：实测 `label` / `rich` 全为空（原稿以矢量/图片导出），
+ *    正文只在页面 HTML 中，而且是 **HTML 实体编码**（`&#x7EFF;` = 绿）。
+ *    每个控件在 HTML 里是 `<div id="u216">` + `<div id="u216_text">正文</div>`；
+ *    文本域是 `<textarea id="u0_input">`。
+ */
+export function decodeAxureText(html, opts = {}) {
+  const s = String(html ?? '');
+  const clean = s
+    .replace(/<script[\s\S]*?<\/script>/gi, ' ')
+    .replace(/<!--[\s\S]*?-->/g, ' ');
+  const byScriptId = new Map();
+  const re = /<(div|textarea|span|p)\b[^>]*\bid="(u\d+)_(?:text|input)"[^>]*>([\s\S]*?)<\/\1>/gi;
+  const cap = Number(opts.limit ?? 5000);
+  for (const m of clean.matchAll(re)) {
+    const text = htmlInnerText(m[3]);
+    if (!text) continue;
+    if (!byScriptId.has(m[2])) byScriptId.set(m[2], text);
+    if (byScriptId.size >= cap) break;
+  }
+  // 页级文本清单（回答"这一页有哪些字"）—— 复用已验证的抽取器
+  const texts = extractHtmlText(clean, { limit: Number(opts.textLimit ?? 300) });
+  return { byScriptId, texts };
+}
+
+
+/**
+ * 一个节点**看起来像控件**吗 —— 这是判断"某个数组键是不是子层容器"的**唯一判据**。
+ *
+ * 为什么不能只看键名（`objs`/`objects`/`diagrams`）：Axure 的导出里数组键五花八门
+ * （实测出现过 `stops` / `cases` / `actions` / `subExprs` / `arguments` / `objectsToRotate` /
+ * `objectPath` / `firedEvents` / `adaptiveViews` / `variables` …），**按名字列白名单必然漏**。
+ * 反过来按"元素像不像控件"判断，就不会把这些非子层数组误当子层。
+ */
+function looksLikeWidgetNode(v) {
+  return Boolean(v && typeof v === 'object' && !Array.isArray(v)
+    && v.id && (v.type || v.style || v.friendlyType));
+}
+
+/**
+ * 遍历器**实际会走**的子层键。
+ *
+ * ⚠️ **改 `normalizeAxurePage` 的遍历器时，必须同步这个数组** —— 不同步，结构审计会红
+ * （`auditAxureChildKeys` 就是拿它跟"文档里真实出现的子层键"比对的）。
+ * 这不是文档约定，是**被自检钉住的**：见 `test/selfcheck.mjs` 的「结构审计」一组。
+ */
+export const AXURE_CHILD_KEYS = Object.freeze(['objs', 'objects', 'diagrams']);
+
+/**
+ * **结构审计**：扫整份文档，列出"像子层容器"的数组键，并与 `AXURE_CHILD_KEYS` 比对。
+ *
+ * 起因是一次**真实的静默漏层**：`repeater`（中继器）与 `table`（表格）把子层挂在 `objects[]`，
+ * 而遍历器只走了 `objs[]` 与 `diagrams[].objects[]` —— 静默少了 **41 层**；
+ * 同一轮还漏了 **11 个状态容器**。两处都属于同一个病：**"子层挂在哪个键上"是靠人看出来的**。
+ * 现在把它变成**机器拦下**：`normalizeAxurePage` 每次都会跑这个审计，
+ * 一旦出现"文档里有、遍历器不走"的键，就在 `stats.unknownChildKeys` 里报出来并在输出里打警告。
+ *
+ * 返回：
+ *   `childKeys`    —— 文档里实际出现的子层键 `[{key, count, samplePath, handled}]`
+ *   `unhandled`    —— **没被遍历器走过**的那些（正常应为空；非空就是真漏层）
+ *   `panelDiagram` —— `{ inDoc, viaDiagrams }`：守住 `type !== 'Axure:PanelDiagram'` 那个排除条件
+ *                    （容器由 `diagrams` 分支处理，不该再从 `objects` 走一遍；两者数量必须相等）
+ */
+export function auditAxureChildKeys(doc) {
+  const handled = new Set(AXURE_CHILD_KEYS);
+  const found = new Map();
+  const panelDiagram = { inDoc: 0, viaDiagrams: 0 };
+  const rec = (v, path) => {
+    if (Array.isArray(v)) { v.forEach((x, i) => rec(x, `${path}[${i}]`)); return; }
+    if (!v || typeof v !== 'object') return;
+    for (const [k, val] of Object.entries(v)) {
+      if (Array.isArray(val) && val.some(looksLikeWidgetNode)) {
+        const e = found.get(k) ?? { key: k, count: 0, samplePath: `${path}.${k}` };
+        e.count += val.length;
+        found.set(k, e);
+      }
+      if (k === 'diagrams' && Array.isArray(val)) {
+        panelDiagram.viaDiagrams += val.filter((d) => d?.type === 'Axure:PanelDiagram').length;
+      }
+      if (v.type === 'Axure:PanelDiagram' && k === 'objects' && Array.isArray(val)) {
+        panelDiagram.inDoc += 1;
+      }
+      rec(val, path ? `${path}.${k}` : k);
+    }
+  };
+  rec(doc, 'doc');
+  const childKeys = [...found.values()].map((e) => ({ ...e, handled: handled.has(e.key) }));
+  childKeys.sort((a, b) => b.count - a.count);
+  return { childKeys, unhandled: childKeys.filter((e) => !e.handled), panelDiagram };
+}
+
+/** 32 位整数 → `{r,g,b,a}`。**高字节就是 alpha**（见 argbColor 的实测说明）。 */
+export function argbParts(n) {
+  if (typeof n !== 'number' || !Number.isFinite(n)) return null;
+  const u = n >>> 0;
+  return {
+    r: (u >>> 16) & 0xff,
+    g: (u >>> 8) & 0xff,
+    b: u & 0xff,
+    // ⚠️ **不要 round2**：`0x7f` 精确是 127/255 = 0.4980392156862745，round2 会变成 0.5 —— 
+    //    那既不是设计值也不是渲染值。设计稿那条链的 `parseColor` 同样保留全精度，这里对齐它。
+    a: ((u >>> 24) & 0xff) / 255,
+  };
+}
+
+/** Axure 的填充/描边：颜色整数 + **独立的 `opacity` 字段**（两者实测完全一致，见下）。 */
+function axureFillColor(fill) {
+  if (!fill || typeof fill !== 'object') return null;
+  if (fill.fillType === 'linearGradient' || Array.isArray(fill.stops)) return null;
+  const p = argbParts(fill.color);
+  if (!p) return null;
+  const a = fill.opacity === undefined || fill.opacity === null ? p.a : round2(clamp01(Number(fill.opacity)));
+  return { r: p.r, g: p.g, b: p.b, a: Number.isFinite(a) ? a : p.a };
+}
+
+/** 渐变（`fill` 或 `borderFill` 上的 `linearGradient`）→ 每个 stop 一个色。 */
+function axureGradientColors(style) {
+  const out = [];
+  for (const key of ['fill', 'borderFill']) {
+    const f = style?.[key];
+    const isGrad = f && (f.fillType === 'linearGradient' || Array.isArray(f.stops));
+    if (!isGrad) continue;
+    for (const st of f.stops ?? []) {
+      const p = argbParts(st.color);
+      if (!p) continue;
+      const a = st.opacity === undefined || st.opacity === null ? p.a : round2(clamp01(Number(st.opacity)));
+      if (!(a > 0)) continue;
+      out.push({ r: p.r, g: p.g, b: p.b, a, role: 'gradient' });
+    }
+  }
+  return out;
+}
+
+/** `"48px"` / `48` / `"1.4"` → 数字；不确定就 null（**不编造默认值**）。 */
+function axureNumber(v) {
+  if (typeof v === 'number') return Number.isFinite(v) ? round2(v) : null;
+  if (typeof v !== 'string') return null;
+  const m = /-?\d+(?:\.\d+)?/.exec(v);
+  if (!m) return null;
+  const n = Number(m[0]);
+  return Number.isFinite(n) ? round2(n) : null;
+}
+
+/** `"\"PingFang SC\", sans-serif"` → `PingFang SC`（取主族；带回退栈的整串放进 `fontStack`）。 */
+export function axureFontFamily(fontName) {
+  const s = String(fontName ?? '').trim();
+  if (!s) return null;
+  const first = s.split(',')[0].trim().replace(/^["']|["']$/g, '');
+  return first || null;
+}
+
+/**
+ * 把一份原型页面的控件树规范化成**与设计稿同形状**的图层数组。
+ *
+ * 形状与 `flattenArtboard` 的产物一致（`x/y/w/h` 绝对、`inset` 相对父、
+ * `opacity` 自身 / `effectiveOpacity` 累乘、`colors[].role`、`font`、`radius`、`border`），
+ * 因此 `collectTokens` / `classifyBlock` / `renderRegion` 可直接吃。
+ */
+export function normalizeAxurePage({ document: doc, html, pageUrl = null } = {}) {
+  if (!doc || typeof doc !== 'object') {
+    throw new LanhuError('normalizeAxurePage 需要 document（先用 unwrapAxureDocument 剥壳）。');
+  }
+  const scriptIds = axureScriptIds(doc);
+  const { byScriptId, texts } = decodeAxureText(html ?? {});
+  // 结构审计：每次归一化都跑一遍，**发现"文档里有、遍历器不走"的子层键就报出来**（不静默）。
+  const audit = auditAxureChildKeys(doc);
+  const pageStyle = doc?.page?.style ?? {};
+  const pageSize = pageStyle.size ?? {};
+  const layers = [];
+
+  // 画板尺寸：实测 `page.style.size` 常是 `{width:0,height:0}`（高度根本没给），
+  // 唯一可信的宽度在 `defaultAdaptiveView.size`。两者都为 0 时**用控件包围盒兜底** ——
+  // 宁可算出来，也别让下游拿 0×0 的画板去筛区域。
+  const declaredW = axureNumber(pageSize.width) || axureNumber(doc?.defaultAdaptiveView?.size?.width) || 0;
+  const declaredH = axureNumber(pageSize.height) || axureNumber(doc?.defaultAdaptiveView?.size?.height) || 0;
+
+  // 画板层：与设计稿那条链一样，depth 0 是画板本身
+  const artboard = {
+    id: doc?.page?.packageId ?? 'page',
+    type: 'page',
+    name: doc?.page?.name ?? pageUrl ?? '(页面)',
+    parentPath: '',
+    depth: 0,
+    x: 0,
+    y: 0,
+    w: declaredW || null,
+    h: declaredH || null,
+    inset: null,
+    visible: true,
+    opacity: 1,
+    effectiveOpacity: 1,
+    shape: null,
+    radius: null,
+    border: undefined,
+    colors: [],
+    text: null,
+    font: null,
+    hasImage: false,
+  };
+  layers.push(artboard);
+
+  const walk = (arr, parentPath, depth, origin, inheritedOpacity, inheritedVisible, parentBox, panelState = null, containerKind = null) => {
+    for (const o of arr ?? []) {
+      const st = o.style ?? {};
+      const loc = st.location && typeof st.location === 'object' ? st.location : null;
+      const size = st.size && typeof st.size === 'object' ? st.size : null;
+      const rx = loc ? round2(Number(loc.x) || 0) : null;
+      const ry = loc ? round2(Number(loc.y) || 0) : null;
+      const w = size ? axureNumber(size.width) : null;
+      const h = size ? axureNumber(size.height) : null;
+      const x = rx === null ? null : round2(origin.x + rx);
+      const y = ry === null ? null : round2(origin.y + ry);
+
+      const name = (typeof o.label === 'string' && o.label.trim()) ? o.label.trim() : (o.friendlyType ?? o.type ?? '');
+      const path = parentPath ? `${parentPath}/${name}` : name;
+      const ownOpacity = axureNumber(st.opacity);
+      const effectiveOpacity = round2((ownOpacity === null ? 1 : ownOpacity) * inheritedOpacity);
+      const visible = o.visible !== false && inheritedVisible;
+
+      // 文本锚点先取好：颜色与字体都要用它
+      const sid = scriptIds.get(o.id) ?? null;
+
+      // 颜色：填充 / 描边 / 文字色 / 渐变 —— 与设计稿同构（`role` 决定下游怎么归类）
+      const colors = [];
+      const fillC = axureFillColor(st.fill);
+      if (fillC && fillC.a > 0) colors.push({ ...fillC, role: 'fill' });
+      const borderC = axureFillColor(st.borderFill);
+      if (borderC && borderC.a > 0) colors.push({ ...borderC, role: 'border' });
+      const fgC = axureFillColor(st.foreGroundFill);
+      if (fgC && fgC.a > 0) colors.push({ ...fgC, role: 'text' });
+      colors.push(...axureGradientColors(st));
+
+      // 文本：靠 `widgetId → u###` 去 HTML 里取（data.js 里的 label 是空的）
+      const text = (sid ? byScriptId.get(sid) : null) ?? (typeof o.label === 'string' && o.label.trim() ? o.label.trim() : null);
+
+      /**
+       * 字体。
+       *
+       * ⚠️ **为什么会有 `size: null`**：实测 144 个有文本的层里，**60 个在导出里就没有字号**
+       *    （`style.fontSize` 缺席，只有一个 `baseStyle` 哈希，而那个哈希在整个 data.js 里
+       *    **从不当对象键** —— 文档里根本没有样式表，基础样式留在了原始 .rp 里）。
+       *
+       *    去外链 CSS 找过，**找不到**：`files/<页>/styles.css` 里那 251 条 `#uNNN{font-size}`
+       *    经比对**全部**落在"本来就有字号"的控件上（即那份 CSS 是从 data.js **生成**的，不带新信息）；
+       *    `data/styles.css` 只能给出 `.ax_default{13px}` 这种**通用兜底** —— 把它当成设计者填的值
+       *    就是编造。所以这里**留 null**，渲染成 `?`，宁缺勿错。
+       */
+      const fontSize = axureNumber(st.fontSize);
+      const fontWeight = axureNumber(st.fontWeight);
+      const lineHeight = axureNumber(st.lineSpacing);
+      const fontName = st.fontName ?? null;
+      const font = (fontName || fontSize !== null) ? {
+        family: axureFontFamily(fontName),
+        fontStack: fontName ? String(fontName) : null,
+        size: fontSize,
+        weight: fontWeight,
+        align: st.horizontalAlignment ?? null,
+        lineHeight,
+        letterSpacing: null,
+      } : null;
+
+      const cr = axureNumber(st.cornerRadius);
+      const radius = cr && cr > 0 ? { corners: [cr, cr, cr, cr], max: cr } : null;
+
+      const bw = axureNumber(st.borderWidth);
+      let border;
+      if (bw && bw > 0) {
+        border = {
+          color: borderC ? rgbHex(borderC) : null,
+          alpha: borderC ? round2(borderC.a) : null,
+          colorKnown: Boolean(borderC),
+          widths: { top: bw, right: bw, bottom: bw, left: bw },
+          width: bw,
+          sides: ['top', 'right', 'bottom', 'left'],
+          single: null,
+        };
+      }
+
+      // 内边距：Axure 的 `location` **本来就是相对父容器**的，比设计稿那条链更直接
+      const inset = parentBox ? {
+        left: rx,
+        top: ry,
+        right: (w === null || parentBox.w === null) ? null : round2(parentBox.w - (rx ?? 0) - w),
+        bottom: (h === null || parentBox.h === null) ? null : round2(parentBox.h - (ry ?? 0) - h),
+      } : null;
+
+      const imgKeys = Object.keys(o.images ?? {}).filter((k) => !k.endsWith('-isGeneratedImage'));
+      const layer = {
+        id: o.id ?? null,
+        type: o.type ?? null,
+        name,
+        parentPath,
+        depth,
+        x,
+        y,
+        w,
+        h,
+        inset,
+        visible,
+        opacity: ownOpacity === null ? 1 : ownOpacity,
+        effectiveOpacity,
+        shape: o.friendlyType ?? null,
+        radius,
+        border,
+        colors,
+        text,
+        font,
+        hasImage: imgKeys.length > 0,
+        /**
+         * ⚠️ **Axure 与 Figma 的一个真语义差异**：Figma 里文字节点的 `fills` **就是文字色**，
+         *    所以 `buildBlocks` 对"有文字的层"会把 fill 置 null（否则会把文字色当底色）。
+         *    但 Axure 的 `fill`（背景）与 `foreGroundFill`（文字色）是**两个独立字段** ——
+         *    同一个文本控件**可以真的有背景**（实测「需求说明」那个文本域带 `#facd91@6%` 底色，
+         *    若照 Figma 的规则抹掉，背景就整块丢了）。
+         *    这个标记让下游知道："本层的 `role:'fill'` 是真背景，别抹"。
+         */
+        fillIsBackground: true,
+        /** 动态面板的**状态名**（不在面板里就是 null）。这些层是**互斥的备选状态**，不是同时显示的层。 */
+        panelState: panelState ? panelState.label : null,
+        /** 所属动态面板的控件 id（便于把同一面板的状态归组） */
+        panelOf: panelState ? panelState.panelId : null,
+        /** 子层挂在哪种容器下：`repeater`（中继器模板）/ `table`（表格单元格）等；普通层为 null */
+        containerKind,
+        /** 原型专有：Axure 的友好类型（形状/矩形/椭圆/星星/线段/组合）与 HTML 锚点 */
+        friendlyType: o.friendlyType ?? null,
+        scriptId: sid,
+      };
+      layers.push(layer);
+      const childOrigin = { x: x ?? origin.x, y: y ?? origin.y };
+      const childBox = { w, h };
+      walk(o.objs, path, depth + 1, childOrigin, effectiveOpacity, visible, childBox, panelState, containerKind);
+
+      /**
+       * **`objects[]`（注意不是 `objs[]`）—— 还有两种容器把子层放这里**：
+       *   · `repeater`（中继器）：`objects` 是**按数据重复渲染的模板**；
+       *   · `table`（表格）：`objects` 是**单元格/行**。
+       * 实测一份稿里有 **41 层**（table 40 + repeater 1）挂在这上面 —— 不走就**静默少 41 个控件**。
+       * （`Axure:PanelDiagram` 容器也有 `objects`，但它已经由下面的 `diagrams` 分支处理，这里跳过以免重复。）
+       */
+      if (Array.isArray(o.objects) && o.type !== 'Axure:PanelDiagram') {
+        walk(o.objects, `${path}/（${o.friendlyType ?? o.type ?? '容器'} 子项）`, depth + 1,
+          childOrigin, effectiveOpacity, visible, childBox, panelState, o.friendlyType ?? o.type ?? 'container');
+      }
+
+      /**
+       * **动态面板的状态图**：Axure 把每个状态的控件放在 `diagrams[].objects[]` 里。
+       * 实测一份稿有 **7 个面板 / 179 层**（例如一个日历有 August/July/June 三个状态，各 41 层）——
+       * 不走会**少掉近三分之一的控件**。
+       *
+       * ⚠️ 它们是**互斥的备选状态**（同一面板同一时刻只显示一个），导出里也**没有"哪个是当前状态"的字段**
+       * （实测找不到 panelIndex / default 之类）。所以路径里带上状态名、层上打 `panelState` ——
+       * **让调用方知道这是备选而不是同时显示的层**：既不丢，也不假装。
+       *
+       * ⚠️ **状态容器自己也要输出**：实测同一面板三个状态的背景色**各不相同**
+       * （`#ffffff@29%` / `#118281@29%` / `#ffffff@100%`），而面板自身**没有 fill** ——
+       * 只走它的 `objects` 会把「这一状态的背景」整块丢掉。
+       * 但容器**没有 `location`/`size`**（Axure 里状态铺满面板，几何继承自面板），
+       * 所以用**面板的盒子**当几何，并标 `geometryFromParent: true`（不假装容器自己有坐标）。
+       */
+      for (const [i, dg] of (o.diagrams ?? []).entries()) {
+        const label = (typeof dg?.label === 'string' && dg.label.trim()) || `状态${i + 1}`;
+        const dgs = dg?.style ?? {};
+        const dgColors = [];
+        const dgFill = axureFillColor(dgs.fill);
+        if (dgFill && dgFill.a > 0) dgColors.push({ ...dgFill, role: 'fill' });
+        const dgBorder = axureFillColor(dgs.borderFill);
+        if (dgBorder && dgBorder.a > 0) dgColors.push({ ...dgBorder, role: 'border' });
+        dgColors.push(...axureGradientColors(dgs));
+        const dgCr = axureNumber(dgs.cornerRadius);
+        layers.push({
+          id: dg?.id ?? null,
+          type: dg?.type ?? 'Axure:PanelDiagram',
+          name: `（状态 ${label}）`,
+          parentPath: path,
+          depth: depth + 1,
+          x, y, w, h,
+          /** ⚠️ 几何取自**所属面板**（容器自己没有 location/size）—— 标出来，别让人以为这是它的坐标 */
+          geometryFromParent: true,
+          inset,
+          visible,
+          opacity: ownOpacity === null ? 1 : ownOpacity,
+          effectiveOpacity,
+          shape: '状态容器',
+          radius: dgCr && dgCr > 0 ? { corners: [dgCr, dgCr, dgCr, dgCr], max: dgCr } : null,
+          border: undefined,
+          colors: dgColors,
+          text: null,
+          font: null,
+          hasImage: false,
+          panelState: label,
+          panelOf: o.id ?? null,
+          containerKind: 'panel-state',
+          friendlyType: '状态容器',
+          scriptId: null,
+        });
+        walk(dg?.objects, `${path}/（状态 ${label}）`, depth + 1, childOrigin, effectiveOpacity, visible, childBox,
+          { label, panelId: o.id ?? null }, 'panel-state');
+      }
+    }
+  };
+  walk(doc?.page?.diagram?.objects, '', 1, { x: 0, y: 0 }, 1, true, {
+    w: axureNumber(pageSize.width),
+    h: axureNumber(pageSize.height),
+  });
+
+  // 声明尺寸缺失时，用控件包围盒把画板尺寸补出来（并标注来源，别让人以为是稿子声明的）
+  const bbox = layers.slice(1).reduce((acc, l) => {
+    if (l.x === null || l.y === null || l.w === null || l.h === null) return acc;
+    return {
+      x0: Math.min(acc.x0, l.x), y0: Math.min(acc.y0, l.y),
+      x1: Math.max(acc.x1, l.x + l.w), y1: Math.max(acc.y1, l.y + l.h),
+    };
+  }, { x0: Infinity, y0: Infinity, x1: -Infinity, y1: -Infinity });
+  const bboxOk = Number.isFinite(bbox.x0) && bbox.x1 > bbox.x0;
+  if (!artboard.w && bboxOk) artboard.w = round2(bbox.x1 - bbox.x0);
+  if (!artboard.h && bboxOk) artboard.h = round2(bbox.y1 - bbox.y0);
+  artboard.sizeSource = (declaredW && declaredH) ? 'declared' : (bboxOk ? 'bbox' : 'unknown');
+
+  const stats = {
+    layerCount: layers.length,
+    widgetCount: layers.length - 1,
+    /** 只数控件（**不含画板层**）—— 否则会出现"控件 2 个（可见 3）"这种自相矛盾的话 */
+    visibleCount: layers.slice(1).filter((l) => l.visible !== false).length,
+    withFill: layers.filter((l) => l.colors.some((c) => c.role === 'fill')).length,
+    withText: layers.filter((l) => l.text).length,
+    withFont: layers.filter((l) => l.font?.size !== null && l.font?.size !== undefined).length,
+    maxDepth: layers.reduce((m, l) => Math.max(m, l.depth), 0),
+    /** 画板尺寸的来源：declared=稿子声明 / bbox=控件包围盒算的 / unknown=都没有 */
+    sizeSource: artboard.sizeSource,
+    pageWidth: artboard.w,
+    pageHeight: artboard.h,
+    pageTexts: texts.length,
+    scriptIdCount: scriptIds.size,
+    textIndexCount: byScriptId.size,
+    /** **有文本却没有字号**的层数：导出里就没给（见 normalizeAxurePage 里的长注释，别去猜） */
+    textLayersWithoutFontSize: layers.filter((l) => l.depth > 0 && l.text && l.font?.size == null).length,
+    /** 动态面板状态层（**互斥的备选状态**，不是同时显示的层）—— 含状态容器自己 */
+    panelStateLayers: layers.filter((l) => l.panelState).length,
+    panelCount: new Set(layers.filter((l) => l.panelOf).map((l) => l.panelOf)).size,
+    /** 挂在 `objects[]` 下的子层（中继器模板 / 表格单元格）—— 不是 `objs`，容易漏 */
+    containerObjectLayers: layers.filter((l) => l.containerKind && l.containerKind !== 'panel-state').length,
+    /** ⚠️ **结构审计**：文档里出现、但遍历器**没走**的子层键。正常为空；非空 = 真漏层，别忽略 */
+    unknownChildKeys: audit.unhandled,
+    /** 文档里实际出现的子层键（含已走的），便于核对遍历器的覆盖面 */
+    childKeys: audit.childKeys.map((e) => ({ key: e.key, count: e.count, handled: e.handled })),
+  };
+  return { layers, stats, texts };
+}
+
+/** 原型页面的文本渲染（`format: 'layers'`）。**必须自己说明"这不是设计稿"**。 */
+export function renderProductLayers(result, opts = {}) {
+  const L = [];
+  const c = result.content?.[0] ?? null;
+  L.push(`# 原型页面样式 —— ${result.doc?.name ? `${result.doc.name} / ` : ''}${c?.path ?? c?.name ?? '(未指定页)'}`);
+  L.push('> ⚠️ 这是 **Axure 原型**里的样式值，**不是设计稿** —— 颜色/字号是设计者随手填的，');
+  L.push('> 可以照着实现，但**最终视觉以 UI 设计稿为准**（有设计稿时用 lanhu_read_design / lanhu_read_blocks）。');
+  if (result.project) L.push(`> 项目：${result.project.name ?? '—'}${result.project.folderName ? `（${result.project.folderName}）` : ''}`);
+  L.push(`> 版本：${result.version?.id ?? '—'}${result.version?.isLatest === false ? `（**不是最新版**，最新 ${result.version.latestId}）` : '（最新版）'}`);
+  for (const p of result.content ?? []) {
+    L.push('');
+    L.push(`## ${p.path}（pageId ${p.pageId}）`);
+    if (!p.readable) { L.push(`（不可读：${p.reason}）`); continue; }
+    const s = p.stats ?? {};
+    L.push(`> 控件 ${s.widgetCount ?? '?'} 个（可见 ${s.visibleCount ?? '?'}）· 带底色 ${s.withFill ?? '?'} · 带字号 ${s.withFont ?? '?'} · 带文本 ${s.withText ?? '?'} · 最大层级 ${s.maxDepth ?? '?'}`);
+    L.push('> 坐标是**绝对坐标**（已把 Axure 的相对坐标逐层累加）；`不透明`= 图层 opacity 累乘祖先链。');
+    if (s.unknownChildKeys?.length) {
+      L.push(`> ❌ **还有没被遍历的子层键**：${s.unknownChildKeys.map((e) => `\`${e.key}\`（${e.count} 个，如 ${e.samplePath}）`).join('、')}`);
+      L.push('> —— 这些节点**不在下面的清单里**，清单是**不完整的**。请把这个键名报给插件作者（结构审计已拦下，但遍历器还没支持）。');
+    }
+    if (s.panelStateLayers) {
+      L.push(`> ⚠️ 其中 **${s.panelStateLayers} 层属于 ${s.panelCount} 个动态面板的状态**（表里名称带『（状态 X）』）——`
+        + '**它们是互斥的备选状态**（同一面板一次只显示一个），**不是同时显示的层**；'
+        + '导出里没有"当前是哪个状态"的字段，所以要按业务自己判断。其余层才是同时可见的。');
+    }
+    if (s.textLayersWithoutFontSize) {
+      L.push(`> ⚠️ 其中 **${s.textLayersWithoutFontSize} 个文本层没有字号**（显示为 \`?\`）——`
+        + '**导出里就没有**（Axure 把基础样式留在了原始 .rp，导出不带；外链 CSS 只有 `.ax_default{13px}` 这种通用兜底，'
+        + '拿它当设计值就是编造）。**别把 `?` 读成 0，也别自己猜一个** —— 以最终设计稿为准。');
+    }
+    const tk = p.tokens ?? {};
+    // ⚠️ `collectTokens` 返回的是**数组**（已按 count 倒序），不是 Map：
+    //    `colors:[{hex,alpha,count,rgb}]`、`fontSizes:[{size,count}]`、`fontFamilies:[{family,count}]`。
+    //    当成 Map 用会打印出一片 `[object Object]`（实测踩过）。
+    const top = (arr, fmt) => (arr ?? []).slice(0, 8).map(fmt).join(' ');
+    if (tk.colors?.length) {
+      L.push(`> 色板（前 8）：${top(tk.colors, (c) => `${c.hex}${c.alpha < 1 ? `@${Math.round(c.alpha * 100)}%` : ''}×${c.count}`)}`);
+    }
+    if (tk.fontSizes?.length) L.push(`> 字号（前 8）：${top(tk.fontSizes, (f) => `${f.size}×${f.count}`)}`);
+    if (tk.fontFamilies?.length) L.push(`> 字体族（前 8）：${top(tk.fontFamilies, (f) => `${f.family}×${f.count}`)}`);
+    // 用**块级表**而不是区域表：块级表本来就把「文字色」与「底色」分开（`isTextLayer` 时 fill 置 null），
+    // 且多段渐变打全 stop。这样原型与设计稿的清单**是同一张表** —— AI 不用学第二套。
+    // 区域表（renderRegion）的 `填充` 列对"只有文字色的层"会退化成显示文字色，别用那个。
+    const blocks = buildBlocks(p.layers ?? [], {});
+    L.push('');
+    L.push(renderBlocks(blocks, {
+      name: p.path,
+      width: p.stats?.pageWidth,
+      height: p.stats?.pageHeight,
+    }, { limit: Number(opts.limit ?? 60), includeNoise: Boolean(opts.includeNoise) }));
+  }
+  return L.join('\n');
+}
+
+/**
+ * 取一页的**原型样式图层**（`format: 'layers'` 用）。
+ *
+ * 与 `fetchProductPage` 的区别：那个只取"文本与标注"，这个取**整棵控件树的样式**。
+ * 两者都从同一对 CDN 资源来（`dataJs` + `html`），所以失败模式也一样 —— 如实报。
+ */
+export async function fetchProductPageLayers(page, opts = {}) {
+  const entry = opts.pagesIndex?.[page.url] ?? null;
+  if (!entry) return { ...page, readable: false, reason: '该页在 pages 索引里没有条目（通常是 Folder 节点）' };
+  const out = { ...page, readable: true, layers: [], stats: null, tokens: null, dataBytes: 0, htmlBytes: 0 };
+  try {
+    const { text: dataText } = await fetchTextUrl(`${AXURE_CDN}/${entry.dataJs.sign_md5}`, opts);
+    out.dataBytes = dataText.length;
+    const doc = unwrapAxureDocument(dataText);
+    let html = '';
+    if (entry.html?.sign_md5) {
+      const r = await fetchTextUrl(`${AXURE_CDN}/${entry.html.sign_md5}`, opts);
+      html = r.text;
+      out.htmlBytes = html.length;
+    }
+    const norm = normalizeAxurePage({ document: doc, html, pageUrl: page.url });
+    out.layers = norm.layers;
+    out.stats = norm.stats;
+    out.tokens = collectTokens(norm.layers.filter((l) => l.depth > 0));
+  } catch (e) {
+    out.readable = false;
+    out.reason = e.message ?? String(e);
+  }
+  return out;
+}
+
 /** A1 的文本渲染。 */
 export function renderProductDoc(result) {
   const L = [];
@@ -1849,8 +2486,15 @@ export async function readProductDoc(args = {}) {
   const selected = selectProductPages(pages, { pageId: pageIdIn, pageName: args.pageName });
   const limit = Number.isFinite(Number(args.limit)) && Number(args.limit) > 0 ? Number(args.limit) : 1;
   const chosen = selected.slice(0, limit);
+  const format = String(args.format ?? 'doc');
   const content = [];
-  for (const p of chosen) content.push(await fetchProductPage(p, { ...ao, pagesIndex: tree.pages, textLimit: args.textLimit, objectLimit: args.objectLimit }));
+  if (format === 'layers') {
+    // 原型样式的第二条路：不是"这页写了什么规则"，而是"这页长什么样"。
+    // 用途是**没有设计稿、只有原型**的项目 —— 那时 read_design 一点数据都没有。
+    for (const p of chosen) content.push(await fetchProductPageLayers(p, { ...ao, pagesIndex: tree.pages }));
+  } else {
+    for (const p of chosen) content.push(await fetchProductPage(p, { ...ao, pagesIndex: tree.pages, textLimit: args.textLimit, objectLimit: args.objectLimit }));
+  }
 
   const versionInfo = {
     id: detail.versionId,
@@ -1873,7 +2517,10 @@ export async function readProductDoc(args = {}) {
     account: acct,
     accountBy: picked.by ?? null,
   };
-  result.text = renderProductDoc({ ...result, pageTreeLimit: args.pageTreeLimit });
+  result.format = format;
+  result.text = format === 'layers'
+    ? renderProductLayers(result, { limit: args.layerLimit ?? args.limit })
+    : renderProductDoc({ ...result, pageTreeLimit: args.pageTreeLimit });
   result.textBytes = Buffer.byteLength(result.text, 'utf8');
   return result;
 }
@@ -2337,10 +2984,12 @@ export function buildBlocks(layers, opts = {}) {
     // ⚠️ 文本层的 `fills` 是**文字颜色**（Figma 里文字色就是 fill），不是底色。
     //    不排除它会把文字色当成背景色，报出"设计稿有底色、页面没有"这种假问题（实测踩过）。
     const isTextLayer = typeof l.text === 'string' && l.text !== '';
-    const fill = isTextLayer ? null : (l.colors ?? []).find((c) => c.role === 'fill' || c.role === 'gradient');
+    // `l.fillIsBackground` 只有**原型**这条链会设（Axure 的 fill 与 foreGroundFill 是分开的字段）；
+    // 设计稿那条链不设它 → 行为逐字不变。
+    const fill = (isTextLayer && !l.fillIsBackground) ? null : (l.colors ?? []).find((c) => c.role === 'fill' || c.role === 'gradient');
     // 多段渐变：把**全部** stop 留一份（按设计稿顺序）。
     // ⚠️ 以前渲染只取第一个 stop —— 表格里"有颜色"，看着不像缺信息，比 opacity 更隐蔽（交接清单缺口 4）。
-    const gradientStops = isTextLayer ? [] : (l.colors ?? []).filter((c) => c.role === 'gradient');
+    const gradientStops = (isTextLayer && !l.fillIsBackground) ? [] : (l.colors ?? []).filter((c) => c.role === 'gradient');
     const textColor = (l.colors ?? []).find((c) => c.role === 'text') ?? (isTextLayer ? (l.colors ?? []).find((c) => c.role === 'fill') : null);
     const h = l.h ?? 0;
     const thin = Math.min(l.w ?? 0, h);
@@ -4647,13 +5296,18 @@ export async function main(argv = process.argv.slice(2)) {
           pageId: args['page-id'] ?? args.page, pageName: args['page-name'],
           version: args.version,
           limit: args.limit === undefined ? 1 : Number(args.limit),
+          format: args.format,
+          layerLimit: args['layer-limit'] === undefined ? undefined : Number(args['layer-limit']),
+          includeNoise: Boolean(args.all),
           cookie,
         });
         if (args.json) printJson({ ...r, text: undefined });
         else {
           console.log(r.text);
           console.log('');
-          console.log(`— 产品文档（原型） | ${r.pageCount} 个页面节点（${r.wireframeCount} 可读） | 读正文 ${r.selectedCount} 页 | 输出 ${kb(r.text)}`);
+          console.log(r.format === 'layers'
+            ? `— 原型样式（layers） | ${r.doc?.name ?? ''} | 读 ${r.selectedCount} 页 | 输出 ${kb(r.text)}`
+            : `— 产品文档（原型） | ${r.pageCount} 个页面节点（${r.wireframeCount} 可读） | 读正文 ${r.selectedCount} 页 | 输出 ${kb(r.text)}`);
         }
         return r;
       }
@@ -4822,6 +5476,8 @@ export async function main(argv = process.argv.slice(2)) {
   product-docs --url "<原型链接>" | --project <pid> --team <tid>
            列**产品文档（Axure 原型 / PRD）**——不是设计稿。含 docId / 最新版本 / 版本数 / 更新时间
   product-doc  --url "<原型链接>" [--page-id <id>] [--page-name <名>] [--limit N] [--version <id>]
+               [--format layers] [--layer-limit N] [--all]   # layers = 该页的样式图层/块级清单
+                                                            #   —— 项目只有原型、没有设计稿时靠它照着实现
            读原型的页面树 + 命中页正文（**先不带 --page-id 看树**，一份原型常有上百个节点）
            --page-id 跨版本稳定，推荐；正文取自页面 HTML（data.js 里常为空）
   read/blocks/product-doc/slices 均可加 --version <版本id>（默认 latest；给错会报错，不静默回退）

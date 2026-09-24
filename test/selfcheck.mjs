@@ -75,6 +75,16 @@ const {
   decodeHtmlEntities,
   extractHtmlText,
   parseAxureJs,
+  unwrapAxureDocument,
+  axureScriptIds,
+  decodeAxureText,
+  normalizeAxurePage,
+  renderProductLayers,
+  auditAxureChildKeys,
+  AXURE_CHILD_KEYS,
+  argbParts,
+  argbColor,
+  axureFontFamily,
   extractAxureObjects,
   ddsSchema,
 } = await import('../lanhu.mjs');
@@ -1190,6 +1200,302 @@ group('⑨ 产品文档（A1/A2）与算法（B1~B4）');
     String(resolveTarget({ url: plain }).versionId));
   ok('显式给 projectId+imageId 时不编 versionId', resolveTarget({ projectId: 'p', imageId: 'i' }).versionId === undefined
     || resolveTarget({ projectId: 'p', imageId: 'i' }).versionId === null);
+}
+
+/* ═══════════ 原型（Axure）页面样式：剥壳 / 文本回挂 / 归一化（0.3.0） ═══════════ */
+{
+  // ── ① 剥壳：两层包装 + 括号配对
+  ok('剥壳：两层包装（loadCurrentPage(lanhu_Axure_Mapping_Data(…))）能剥出 JSON',
+    unwrapAxureDocument('$axure.loadCurrentPage(lanhu_Axure_Mapping_Data({"a":1}))').a === 1);
+  ok('剥壳：JSON 字符串里的 ) { } 不影响配对',
+    (() => { const d = unwrapAxureDocument('$ax(lanhu_Axure_Mapping_Data({"note":"a)b{c}d","n":2}))'); return d.n === 2 && d.note === 'a)b{c}d'; })());
+  ok('剥壳：转义引号不会误判字符串结束',
+    unwrapAxureDocument('$ax(lanhu_Axure_Mapping_Data({"s":"he said \\"}\\" ok","k":3}))').k === 3);
+  // ⚠️ 这条是**真会让旧实现切错**的输入：包装里 JSON 之后还有一个 `}`
+  //    （旧 parseAxureJs 用 lastIndexOf('}')，会切到尾巴那个 → 报 Unexpected non-whitespace）
+  const tailBrace = '$axure.loadCurrentPage(lanhu_Axure_Mapping_Data({"a":1}), {"tail":true})';
+  // 包 try/catch：实现坏掉时应该是**一条红**，而不是把整个自检崩掉（崩溃会连带掩盖后面的断言）
+  ok('剥壳：JSON 之后还有 } 时仍切得准（旧实现的切法在这条上会失败）',
+    (() => { try { return unwrapAxureDocument(tailBrace).a === 1; } catch { return false; } })());
+  ok('剥壳：空输入明确报错（不是静默给空对象）',
+    (() => { try { unwrapAxureDocument(''); return false; } catch { return true; } })());
+  // 注意：`{...}` 本身完整、只是外层少了个 `)` 时**应该照常解析出来**（JSON 是好的）。
+  // 只有 **JSON 自己缺右括号** 才算不配对 —— 那才是"文件被截断"。
+  ok('剥壳：外层少 ) 但 JSON 完整 → 照常解析（不误报）',
+    unwrapAxureDocument('$ax(lanhu_Axure_Mapping_Data({"a":1}').a === 1);
+  ok('剥壳：**JSON 自己缺右括号** → 明确报错（文件被截断的情形）',
+    (() => { try { unwrapAxureDocument('$ax(lanhu_Axure_Mapping_Data({"a":1)'); return false; } catch { return true; } })());
+
+  // ── ② 32 位色值：**高字节就是 alpha**（旧实现 `a===0?1:…` 把透明当不透明）
+  ok('argb：0x7f58a2cc → #58a2cc，alpha=127/255',
+    (() => { const c = argbColor(0x7f58a2cc); return c.hex === '#58a2cc' && Math.abs(c.alpha - 127 / 255) < 1e-9; })());
+  ok('argb：**0x00ffffff 是透明（alpha 0）**，不是"无 alpha 信息"',
+    argbColor(0x00ffffff).alpha === 0, String(argbColor(0x00ffffff).alpha));
+  ok('argb：0xff000000 → 黑色不透明', (() => { const c = argbColor(0xff000000); return c.hex === '#000000' && c.alpha === 1; })());
+  ok('argb：非数字 → null（不编造）', argbColor('x') === null && argbColor(undefined) === null);
+  ok('argb ：argbParts 与 argbColor 同源（不重复实现）',
+    (() => { const p = argbParts(0x4c58a2cc); const c = argbColor(0x4c58a2cc); return p.r === 0x58 && p.g === 0xa2 && p.b === 0xcc && c.alpha === p.a; })());
+
+  // ── ③ 文本回挂：只认 `uNNN_text` / `uNNN_input`，并解 HTML 实体
+  {
+    const html = '<div id="u12"><div id="u12_text">&#x4F60;&#x597D; &#x4E16;&#x754C;</div></div>'
+      + '<div id="u13"><textarea id="u13_input">&#x7EFF;&#x8272;</textarea></div>'
+      + '<div id="u14" class="x">不该被当文本</div>';
+    const { byScriptId, texts } = decodeAxureText(html);
+    ok('文本回挂：`uNNN_text` 解实体后挂到该控件', byScriptId.get('u12') === '你好 世界', String(byScriptId.get('u12')));
+    ok('文本回挂：`uNNN_input`（文本域）也认', byScriptId.get('u13') === '绿色', String(byScriptId.get('u13')));
+    ok('文本回挂：**没有 _text/_input 后缀的元素不进索引**（防把容器当正文）', !byScriptId.has('u14'));
+    ok('文本回挂：页级文本清单也在', texts.length >= 2, String(texts.length));
+  }
+
+  ok('字体族：JSON 回退栈取主族', axureFontFamily('"PingFang SC", sans-serif') === 'PingFang SC');
+  ok('字体族：没有引号也认', axureFontFamily('微软雅黑') === '微软雅黑');
+  ok('字体族：空 → null（不编造）', axureFontFamily('') === null && axureFontFamily(null) === null);
+
+  // ── ④ 归一化：合成小夹具（**不把 861KB 真实数据提交进仓库**）
+  const synth = {
+    page: {
+      name: '合成页', packageId: 'pkg1',
+      style: { size: { width: 0, height: 0 } }, // ⚠️ 故意为 0：走包围盒兜底
+      diagram: {
+        objects: [{
+          id: 'w1', label: '', friendlyType: '组合', type: 'layer', visible: true,
+          style: { location: { x: 100, y: 50 }, size: { width: 400, height: 300 }, opacity: '0.5' },
+          objs: [{
+            id: 'w2', label: '', friendlyType: '矩形', type: 'vectorShape', visible: true,
+            style: {
+              location: { x: 10, y: 5 }, size: { width: 100, height: 40 }, opacity: '0.5',
+              fill: { fillType: 'solid', color: 0x7f58a2cc },
+              foreGroundFill: { fillType: 'solid', color: 0xff333333 },
+              borderFill: { fillType: 'solid', color: 0xff000000 }, borderWidth: '2', cornerRadius: '8',
+              fontName: '"PingFang SC", sans-serif', fontSize: '14px', fontWeight: '700', lineSpacing: '20px',
+            },
+            images: { 'normal~': 'images/synth/u2.png' },
+          }, {
+            id: 'w3', label: '', friendlyType: '形状', type: 'vectorShape', visible: true,
+            style: { fill: { fillType: 'linearGradient', stops: [{ color: 0xff58a2cc, offset: 0, opacity: 1 }, { color: 0x80ff0000, offset: 1, opacity: 0.5 }] } },
+          }, {
+            id: 'w4', label: '', friendlyType: '矩形', type: 'vectorShape', visible: true,
+            style: { foreGroundFill: { fillType: 'solid', color: 0xff000000 } }, // ⚠️ 故意没有 location
+          }],
+        }],
+      },
+    },
+    objectPaths: { w2: { scriptId: 'u2' }, w3: { scriptId: 'u3' } },
+  };
+  const synthHtml = '<div id="u2"><div id="u2_text">合成文本</div></div>';
+  const norm = normalizeAxurePage({ document: synth, html: synthHtml });
+  const byId = Object.fromEntries(norm.layers.map((l) => [l.id, l]));
+  const art = norm.layers[0];
+  const w2 = byId.w2; const w3 = byId.w3; const w4 = byId.w4;
+
+  ok('归一化：层数 = 画板 + 4 个控件', norm.layers.length === 5, String(norm.layers.length));
+  ok('归一化：**绝对坐标逐层累加**（父 100,50 + 子 10,5 = 110,55）', w2?.x === 110 && w2?.y === 55, `${w2?.x},${w2?.y}`);
+  ok('归一化：**opacity 顺链累乘**（0.5×0.5=0.25）', w2?.effectiveOpacity === 0.25, String(w2?.effectiveOpacity));
+  ok('归一化：inset 用**相对坐标**（Axure 的 location 本来就是相对父）',
+    w2?.inset?.left === 10 && w2?.inset?.top === 5 && w2?.inset?.right === 290 && w2?.inset?.bottom === 255,
+    JSON.stringify(w2?.inset));
+  ok('归一化：画板尺寸声明为 0 时**用包围盒兜底**（400×300）',
+    art.w === 400 && art.h === 300 && art.sizeSource === 'bbox', `${art.w}×${art.h} ${art.sizeSource}`);
+  ok('归一化：文本从 HTML 回挂到控件', w2?.text === '合成文本', String(w2?.text));
+  ok('归一化：**fill 与文字色分成两个 role**（Axure 是两个独立字段）',
+    w2?.colors?.some((c) => c.role === 'fill') === true && w2?.colors.some((c) => c.role === 'text'),
+    JSON.stringify((w2?.colors ?? []).map((c) => c.role)));
+  ok('归一化：`fillIsBackground=true`（告诉下游"这个底色是真的，别按 Figma 规则抹掉"）', w2?.fillIsBackground === true);
+  ok('归一化：渐变 stop 全部保留且带 role=gradient',
+    w3?.colors.filter((c) => c.role === 'gradient').length === 2, String(w3?.colors.filter((c) => c.role === 'gradient').length));
+  ok('归一化：圆角 / 描边 / 图片 / 字体都落到设计稿同名字段',
+    w2?.radius?.max === 8 && w2?.border?.width === 2 && w2?.border.color === '#000000'
+    && w2?.hasImage === true && w2?.font?.family === 'PingFang SC' && w2?.font.size === 14 && w2?.font.weight === 700 && w2?.font.lineHeight === 20,
+    JSON.stringify({ r: w2?.radius?.max, b: w2?.border?.width, img: w2?.hasImage, f: w2?.font }));
+  ok('归一化：**没有 location 就留 null，不编造 0**（w4）', w4?.x === null && w4?.y === null, `${w4?.x},${w4?.y}`);
+
+  // 可见性顺链继承（父隐藏 → 子不该出现在清单里）
+  const hidden = JSON.parse(JSON.stringify(synth));
+  hidden.page.diagram.objects[0].visible = false;
+  const normH = normalizeAxurePage({ document: hidden, html: synthHtml });
+  ok('归一化：**父层隐藏时子层也标为不可见**（顺链继承）',
+    normH.layers.find((l) => l.id === 'w2')?.visible === false);
+
+  // ── ⑤ 与块级模型的接合点：`fillIsBackground` 决定"有文字的层要不要留底色"
+  const mkLayer = (extra) => ({
+    id: 'x', type: 'vectorShape', name: 'x', parentPath: '', depth: 1, x: 0, y: 0, w: 100, h: 40,
+    inset: null, visible: true, opacity: 1, effectiveOpacity: 1, shape: '矩形', radius: null, border: undefined,
+    colors: [{ r: 250, g: 205, b: 145, a: 0.06, role: 'fill' }, { r: 0, g: 0, b: 0, a: 1, role: 'text' }],
+    text: '有文字的层', font: { family: 'Arial', size: 14, weight: 400, align: null, lineHeight: null, letterSpacing: null },
+    hasImage: false, ...extra,
+  });
+  const bProto = buildBlocks([mkLayer({ fillIsBackground: true })], {})[0];
+  const bDesign = buildBlocks([mkLayer({})], {})[0];
+  ok('块级：原型层（fillIsBackground）**保住真底色** —— 否则 Axure 文本控件的背景会整块丢',
+    bProto?.bg?.hex === '#facd91', JSON.stringify(bProto?.bg));
+  ok('块级：设计稿层行为**完全不变**（文字层的 fill 仍视为文字色、不染底色）',
+    Boolean(bDesign) && !bDesign?.bg, JSON.stringify(bDesign?.bg));
+  ok('块级：两侧都拿得到文字色', bProto?.color === '#000000' && bDesign?.color === '#000000',
+    `${bProto?.color} / ${bDesign?.color}`);
+
+  // ── ⑥ 动态面板的**状态图**（`diagrams[].objects[]`）——不走进来会少掉三分之一的控件
+  const panelDoc = {
+    page: {
+      name: '面板页', packageId: 'pkg2', style: { size: { width: 500, height: 400 } },
+      diagram: {
+        objects: [{
+          id: 'pnl', label: '日历', friendlyType: '动态面板', type: 'layer', visible: true,
+          style: { location: { x: 20, y: 30 }, size: { width: 300, height: 200 } },
+          objs: [{ id: 'base', label: '底', friendlyType: '矩形', type: 'vectorShape', visible: true, style: { location: { x: 1, y: 1 }, size: { width: 10, height: 10 } } }],
+          diagrams: [
+            { id: 'dA', label: 'August', type: 'Axure:PanelDiagram', style: { fill: { fillType: 'solid', color: 0x4affffff } }, objects: [{ id: 'ga', label: '八月格', friendlyType: '矩形', type: 'vectorShape', visible: true, style: { location: { x: 5, y: 6 }, size: { width: 20, height: 20 } } }] },
+            { id: 'dB', label: 'July', type: 'Axure:PanelDiagram', style: { fill: { fillType: 'solid', color: 0x4a118281 } }, objects: [{ id: 'gb', label: '七月格', friendlyType: '矩形', type: 'vectorShape', visible: true, style: { location: { x: 5, y: 6 }, size: { width: 20, height: 20 } } }] },
+            { id: 'dC', objects: [{ id: 'gc', label: '(无名状态)', friendlyType: '矩形', type: 'vectorShape', visible: true, style: { location: { x: 0, y: 0 }, size: { width: 1, height: 1 } } }] },
+          ],
+        }],
+      },
+    },
+    objectPaths: { ga: { scriptId: 'u1' }, gb: { scriptId: 'u2' }, gc: { scriptId: 'u3' } },
+  };
+  const pn = normalizeAxurePage({ document: panelDoc, html: '' });
+  const pg = Object.fromEntries(pn.layers.map((l) => [l.id, l]));
+  ok('面板状态：**没有状态的字段不会被丢掉**（`diagrams[].objects[]` 也是控件）', Boolean(pg.ga && pg.gb && pg.gc));
+  ok('面板状态：状态层带 `panelState`（标注"这是备选状态"）', pg.ga?.panelState === 'August' && pg.gb?.panelState === 'July');
+  ok('面板状态：状态层带 `panelOf`（可把同一面板的状态归组）', pg.ga?.panelOf === 'pnl' && pg.gb?.panelOf === 'pnl');
+  ok('面板状态：路径里写明状态（列表里一眼能看出是备选）', pg.ga?.parentPath?.includes('（状态 August）') === true, String(pg.ga?.parentPath));
+  ok('面板状态：状态内控件坐标**仍逐层累加**（20+5, 30+6）', pg.ga?.x === 25 && pg.ga?.y === 36, `${pg.ga?.x},${pg.ga?.y}`);
+  ok('面板状态：状态无名时给「状态N」而不是留空', pg.gc?.panelState === '状态3', String(pg.gc?.panelState));
+  ok('面板状态：**不在面板里的层 `panelState` 为 null**（不误标）', pg.base?.panelState === null && pg.base?.panelOf === null);
+  // 6 = 3 个状态容器 + 3 个状态内子层（容器自己也算一层，见下面的断言）
+  ok('面板状态：stats 报出状态层数与面板数（含状态容器自己，调用方不用自己数）',
+    pn.stats.panelStateLayers === 6 && pn.stats.panelCount === 1,
+    JSON.stringify({ l: pn.stats.panelStateLayers, p: pn.stats.panelCount }));
+  ok('面板状态：**同一面板的多个状态是互斥的**，所以路径互不相同（不会互相覆盖）',
+    pg.ga?.parentPath !== undefined && pg.ga?.parentPath !== pg.gb?.parentPath);
+
+  // ⚠️ 状态**容器自己也是一层**：它带着"这一状态的背景色"，而面板自身没有 fill —— 丢了就丢了状态背景
+  ok('面板状态：**状态容器自己也输出成层**（不是只走它的 children）', pg.dA?.containerKind === 'panel-state', String(pg.dA?.containerKind));
+  ok('面板状态：容器没有 location/size → 几何**取自所属面板**，并明确标记 `geometryFromParent`',
+    pg.dA?.geometryFromParent === true && pg.dA?.x === 20 && pg.dA?.y === 30,
+    `${pg.dA?.x},${pg.dA?.y} fromParent=${pg.dA?.geometryFromParent}`);
+  ok('面板状态：**各状态的背景色各自保留**（实测同一面板三个状态的底色不同）',
+    pg.dA?.colors?.[0]?.b === 255 && pg.dB?.colors?.[0]?.g === 0x82,
+    JSON.stringify([pg.dA?.colors?.[0], pg.dB?.colors?.[0]]));
+
+  // ── `objects[]`（**不是 `objs[]`**）：中继器模板 / 表格单元格 —— 整类容易漏，实测一份稿漏了 41 层
+  const objDoc = {
+    page: {
+      name: 'P', packageId: 'p3', style: { size: { width: 10, height: 10 } },
+      diagram: {
+        objects: [
+          { id: 'rep', label: '中继器', friendlyType: '中继器', type: 'repeater', visible: true,
+            style: { location: { x: 1, y: 2 }, size: { width: 100, height: 50 } },
+            objects: [{ id: 'ritem', label: '模板项', friendlyType: '矩形', type: 'vectorShape', visible: true, style: { location: { x: 3, y: 4 }, size: { width: 5, height: 5 } } }] },
+          { id: 'tbl', label: '表格', friendlyType: '表格', type: 'table', visible: true,
+            style: { location: { x: 0, y: 0 }, size: { width: 200, height: 80 } },
+            objects: [{ id: 'cell', label: '单元格', friendlyType: '矩形', type: 'vectorShape', visible: true, style: { location: { x: 6, y: 7 }, size: { width: 8, height: 8 } } }] },
+        ],
+      },
+    },
+    objectPaths: {},
+  };
+  const pn2audit = (docObj) => auditAxureChildKeys(docObj).panelDiagram;
+  const od = normalizeAxurePage({ document: objDoc, html: '' });
+  const og = Object.fromEntries(od.layers.map((l) => [l.id, l]));
+  ok('objects[]：**中继器**的子层不再被静默漏掉', Boolean(og.ritem));
+  ok('objects[]：**表格**的子层不再被静默漏掉', Boolean(og.cell));
+  ok('objects[]：子层带 `containerKind` 标明来自哪种容器',
+    og.ritem?.containerKind === '中继器' && og.cell?.containerKind === '表格',
+    `${og.ritem?.containerKind} / ${og.cell?.containerKind}`);
+  ok('objects[]：路径里写明容器（列表里看得出是模板还是单元格）',
+    og.ritem?.parentPath?.includes('中继器') === true, String(og.ritem?.parentPath));
+  ok('objects[]：坐标仍逐层累加（1+3, 2+4）', og.ritem?.x === 4 && og.ritem?.y === 6, `${og.ritem?.x},${og.ritem?.y}`);
+  ok('objects[]：stats 报出这类层数（41 那种量级不该靠人肉发现）',
+    od.stats.containerObjectLayers === 2, String(od.stats.containerObjectLayers));
+
+  // ── 计数口径（对账时最有用的那条）：层数 = 画板 + 所有遍历到的控件
+  //    （`objs` + `objects` + `diagrams` 三种子层容器，**且状态容器自己也算一层**）
+  ok('计数口径：合成夹具的层数 = 画板1 + 面板1 + 面板直属子层1 + 状态容器3 + 状态子层3 = 9',
+    pn.layers.length === 9, `实际 ${pn.layers.length}`);
+
+  // ── 结构审计：把"子层挂在哪个键上"从**靠人看**变成**机器拦下**
+  //    （起因：真漏过 41 层 `objects[]` + 11 个状态容器，都属同一个病）
+  const audOk = auditAxureChildKeys(objDoc);
+  ok('结构审计：正常夹具**不误报**（objs / objects / diagrams 都走了）',
+    audOk.unhandled.length === 0, JSON.stringify(audOk.unhandled));
+  ok('结构审计：能认出实际用到的子层键并标 handled',
+    audOk.childKeys.some((e) => e.key === 'objects' && e.handled) && audOk.childKeys.every((e) => e.handled),
+    JSON.stringify(audOk.childKeys));
+
+  // `stops` / `cases` / `arguments` / `linePatternArray` 这类**非子层**数组不能误判
+  const noiseDoc = {
+    page: { name: 'S', packageId: 'p5', style: { size: { width: 1, height: 1 } }, diagram: { objects: [
+      { id: 'a', label: 'a', type: 'vectorShape', visible: true,
+        style: { location: { x: 0, y: 0 }, size: { width: 1, height: 1 },
+          stops: [{ color: 1, offset: 0 }], cases: [{ condition: 'x' }], arguments: [{ name: 'v' }], linePatternArray: [0] } },
+    ] } }, objectPaths: {},
+  };
+  ok('结构审计：**非子层数组不误判**（元素没有 id+type/style/friendlyType）',
+    auditAxureChildKeys(noiseDoc).unhandled.length === 0, JSON.stringify(auditAxureChildKeys(noiseDoc).unhandled));
+
+  // 第四种子层键（Axure 哪天把子层放到 `items`）→ 必须被认出来
+  const weirdDoc = {
+    page: { name: 'W', packageId: 'p4', style: { size: { width: 9, height: 9 } }, diagram: { objects: [
+      { id: 'w', label: 'x', friendlyType: '矩形', type: 'vectorShape', visible: true,
+        style: { location: { x: 1, y: 1 }, size: { width: 2, height: 2 } },
+        items: [{ id: 'w1', label: '子', friendlyType: '矩形', type: 'vectorShape', style: { location: { x: 0, y: 0 }, size: { width: 1, height: 1 } } }] },
+    ] } }, objectPaths: {},
+  };
+  const aw = auditAxureChildKeys(weirdDoc);
+  ok('结构审计：**能认出没走过的第四种子层键**（key=items）—— 这就是防下次静默漏的守门人',
+    aw.unhandled.length === 1 && aw.unhandled[0].key === 'items' && aw.unhandled[0].count === 1,
+    JSON.stringify(aw.unhandled));
+  ok('结构审计：第四种键会进 `stats.unknownChildKeys`（真机上还会打警告，不静默）',
+    normalizeAxurePage({ document: weirdDoc, html: '' }).stats.unknownChildKeys.length === 1);
+
+  // 守住 `type !== 'Axure:PanelDiagram'` 那个排除条件（别让它变成没人监督的魔法常量）
+  ok('结构审计：文档里的 `Axure:PanelDiagram` 数量 == 经 `diagrams` 走到的数量（排除条件受监督）',
+    pn2audit(panelDoc).inDoc === pn2audit(panelDoc).viaDiagrams, JSON.stringify(pn2audit(panelDoc)));
+
+  // ⭐ 交叉校验：用**通用参考遍历**（按"元素像不像控件"走，**不看键名**）数一遍，
+  //    与遍历器的输出对齐 —— 于是"删掉任一子层键"必然让两者不等 → 报红。
+  const WIDGETISH = (x) => Boolean(x && typeof x === 'object' && x.id && (x.type || x.style || x.friendlyType));
+  const genericCount = (arr) => {
+    let n = 0;
+    for (const node of arr ?? []) {
+      n += 1;
+      for (const val of Object.values(node ?? {})) {
+        if (Array.isArray(val) && val.some(WIDGETISH)) n += genericCount(val);
+      }
+    }
+    return n;
+  };
+  ok('结构审计：**通用参考遍历**（不看键名）与遍历器输出层数一致 —— 少走任一键都会不等',
+    genericCount(objDoc.page.diagram.objects) === od.layers.length - 1,
+    `参考 ${genericCount(objDoc.page.diagram.objects)} vs 遍历器 ${od.layers.length - 1}`);
+  ok('结构审计：面板夹具上同样一致（含状态容器）',
+    genericCount(panelDoc.page.diagram.objects) === pn.layers.length - 1,
+    `参考 ${genericCount(panelDoc.page.diagram.objects)} vs 遍历器 ${pn.layers.length - 1}`);
+  // 光进 stats 不算"报出来了" —— 输出里必须真的有 ❌ 警告，否则 AI 看不到
+  {
+    const fakeResult = {
+      doc: { name: 'X' }, project: null, version: { id: 'v', isLatest: true, count: 1 },
+      content: [{
+        path: 'p', pageId: 'pg', readable: true, layers: [], tokens: null,
+        stats: { widgetCount: 1, unknownChildKeys: [{ key: 'items', count: 3, samplePath: 'doc.page.diagram.objects[0].items' }] },
+      }],
+    };
+    const t = renderProductLayers(fakeResult, {});
+    ok('结构审计：**输出里真的会打 ❌ 警告**（不只是 stats 里一个字段）',
+      /还有没被遍历的子层键/.test(t) && /items/.test(t), t.split('\n').slice(0, 7).join(' | ').slice(0, 130));
+  }
+
+  ok('结构审计：`AXURE_CHILD_KEYS` 就是遍历器声明会走的那三个键',
+    JSON.stringify([...AXURE_CHILD_KEYS]) === JSON.stringify(['objs', 'objects', 'diagrams']), JSON.stringify(AXURE_CHILD_KEYS));
+
+  // ── `axureScriptIds` 的契约：传错形状必须**抛错**，不许静默给空 Map（实测被误用过）
+  ok('axureScriptIds：正确入参（整个 doc）能取到映射',
+    axureScriptIds({ objectPaths: { a: { scriptId: 'u1' }, b: { scriptId: 'u2' } } }).size === 2);
+  for (const [label, bad] of [['doc.page', { page: {} }], ['null', null], ['原文 JSON 字符串', '{"objectPaths":{}}'], ['空对象', {}]]) {
+    ok(`axureScriptIds：传 ${label} → **抛错**（曾静默返回空 Map）`,
+      (() => { try { axureScriptIds(bad); return false; } catch { return true; } })());
+  }
 }
 
 /* ═══════════════ 汇总 ═══════════════ */
