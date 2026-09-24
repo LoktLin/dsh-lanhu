@@ -49,6 +49,8 @@
       → 发布 → **还原 `.npmrc` 并去 npmjs.com 撤销令牌**。长期凭据不值得留在磁盘上。
    > 打包范围由 `package.json` 的 `files` 决定（当前含 `lib` / `lanhu.mjs` / `cordis.patch.yml` /
    > `docs` / `CHANGELOG.md` / `README.md` / `LICENSE`，实测 14 文件 ≈ 187 kB）。
+   > ⚠️ **改了 README 想让它出现在 npm 页面上，必须再发一版** —— npm 的「主文档」是**跟着版本定格的**，
+   > 不是跟着仓库走。0.4.3 就踩过：发完才补的安装说明，npm 页面看不到，只能发 0.4.4。
    > ⚠️ **README 里的文档链接必须是 GitHub 绝对地址** —— 相对路径在 npm 页面上会 404
    > （那些文件在包里，但 npm 不提供文件浏览）；`readme-test` 的链接绊线会同时验两种形态。
 
