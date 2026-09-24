@@ -1,5 +1,9 @@
 # dsh-lanhu
 
+[![npm version](https://img.shields.io/npm/v/dsh-lanhu.svg)](https://www.npmjs.com/package/dsh-lanhu)
+[![license](https://img.shields.io/npm/l/dsh-lanhu.svg)](https://github.com/LoktLin/dsh-lanhu/blob/main/LICENSE)
+[![node](https://img.shields.io/node/v/dsh-lanhu.svg)](https://www.npmjs.com/package/dsh-lanhu)
+
 [中文](#30-秒上手不用读完全文) | [English](#english-overview)
 
 > ## 目标是让 AI 更好用
@@ -15,10 +19,6 @@
 
 > **没有它**：AI 写页面前只能看设计稿**截图**，色值和字号靠视觉估算（OCR 小字经常错）。
 > **有了它**：设计稿的真实数值直接进上下文 —— 等于把「设计标注」喂给模型；还能反过来拿它**自动验收**页面还原度。
-
-[![npm version](https://img.shields.io/npm/v/dsh-lanhu.svg)](https://www.npmjs.com/package/dsh-lanhu)
-[![license](https://img.shields.io/npm/l/dsh-lanhu.svg)](https://github.com/LoktLin/dsh-lanhu/blob/main/LICENSE)
-[![node](https://img.shields.io/node/v/dsh-lanhu.svg)](https://www.npmjs.com/package/dsh-lanhu)
 
 **版本 `0.4.4`**（见 [CHANGELOG](https://github.com/LoktLin/dsh-lanhu/blob/main/CHANGELOG.md)） · MIT · 已发布到 npm：[`dsh-lanhu`](https://www.npmjs.com/package/dsh-lanhu)
 适用于 [DeepSeek Harness](https://github.com/deepseek-ai)（DSH）Web GUI，需要 **Node ≥ 20**。自带 15 个原生工具 + 侧边面板 + CLI。
