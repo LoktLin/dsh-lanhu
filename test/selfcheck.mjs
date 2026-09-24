@@ -114,9 +114,9 @@ function eq(name, actual, expected) {
 /* ═══════════════ ① 链接解析 ═══════════════ */
 group('① 链接解析');
 
-const TID = '33333333-3333-4333-8333-333333333333';
-const PID = '11111111-1111-4111-8111-111111111111';
-const IID = '22222222-2222-4222-8222-222222222222';
+const TID = '00000001-0000-4000-8000-000000000001';
+const PID = '00000002-0000-4000-8000-000000000002';
+const IID = '00000003-0000-4000-8000-000000000003';
 
 const hashUrl = `https://lanhuapp.com/web/#/item/project/detailDetach?tid=${TID}&pid=${PID}&project_id=${PID}&image_id=${IID}&fromEditor=true&type=image`;
 {
@@ -431,7 +431,7 @@ group('⑥.5 CLI 入口守卫');
     const unknownExit = exitOf(['definitely-not-a-command']);
     ok('未知命令非零退出（不再把帮助文本当成功）', unknownExit === 1, `exit=${unknownExit}`);
     ok('无参数只打帮助、退出码仍为 0', exitOf([]) === 0);
-    ok('校验失败的命令以非零退出（只给 project 没给 image）', exitOf(['read', '--project', '11111111-1111-4111-8111-111111111111']) !== 0);
+    ok('校验失败的命令以非零退出（只给 project 没给 image）', exitOf(['read', '--project', '00000002-0000-4000-8000-000000000002']) !== 0);
   } catch (e) {
     ok('经符号链接调用能执行（不是零输出 exit 0）', false, String(e.message).slice(0, 80));
   } finally {
@@ -836,22 +836,22 @@ ok('自检跑在临时数据目录（不碰真实账号）', lanhuHome() === TMP
 {
   // 归属判定：手工塞索引，验证三级命中的前两级（零请求路径）
   const doc = loadAccounts();
-  const TID = '33333333-3333-4333-8333-333333333333';
-  const PID = '11111111-1111-4111-8111-111111111111';
+  const TID = '00000001-0000-4000-8000-000000000001';
+  const PID = '00000002-0000-4000-8000-000000000002';
   Object.assign(doc.accounts.find((a) => a.alias === 'acme'), {
     teams: [{ teamId: TID, name: 'Acme', memberNum: 2 }],
     projects: [{ projectId: PID, name: '小程序', teamId: TID }],
   });
   fs.writeFileSync(accountsPath(), JSON.stringify(doc, null, 2));
 
-  const byTid = await whoIsIt({ url: `https://lanhuapp.com/web/#/item/project/detailDetach?tid=${TID}&pid=${PID}&image_id=22222222-2222-4222-8222-222222222222&type=image` });
+  const byTid = await whoIsIt({ url: `https://lanhuapp.com/web/#/item/project/detailDetach?tid=${TID}&pid=${PID}&image_id=00000003-0000-4000-8000-000000000003&type=image` });
   ok('① 按链接 tid 命中（零请求）', byTid.found === true && byTid.matchedBy === 'tid' && byTid.alias === 'acme');
-  const byPid = await whoIsIt({ projectId: PID, imageId: '22222222-2222-4222-8222-222222222222' });
+  const byPid = await whoIsIt({ projectId: PID, imageId: '00000003-0000-4000-8000-000000000003' });
   ok('② 按 projectId 命中（零请求）', byPid.found === true && byPid.matchedBy === 'pid');
   // 不给 imageId → 不会触发联网探测，纯离线验证「未命中」这条路径
   const none = await whoIsIt({
-    teamId: 'ffffffff-9999-9999-9999-999999999999',
-    projectId: 'ffffffff-9999-9999-9999-999999999999',
+    teamId: '00000004-0000-4000-8000-000000000004',
+    projectId: '00000004-0000-4000-8000-000000000004',
   });
   ok('③ tid/pid 都不在索引里 → 未命中', none.found === false);
   ok('③ 未命中时列出已知账号并给引导', Array.isArray(none.knownAccounts) && typeof none.hint === 'string' && none.hint.length > 0);
@@ -872,7 +872,7 @@ ok('自检跑在临时数据目录（不碰真实账号）', lanhuHome() === TMP
   //    所以"能读到"只能证明稿子存在，不能证明归属。回填会污染索引、给出错误结论。
   const before = fs.readFileSync(accountsPath(), 'utf8');
   // 不给 imageId → 不会触发任何网络探测，纯离线
-  const miss = await whoIsIt({ teamId: 'ffffffff-0000-0000-0000-000000000000', projectId: 'ffffffff-0000-0000-0000-000000000000' });
+  const miss = await whoIsIt({ teamId: '00000005-0000-4000-8000-000000000005', projectId: '00000005-0000-4000-8000-000000000005' });
   const after = fs.readFileSync(accountsPath(), 'utf8');
   ok('归属判定不写档案（不做任何回填）', before === after);
   ok('未命中时 found=false 且不返回猜测账号', miss.found === false && miss.alias === undefined);
@@ -881,15 +881,15 @@ ok('自检跑在临时数据目录（不碰真实账号）', lanhuHome() === TMP
 }
 {
   // 自动挑账号：别的 AI 只拿到一条链接，不该要求它知道这属于哪个账号
-  const TID = '33333333-3333-4333-8333-333333333333';
-  const url = `https://lanhuapp.com/web/#/item/project/detailDetach?tid=${TID}&pid=11111111-1111-4111-8111-111111111111&image_id=22222222-2222-4222-8222-222222222222&type=image`;
+  const TID = '00000001-0000-4000-8000-000000000001';
+  const url = `https://lanhuapp.com/web/#/item/project/detailDetach?tid=${TID}&pid=00000002-0000-4000-8000-000000000002&image_id=00000003-0000-4000-8000-000000000003&type=image`;
   const r1 = await resolveAccountFor({ url }, { offline: true });
   ok('索引命中时零请求判定账号', r1 && r1.alias === 'acme' && r1.by === 'index:teams', JSON.stringify(r1));
 
-  const r2 = await resolveAccountFor({ projectId: '11111111-1111-4111-8111-111111111111' }, { offline: true });
+  const r2 = await resolveAccountFor({ projectId: '00000002-0000-4000-8000-000000000002' }, { offline: true });
   ok('按 projectId 也能判定', r2 && r2.alias === 'acme' && r2.by === 'index:projects', JSON.stringify(r2));
 
-  const r3 = await resolveAccountFor({ teamId: 'ffffffff-0000-0000-0000-000000000000' }, { offline: true });
+  const r3 = await resolveAccountFor({ teamId: '00000005-0000-4000-8000-000000000005' }, { offline: true });
   ok('都不命中时返回 null（退回默认账号）', r3 === null);
 
   const r4 = await pickAccount({ account: 'other' });
@@ -912,12 +912,12 @@ group('⑨ 产品文档（A1/A2）与算法（B1~B4）');
 
 // ── A2 · 解析原型链接：**不能**沿用 parseLanhuUrl（那个强制要 image_id）
 {
-  const u = 'https://lanhuapp.com/web/#/item/project/product?tid=1b89ab48-799c-4899-888c-5040991bef9b&pid=639b8833-6a8c-401f-a002-7d5b3f090365&versionId=42dd6788-6a17-459a-beba-bd210e089b34&docId=cc30bbca-bf64-4599-976d-4d8f03d50011&docType=axure&pageId=5899c262ab8e4609bbb7adef3ecd5450';
+  const u = 'https://lanhuapp.com/web/#/item/project/product?tid=00000006-0000-4000-8000-000000000006&pid=00000007-0000-4000-8000-000000000007&versionId=00000008-0000-4000-8000-000000000008&docId=00000009-0000-4000-8000-000000000009&docType=axure&pageId=5899c262ab8e4609bbb7adef3ecd5450';
   const p = parseProductUrl(u);
-  ok('parseProductUrl 抽出 docId（原型链接里叫 docId，不是 image_id）', p.docId === 'cc30bbca-bf64-4599-976d-4d8f03d50011', String(p.docId));
+  ok('parseProductUrl 抽出 docId（原型链接里叫 docId，不是 image_id）', p.docId === '00000009-0000-4000-8000-000000000009', String(p.docId));
   ok('parseProductUrl 抽出 pageId', p.pageId === '5899c262ab8e4609bbb7adef3ecd5450', String(p.pageId));
-  ok('parseProductUrl 抽出 versionId', p.versionId === '42dd6788-6a17-459a-beba-bd210e089b34', String(p.versionId));
-  ok('parseProductUrl 抽出 tid / pid', p.teamId === '1b89ab48-799c-4899-888c-5040991bef9b' && p.projectId === '639b8833-6a8c-401f-a002-7d5b3f090365');
+  ok('parseProductUrl 抽出 versionId', p.versionId === '00000008-0000-4000-8000-000000000008', String(p.versionId));
+  ok('parseProductUrl 抽出 tid / pid', p.teamId === '00000006-0000-4000-8000-000000000006' && p.projectId === '00000007-0000-4000-8000-000000000007');
   // 反例：**没有 image_id 的原型链接**，parseLanhuUrl 会抛错，parseProductUrl 必须能读
   let plThrew = false; let ppOk = false;
   try { parseLanhuUrl(u); } catch { plThrew = true; }
@@ -1174,11 +1174,11 @@ group('⑨ 产品文档（A1/A2）与算法（B1~B4）');
   ok('通用透传检查确实扫到了全部参数（不是空跑）', checkedParams > 70, `扫了 ${checkedParams} 个`);
 
   // `account` 被忽略时的静默后果：`cookie_set {account:"x"}` 会覆盖**默认账号**的 Cookie
-  upsertAccount({ alias: 'kongtian', company: '测试账号' });
+  upsertAccount({ alias: 'demo', company: '测试账号' });
   const FAKE_COOKIE = 'user_token=SELFCHECK_FAKE; sl_check=1';
-  const sc = await saveCookie(FAKE_COOKIE, { verify: false, account: 'kongtian' });
+  const sc = await saveCookie(FAKE_COOKIE, { verify: false, account: 'demo' });
   ok('cookie_set 给 account → 写进该账号 cookies/<alias>（不碰默认文件）',
-    sc.account === 'kongtian' && sc.path.endsWith(path.join('cookies', 'kongtian')), sc.path);
+    sc.account === 'demo' && sc.path.endsWith(path.join('cookies', 'demo')), sc.path);
   const scBad = await saveCookie(FAKE_COOKIE, { verify: false, account: '__no_such__' }).then(() => null, (e) => e);
   ok('cookie_set 给不存在的 account → 明确报错（不静默落到默认）',
     !!scBad && /不存在/.test(scBad.message), scBad ? scBad.message.slice(0, 60) : '没有报错！');
@@ -1189,12 +1189,12 @@ group('⑨ 产品文档（A1/A2）与算法（B1~B4）');
 
 /* ═══════════ 混链：docId / image_id / versionId 同时出现（蓝湖编辑页的真实形态） ═══════════ */
 {
-  const IMG = 'beceb033-866c-4759-913d-cee0a3b18d3a';
-  const DOC = 'cc30bbca-bf64-4599-976d-4d8f03d50011';
-  const DOCVER = '42dd6788-6a17-459a-beba-bd210e089b34';
+  const IMG = '0000000a-0000-4000-8000-00000000000a';
+  const DOC = '00000009-0000-4000-8000-000000000009';
+  const DOCVER = '00000008-0000-4000-8000-000000000008';
   const PAGE = '5899c262ab8e4609bbb7adef3ecd5450';
-  const MIX = `https://lanhuapp.com/web/#/item/project/detailDetach?tid=1b89ab48-799c-4899-888c-5040991bef9b`
-    + `&pid=639b8833-6a8c-401f-a002-7d5b3f090365&versionId=${DOCVER}&docId=${DOC}&docType=axure`
+  const MIX = `https://lanhuapp.com/web/#/item/project/detailDetach?tid=00000006-0000-4000-8000-000000000006`
+    + `&pid=00000007-0000-4000-8000-000000000007&versionId=${DOCVER}&docId=${DOC}&docType=axure`
     + `&image_id=${IMG}&pageId=${PAGE}&type=image`;
   const p = parseLanhuUrl(MIX);
   ok('混链里 image_id 优先（type=image，不是那个 docId）', p.imageId === IMG, p.imageId);
@@ -1204,7 +1204,7 @@ group('⑨ 产品文档（A1/A2）与算法（B1~B4）');
   // ⚠️ 回归：resolveTarget 曾把 versionId 吞掉 → URL 里的版本号完全失效，永远读 latest
   ok('resolveTarget **不许吞掉 versionId**（吞了 URL 版本就失效）',
     resolveTarget({ url: MIX }).versionId === DOCVER, String(resolveTarget({ url: MIX }).versionId));
-  const plain = 'https://lanhuapp.com/web/#/item/project/detailDetach?pid=639b8833-6a8c-401f-a002-7d5b3f090365&image_id=' + IMG;
+  const plain = 'https://lanhuapp.com/web/#/item/project/detailDetach?pid=00000007-0000-4000-8000-000000000007&image_id=' + IMG;
   ok('链接没带 versionId 时就是 null（不瞎猜）', resolveTarget({ url: plain }).versionId === null,
     String(resolveTarget({ url: plain }).versionId));
   ok('显式给 projectId+imageId 时不编 versionId', resolveTarget({ projectId: 'p', imageId: 'i' }).versionId === undefined
@@ -1523,8 +1523,8 @@ group('⑨ 产品文档（A1/A2）与算法（B1~B4）');
     /需要 projectId/.test(ldNoArgs.text ?? ''), String(ldNoArgs.text ?? '').slice(0, 56));
 
   // ── parseProjectTarget：面向"项目"的解析（**不要求 image_id**）──
-  const TID2 = '1b89ab48-799c-4899-888c-5040991bef9b';
-  const PID2 = '639b8833-6a8c-401f-a002-7d5b3f090365';
+  const TID2 = '00000006-0000-4000-8000-000000000006';
+  const PID2 = '00000007-0000-4000-8000-000000000007';
   const projectPage = `https://lanhuapp.com/web/#/item/project/detailDetach?tid=${TID2}&pid=${PID2}`;
   const pt = parseProjectTarget(projectPage);
   ok('项目页链接（**没有 image_id**）也能取到 pid / tid',
@@ -1602,7 +1602,7 @@ group('⑨ 产品文档（A1/A2）与算法（B1~B4）');
       ok(`打印点 ${label} 对**路径** meta 标了「路径：」`, /路径：A \/ B \/ C/.test(line), line.slice(0, 58));
     }
     // 反向：普通稿名**不许**加前缀 —— 满屏"路径："同样是噪声
-    const plainMeta = { name: '人才详情', width: 375, height: 1333 };
+    const plainMeta = { name: '某详情页', width: 375, height: 1333 };
     ok('反向：普通稿名**不**加「路径：」前缀', !/路径：/.test(renderBlocks([], plainMeta).split('\n')[0]),
       renderBlocks([], plainMeta).split('\n')[0].slice(0, 50));
     // 源头必须打标记 —— 漏了它上面四条会一起失灵
@@ -1664,7 +1664,7 @@ group('⑨ 产品文档（A1/A2）与算法（B1~B4）');
 /* ═══════ CLI 的 --account 透传（工具链有同款守卫；**CLI 这条缝里漏出过 30005**） ═══════ */
 {
   // 起因：CLI 的 16 个 cmdXxx 全都没把 args.account 传给核心函数 → 永远走默认账号。
-  // 实测：空天碳团队（属 kongtian）用默认账号 quanzi 调 search → `code=30005 用户或团队不存在`，
+  // 实测：示例团队（属 demo）用默认账号 default-acct 调 search → `code=30005 用户或团队不存在`，
   //      而同入参改走工具（带 account）就正常。**工具对、CLI 错**，就是这条缝。
   const hostSrc = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'lanhu.mjs'), 'utf8');
   const NET_CALL = /await (checkAuth|listTeams|listDirectory|listSectors|listImages|search|readDesign|readBlocks|readProductDoc|downloadSlices|verifySpec|saveCookie|productDocuments|tryProjectInfo|fetchDesignTree|whoIsIt|buildAccountIndex)\(/;

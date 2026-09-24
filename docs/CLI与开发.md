@@ -9,11 +9,11 @@
 >
 > **指定账号**：`node lanhu.mjs <命令> … --account <别名>`
 > —— 目标团队不属于**默认账号**时**必须给**，否则接口报 `30005 用户或团队不存在`。
-> 实测（空天碳团队属 `kongtian`，而默认账号是 `quanzi`）：
+> 实测（示例团队属 `demo`，而默认账号是 `default-acct`）：
 >
 > ```bash
-> node lanhu.mjs search --team 1b89ab48-… --keyword 雷达组网                    # ❌ code=30005 用户或团队不存在
-> node lanhu.mjs search --team 1b89ab48-… --keyword 雷达组网 --account kongtian  # ✅ 正常返回
+> node lanhu.mjs search --team <团队id> --keyword 某大屏                    # ❌ code=30005 用户或团队不存在
+> node lanhu.mjs search --team <团队id> --keyword 某大屏 --account demo  # ✅ 正常返回
 > ```
 >
 > 优先级：`--cookie` > 环境变量 `LANHU_COOKIE` > `--account` > 默认账号 ——
