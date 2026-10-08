@@ -10,7 +10,7 @@
  *
  *   ① 工具速查块必须与 `lib/index.js` 的 `TOOLS` **逐字一致**（手改了就红）
  *   ② `docs/…md` 链接必须存在；`docs/` 下**不许有孤立文件**（没人链接 = 没人会读）
- *   ③ 版本号**五处一起改**（package.json / package-lock ×2 / README / CHANGELOG）
+ *   ③ 版本号**四处一起改**（package.json / package-lock ×2 / README）
  *      —— 这条以前是纯靠人核的，发布清单里专门写着「已知空缺」
  *   ④ 发布说明 与 公开纪律：双语锚点格式合规、**不许出现本机绝对路径**
  *
@@ -81,7 +81,8 @@ group('② docs 链接');
   const uniqLinks = [...new Set(links)];
   const dead = uniqLinks.filter((t) => !exists(t));
   ok('README 的链接都指向真实存在的文件（相对 + GitHub 绝对）', dead.length === 0, dead.join(', '));
-  ok('确实检查到了链接（不是空跑）', uniqLinks.length >= 10, `检查了 ${uniqLinks.length} 条`);
+  // 阈值 6：删掉 CHANGELOG 的两条链接后剩 8 条，留出余量；低于 6 说明链接大面积消失了
+  ok('确实检查到了链接（不是空跑）', uniqLinks.length >= 6, `检查了 ${uniqLinks.length} 条`);
 
   const docsDir = path.join(ROOT, 'docs');
   const docs = fs.existsSync(docsDir)
@@ -104,13 +105,12 @@ group('③ 版本号一致');
     'package-lock.json 根': lock.version,
     'package-lock.json packages[""]': lock.packages?.['']?.version,
     'README 版本行': (readme.match(/\*\*版本 `([^`]+)`\*\*/) ?? [])[1],
-    'CHANGELOG 最新章节': (read('CHANGELOG.md').match(/^## (\d+\.\d+\.\d+) /m) ?? [])[1],
   };
   const values = [...new Set(Object.values(versions))];
   for (const [where, v] of Object.entries(versions)) {
     ok(`${where} 有版本号`, Boolean(v), v ? '' : '取不到');
   }
-  ok('五处版本号**完全一致**', values.length === 1, JSON.stringify(versions));
+  ok('四处版本号**完全一致**', values.length === 1, JSON.stringify(versions));
   ok('README 版本行与 package.json 一致', versions['README 版本行'] === pkg.version,
     `${versions['README 版本行']} vs ${pkg.version}`);
 }

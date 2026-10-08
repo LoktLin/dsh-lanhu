@@ -20,7 +20,7 @@
 > **没有它**：AI 写页面前只能看设计稿**截图**，色值和字号靠视觉估算（OCR 小字经常错）。
 > **有了它**：设计稿的真实数值直接进上下文 —— 等于把「设计标注」喂给模型；还能反过来拿它**自动验收**页面还原度。
 
-**版本 `0.5.3`**（见 [CHANGELOG](https://github.com/LoktLin/dsh-lanhu/blob/main/CHANGELOG.md)） · MIT · 已发布到 npm：[`dsh-lanhu`](https://www.npmjs.com/package/dsh-lanhu)
+**版本 `0.5.3`**（见 [发布说明](https://github.com/LoktLin/dsh-lanhu/releases)） · MIT · 已发布到 npm：[`dsh-lanhu`](https://www.npmjs.com/package/dsh-lanhu)
 适用于 [DeepSeek Harness](https://github.com/deepseek-ai)（DSH）Web GUI，需要 **Node ≥ 20**。自带 15 个原生工具 + 侧边面板 + CLI。
 
 > ⚠️ **免责与数据说明**
@@ -46,7 +46,7 @@
 | **侧边面板** | 块级 / 账号 / 记录，三个 Tab，不用敲命令 |
 | **多账号** | 一账号一套 Cookie；贴链接自动判归属（索引命中零请求） |
 | **零运行时依赖** | 真机验收才需要 `puppeteer-core`（`optionalDependencies`，不装也能用） |
-| **离线自检 676 项** | 秒级、零网络；改完代码先跑它（另有**文档绊线** `test/readme-test.mjs`：生成块 / `docs/` 链接与孤立文件 / 版本号五处 / 发布说明格式 / 写死的数字） |
+| **离线自检** | 秒级、零网络；改完代码先跑它（另有**文档绊线** `test/readme-test.mjs`：生成块 / `docs/` 链接与孤立文件 / 版本号五处 / 发布说明格式 / 写死的数字） |
 
 ---
 
@@ -100,7 +100,7 @@
 ## 工具
 
 <!-- BEGIN MANUAL:tool-picker -->
-> 这一屏是**导航**（按事情找工具）。每个工具的**每个参数与取值**在下面「完整说明」里 —— 那一节是**生成的**，不会过时。
+> 这一屏是**导航**（按事情找工具）。每个工具的**每个参数与取值**在下面「完整说明」里 —— 那一节由 schema 生成，改代码时会跟着变。
 
 | 工具 | 作用 |
 |---|---|
@@ -122,8 +122,7 @@
 > 下面这段由 `node tools/gen-readme-tools.mjs --write` 从 `lib/index.js` 的 `TOOLS` **生成** ——
 > **工具的唯一真身是 schema**，本文件只是它的投影。改了工具（加参数 / 改描述 / 改必填）就跑一次生成器：
 > `node test/readme-test.mjs` 会**逐字比对**，忘了跑就**红**。
-> 所以这一节**不会过时** —— 而手写的清单一定会（实测：`lanhu_read_design` 有三个月在 schema 里声明着
-> `limit` / `mapBox` / `toBox`，文档和实现都没接上，没人发现，因为文档是手抄的）。
+> 所以这一节跟着 schema 走，不必手改 —— 手写清单容易与 schema 脱节，而且脱节了没人会发现。
 
 <!-- BEGIN GENERATED:tools -->
 
@@ -375,7 +374,7 @@ cd <plugin-dir> && npm i puppeteer-core   # 只装这一个（它是 optional �
 | 还原完要验收 / 导出切图 | [docs/验收.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/验收.md) |
 | 用侧边面板 / 配多账号 / Cookie 失效了 | [docs/面板与账号.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/面板与账号.md) |
 | 用命令行 / 跑自检 / 踩到限制 | [docs/CLI与开发.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/CLI与开发.md) |
-| 这一版改了什么 | [CHANGELOG.md](https://github.com/LoktLin/dsh-lanhu/blob/main/CHANGELOG.md) · [最新发布说明（v0.2.1）](https://github.com/LoktLin/dsh-lanhu/blob/main/.github/release-notes/v0.2.1.md) |
+| 这一版改了什么 | [Releases](https://github.com/LoktLin/dsh-lanhu/releases)（每个版本一份中英发布说明） |
 
 ---
 
