@@ -1,6 +1,6 @@
 {
   "name": "dsh-lanhu",
-  "version": "0.5.3",
+  "version": "0.5.4",
   "description": "让 AI 直接「读蓝湖（Lanhu）设计稿」—— 把设计稿解析成可直抄的精确数值（色值 / 字号 / 圆角 / 间距 / 文本），替代靠截图估算。",
   "type": "module",
   "main": "./lib/index.js",
