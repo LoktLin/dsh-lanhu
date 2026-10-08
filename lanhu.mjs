@@ -30,6 +30,71 @@ export const AXURE_CDN = 'https://axure-file.lanhuapp.com';
 export const DDS_BASE_URL = 'https://dds.lanhuapp.com';
 
 /* ==========================================================================
+ * 受控词表与阈值 —— **单一出口**
+ *
+ * 为什么集中在这里（而不是散在使用点）：
+ *   本仓库刚因为"没有唯一收口"连续踩过四次同一个坑（间距关系被静默丢掉、
+ *   画板被当元素、齐平段父子成对、同名撞车）。结论写进了代码里：
+ *   「新加一个返回 / 一个类型 / 一个阈值时，先问：它的单一出口在哪？」
+ *
+ * 规矩（照 `AXURE_CHILD_KEYS` 的先例）：
+ *   · 受控词表一律 `Object.freeze`，**每个值都带 desc**（desc 是写给 AI 看的：
+ *     它的消费者是写前端代码的 agent，一句"还原时别用 border-image"比"分割线"有用）；
+ *   · 阈值/上限一律进 `LIMITS`，**不许在逻辑里裸写数字**；
+ *   · 新常量加到对应分区，别另起一处。
+ * ========================================================================== */
+
+/** 块类型（受控词表）。下游渲染、文档、验收都引用这里。 */
+export const KINDS = Object.freeze({
+  ARTBOARD: 'artboard',
+  IMAGE: 'image',
+  TEXT: 'text',
+  DIVIDER: 'divider',
+  PILL: 'pill',
+  CARD: 'card',
+  CONTAINER: 'container',
+  OTHER: 'other',
+});
+
+/** 每个块类型**是什么意思、还原时要注意什么**（写给 AI 看）。 */
+export const KIND_DESC = Object.freeze({
+  [KINDS.ARTBOARD]: '画板本身（不是内容块）。坐标是画布绝对坐标，**不要**参与块间几何比较。',
+  [KINDS.IMAGE]: '切图/图片块。**没有填充也没有圆角是正常的** —— 尺寸照样要还原，别当噪音跳过。',
+  [KINDS.TEXT]: '文本层。字号/字重/字体族/行高字距照抄，字重 400 就是 400 别写成 600。',
+  [KINDS.DIVIDER]: '分割线（极细实心条，或只有单边边框的薄块）。还原用 1px 实线，**别用 border-image**。',
+  [KINDS.PILL]: '胶囊/圆角标签。圆角撑满短边 → CSS 直接写 `border-radius: 9999px`。',
+  [KINDS.CARD]: '卡片（底色/边框/圆角**至少有一个**，且够大）。内边距看「内边距」列，别再父子相减手算。',
+  [KINDS.CONTAINER]: '有样式但不够大的容器（按钮底、说明块…）。',
+  [KINDS.OTHER]: '无样式的纯布局层。通常只是分组，别当可见元素还原。',
+});
+
+/** 图层颜色的角色（受控词表）。 */
+export const COLOR_ROLES = Object.freeze({
+  FILL: 'fill',
+  GRADIENT: 'gradient',
+  TEXT: 'text',
+});
+
+/** 阈值与上限（**不许在逻辑里裸写这些数字**）。 */
+export const LIMITS = Object.freeze({
+  // —— 块分类（classifyBlock 的判据，等价于状态判定的业务规则）——
+  dividerMaxThin: 3,        // 分割线①：短边 ≤ 3px
+  dividerMinLong: 12,       // 分割线①：长边 ≥ 12px
+  dividerBorderMaxThin: 12, // 分割线②：只有单边边框时短边上限
+  pillMaxHeight: 64,        // 胶囊：高度上限
+  pillRadiusEpsilon: 0.5,   // 胶囊：圆角"撑满短边"的容差
+  cardMinWidth: 240,        // 卡片：最小宽
+  cardMinHeight: 100,       // 卡片：最小高
+  // —— 输出上限 ——
+  summaryMaxBoxes: 14,      // summary「关键容器」最多列几个
+  gapsLimit: 60,            // renderGaps 默认上限
+  gapDigestMaxRows: 24,     // 「间距一览」的间距行封顶（0.5.0 口径）
+  flushMaxRows: 24,         // 「间距一览」的齐平行封顶
+  urlTruncate: 800,         // 长 URL 截断长度
+});
+
+
+/* ==========================================================================
  * 错误
  * ========================================================================== */
 
@@ -754,7 +819,7 @@ export function summarizeArgs(args) {
   // 蓝湖链接通长约 250–350 字符，这里给足；真超长再截并标出。
   if (args.url) {
     const u = String(args.url);
-    out.url = u.length <= 800 ? u : `${u.slice(0, 800)}…(共 ${u.length} 字符)`;
+    out.url = u.length <= LIMITS.urlTruncate ? u : `${u.slice(0, 800)}…(共 ${u.length} 字符)`;
   }
   return Object.keys(out).length > 0 ? out : null;
 }
@@ -1770,7 +1835,7 @@ export function geometricGaps(items, opts = {}) {
 }
 
 /** B4 的文本渲染：每个节点每个方向只列**最近的一条**（全列会 O(N²)，没人看得完）。 */
-export function renderGaps(gaps, limit = 60, opts = {}) {
+export function renderGaps(gaps, limit = LIMITS.gapsLimit, opts = {}) {
   const L = [];
   L.push(`## 几何间距（${gaps.length} 条；只在另一轴有重叠的相邻元素之间算，x/y 各自独立）｜${unitBasisNote(opts.designWidth)}`);
   L.push('> 用途：还原时**直接抄间距**，不用拿坐标手算。');
@@ -1924,7 +1989,7 @@ function makeLabeler(list) {
 
 export function renderGapDigest(items, opts = {}) {
   const designWidth = Number(opts.designWidth);
-  const limit = Number.isFinite(opts.limit) ? Number(opts.limit) : 24;
+  const limit = Number.isFinite(opts.limit) ? Number(opts.limit) : LIMITS.gapDigestMaxRows;
   // ⚠️ 进来先保证**每个元素都有唯一 id**：`geometricGaps` 只会把 `from`/`to`（= id）带回来，
   //    没有 id 时它给的是 `null`，间距行就只能退回**原始截断名** —— 同名/截断撞车时会显示成
   //    两个一模一样的名字（"看着像自己跟自己"）。有 id 才能走同一套去歧义。
@@ -2326,11 +2391,11 @@ function axureNodeFields(o, ctx) {
   // 颜色：填充 / 描边 / 文字色 / 渐变 —— 与设计稿同构（`role` 决定下游怎么归类）
   const colors = [];
   const fillC = axureFillColor(st.fill);
-  if (fillC && fillC.a > 0) colors.push({ ...fillC, role: 'fill' });
+  if (fillC && fillC.a > 0) colors.push({ ...fillC, role: COLOR_ROLES.FILL });
   const borderC = axureFillColor(st.borderFill);
   if (borderC && borderC.a > 0) colors.push({ ...borderC, role: 'border' });
   const fgC = axureFillColor(st.foreGroundFill);
-  if (fgC && fgC.a > 0) colors.push({ ...fgC, role: 'text' });
+  if (fgC && fgC.a > 0) colors.push({ ...fgC, role: COLOR_ROLES.TEXT });
   colors.push(...axureGradientColors(st));
 
   // 文本：靠 `widgetId → u###` 去 HTML 里取（data.js 里的 label 是空的）
@@ -2530,7 +2595,7 @@ export function normalizeAxurePage({ document: doc, html, pageUrl = null } = {})
         const dgs = dg?.style ?? {};
         const dgColors = [];
         const dgFill = axureFillColor(dgs.fill);
-        if (dgFill && dgFill.a > 0) dgColors.push({ ...dgFill, role: 'fill' });
+        if (dgFill && dgFill.a > 0) dgColors.push({ ...dgFill, role: COLOR_ROLES.FILL });
         const dgBorder = axureFillColor(dgs.borderFill);
         if (dgBorder && dgBorder.a > 0) dgColors.push({ ...dgBorder, role: 'border' });
         dgColors.push(...axureGradientColors(dgs));
@@ -2590,7 +2655,7 @@ export function normalizeAxurePage({ document: doc, html, pageUrl = null } = {})
     widgetCount: layers.length - 1,
     /** 只数控件（**不含画板层**）—— 否则会出现"控件 2 个（可见 3）"这种自相矛盾的话 */
     visibleCount: layers.slice(1).filter((l) => l.visible !== false).length,
-    withFill: layers.filter((l) => l.colors.some((c) => c.role === 'fill')).length,
+    withFill: layers.filter((l) => l.colors.some((c) => c.role === COLOR_ROLES.FILL)).length,
     withText: layers.filter((l) => l.text).length,
     withFont: layers.filter((l) => l.font?.size !== null && l.font?.size !== undefined).length,
     maxDepth: layers.reduce((m, l) => Math.max(m, l.depth), 0),
@@ -2954,7 +3019,7 @@ function layerColors(node) {
     if (f.isEnabled === false) continue;
     if (f.type === 'color' && f.color) {
       const c = parseColor(f.color);
-      if (c && c.a > 0) out.push({ ...c, role: 'fill' });
+      if (c && c.a > 0) out.push({ ...c, role: COLOR_ROLES.FILL });
     } else if (f.type === 'gradient' && f.gradient) {
       for (const stop of f.gradient.stops ?? []) {
         const c = parseColor(stop.color);
@@ -2970,7 +3035,7 @@ function layerColors(node) {
   const tc = node.text?.style?.color;
   if (tc) {
     const c = parseColor(tc);
-    if (c && c.a > 0) out.push({ ...c, role: 'text' });
+    if (c && c.a > 0) out.push({ ...c, role: COLOR_ROLES.TEXT });
   }
   return out;
 }
@@ -3205,7 +3270,7 @@ function noiseOf(l) {
   return false;
 }
 
-const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+export const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 /**
  * 从蓝湖链接里解析 teamId / projectId / imageId。
@@ -3313,21 +3378,22 @@ function classifyBlock(l) {
   const h = l.h ?? 0;
   const long = Math.max(w, h);
   const thin = Math.min(w, h);
-  if (l.depth === 0) return 'artboard';
-  if (l.hasImage) return 'image';
-  if (l.text !== undefined && l.text !== null && l.text !== '') return 'text';
-  const hasFill = (l.colors ?? []).some((c) => c.role === 'fill' || c.role === 'gradient');
+  // 判据全部来自 LIMITS、类型全部来自 KINDS —— 别在这里裸写数字或字符串（见文件顶部「受控词表与阈值」）
+  if (l.depth === 0) return KINDS.ARTBOARD;
+  if (l.hasImage) return KINDS.IMAGE;
+  if (l.text !== undefined && l.text !== null && l.text !== '') return KINDS.TEXT;
+  const hasFill = (l.colors ?? []).some((c) => c.role === COLOR_ROLES.FILL || c.role === COLOR_ROLES.GRADIENT);
   // 分割线①：极细长的实心条
-  if (thin <= 3 && long >= 12) return 'divider';
+  if (thin <= LIMITS.dividerMaxThin && long >= LIMITS.dividerMinLong) return KINDS.DIVIDER;
   // 分割线②：只有单边边框、自身无底色的薄块（Footer 顶边 1px 就长这样）
-  if (l.border && l.border.single && !hasFill && thin <= 12) return 'divider';
+  if (l.border && l.border.single && !hasFill && thin <= LIMITS.dividerBorderMaxThin) return KINDS.DIVIDER;
   // 胶囊：圆角撑满短边（Contact Button 79×26 r=38 —— 案例 1 的主角）
-  if (l.radius && h > 0 && h <= 64 && l.radius.max >= thin / 2 - 0.5) return 'pill';
+  if (l.radius && h > 0 && h <= LIMITS.pillMaxHeight && l.radius.max >= thin / 2 - LIMITS.pillRadiusEpsilon) return KINDS.PILL;
   // 卡片必须有**样式**（底色/边框/圆角）才算 —— 否则 375×798 的纯布局层会被误判成卡片
   const styled = hasFill || Boolean(l.border) || Boolean(l.radius);
-  if (w >= 240 && h >= 100 && styled) return 'card';
-  if (styled) return 'container';
-  return 'other';
+  if (w >= LIMITS.cardMinWidth && h >= LIMITS.cardMinHeight && styled) return KINDS.CARD;
+  if (styled) return KINDS.CONTAINER;
+  return KINDS.OTHER;
 }
 
 /**
@@ -3356,11 +3422,11 @@ export function buildBlocks(layers, opts = {}) {
     const isTextLayer = typeof l.text === 'string' && l.text !== '';
     // `l.fillIsBackground` 只有**原型**这条链会设（Axure 的 fill 与 foreGroundFill 是分开的字段）；
     // 设计稿那条链不设它 → 行为逐字不变。
-    const fill = (isTextLayer && !l.fillIsBackground) ? null : (l.colors ?? []).find((c) => c.role === 'fill' || c.role === 'gradient');
+    const fill = (isTextLayer && !l.fillIsBackground) ? null : (l.colors ?? []).find((c) => c.role === COLOR_ROLES.FILL || c.role === COLOR_ROLES.GRADIENT);
     // 多段渐变：把**全部** stop 留一份（按设计稿顺序）。
     // ⚠️ 以前渲染只取第一个 stop —— 表格里"有颜色"，看着不像缺信息，比 opacity 更隐蔽（交接清单缺口 4）。
-    const gradientStops = (isTextLayer && !l.fillIsBackground) ? [] : (l.colors ?? []).filter((c) => c.role === 'gradient');
-    const textColor = (l.colors ?? []).find((c) => c.role === 'text') ?? (isTextLayer ? (l.colors ?? []).find((c) => c.role === 'fill') : null);
+    const gradientStops = (isTextLayer && !l.fillIsBackground) ? [] : (l.colors ?? []).filter((c) => c.role === COLOR_ROLES.GRADIENT);
+    const textColor = (l.colors ?? []).find((c) => c.role === COLOR_ROLES.TEXT) ?? (isTextLayer ? (l.colors ?? []).find((c) => c.role === COLOR_ROLES.FILL) : null);
     const h = l.h ?? 0;
     const thin = Math.min(l.w ?? 0, h);
 
@@ -3456,10 +3522,10 @@ export function renderBlocks(blocks, meta = {}, opts = {}) {
   if (withBorder.length > 0) {
     L.push('');
     L.push(`## 边框 / 分割线（${withBorder.length} 处）`);
-    for (const b of withBorder.slice(0, 24)) {
+    for (const b of withBorder.slice(0, LIMITS.flushMaxRows)) {
       L.push(`- ${b.name}：${b.border.color ?? '(蓝湖未给颜色)'} **${b.border.width}px**，${b.border.sides.join('+')}${b.border.single ? ' ← 单边，即分割线' : ''}`);
     }
-    if (withBorder.length > 24) L.push(`- … 其余 ${withBorder.length - 24} 处略`);
+    if (withBorder.length > LIMITS.flushMaxRows) L.push(`- … 其余 ${withBorder.length - LIMITS.flushMaxRows} 处略`);
   }
 
   // 间距一览（§4.2）：块与块"差多少"直接给出来，省掉拿坐标手算。
@@ -3545,11 +3611,11 @@ function bgText(bg) {
 
 function fillText(colors) {
   const arr = colors ?? [];
-  const grads = arr.filter((c) => c.role === 'gradient');
+  const grads = arr.filter((c) => c.role === COLOR_ROLES.GRADIENT);
   const one = (c) => `${rgbHex(c)}${c.a < 1 ? `@${Math.round(c.a * 100)}%` : ''}${rgbaSuffix(c)}`;
   if (grads.length > 1) return grads.map(one).join('→');
   // 保持既有兜底顺序（数组里第一个 fill，再退到首个色）——只是把渐变 stop 提到最前。
-  const c = grads[0] ?? arr.find((x) => x.role === 'fill') ?? arr[0];
+  const c = grads[0] ?? arr.find((x) => x.role === COLOR_ROLES.FILL) ?? arr[0];
   if (!c) return '—';
   return `${c.role === 'border' ? '描边 ' : ''}${one(c)}`;
 }
@@ -3703,9 +3769,9 @@ export function renderSummary({ detail, layers, tokens, meta, maxTextLayers = 36
   const boxes = layers
     .filter((l) => l.depth !== 0)
     .filter((l) => l.visible && !l.text && l.w >= 40 && l.h >= 18)
-    .filter((l) => l.radius !== null || l.colors.some((c) => c.role === 'fill') || l.hasImage)
+    .filter((l) => l.radius !== null || l.colors.some((c) => c.role === COLOR_ROLES.FILL) || l.hasImage)
     .sort((a, b) => (a.y - b.y) || (a.x - b.x));
-  const maxBoxes = 14;
+  const maxBoxes = LIMITS.summaryMaxBoxes;
   // 半透明图层预警：漏读 opacity 会把「渐隐的厚度层 / 底纹」做成生硬实心块（实测踩过）。
   const translucent = layers.filter((l) => l.visible && (l.effectiveOpacity ?? l.opacity ?? 1) < 1);
   if (translucent.length > 0) {
@@ -3739,7 +3805,7 @@ export function renderSummary({ detail, layers, tokens, meta, maxTextLayers = 36
   L.push('| 文本 | 位置(x,y) | 尺寸 | 字号/字重 | 字体 | 行高·字距 | 颜色 |');
   L.push('|---|---|---|---|---|---|---|');
   for (const t of texts.slice(0, maxTextLayers)) {
-    const c = t.colors.find((x) => x.role === 'text') ?? t.colors[0];
+    const c = t.colors.find((x) => x.role === COLOR_ROLES.TEXT) ?? t.colors[0];
     const txt = String(t.text).replace(/\|/g, '\\|').replace(/\n/g, '⏎').slice(0, 40);
     const fam = t.font?.family ? shortFamily(t.font.family) : '—';
     L.push(`| ${txt} | ${t.x},${t.y} | ${dualOn ? dualUnits(t.w, t.h, meta.width) : `${t.w}×${t.h}`} | ${t.font?.size ?? '?'}px/${t.font?.weight ?? '?'} | ${fam} | ${metricsText(t.font)} | ${c ? rgbHex(c) : '—'} |`);

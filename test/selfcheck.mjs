@@ -1935,6 +1935,77 @@ group('注入与结果优化');
   ok('CLI 列表也标注了「（预览）」并给出一行警告', /（预览）/.test(cliSrc) && /缩略图预览尺寸/.test(cliSrc), '');
 }
 
+/* ═══════ 单一出口：受控词表 / 阈值（常量区） ═══════ */
+{
+  const _root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const src = fs.readFileSync(path.join(_root, 'lanhu.mjs'), 'utf8');
+  const mod = await import(path.join(_root, 'lanhu.mjs'));
+  const { KINDS, KIND_DESC, COLOR_ROLES, LIMITS } = mod;
+
+  ok('KINDS / COLOR_ROLES / LIMITS 都是冻结对象',
+    [KINDS, COLOR_ROLES, LIMITS].every((o) => o && Object.isFrozen(o)),
+    `KINDS=${Object.isFrozen(KINDS)} COLOR_ROLES=${Object.isFrozen(COLOR_ROLES)} LIMITS=${Object.isFrozen(LIMITS)}`);
+  ok('确实检查到了词表内容（不是空跑）',
+    Object.keys(KINDS).length >= 8 && Object.keys(LIMITS).length >= 10,
+    `KINDS ${Object.keys(KINDS).length} 项 / LIMITS ${Object.keys(LIMITS).length} 项`);
+  // 对应 Java 枚举的 code+desc：每个值都必须有非空 desc，且 desc 是写给 AI 看的（够长、说清了怎么还原）
+  const missing = Object.values(KINDS).filter((v) => !KIND_DESC[v] || String(KIND_DESC[v]).trim().length < 8);
+  ok('每个 KINDS 都有非空的 KIND_DESC（枚举的 code+desc）', missing.length === 0, missing.join(', '));
+  ok('KIND_DESC 没有多余的键（与 KINDS 一一对应）',
+    Object.keys(KIND_DESC).length === Object.keys(KINDS).length,
+    `KINDS ${Object.keys(KINDS).length} vs KIND_DESC ${Object.keys(KIND_DESC).length}`);
+  // ⚠️ 这条是防退化的关键：classifyBlock 里**不许**再出现裸数字/裸类型字面量
+  const body = src.slice(src.indexOf('function classifyBlock'), src.indexOf('function classifyBlock') + 1600);
+  const cls = body.slice(0, body.indexOf('\n}'));
+  const bare = [];
+  if (/<=\s*\d/.test(cls)) bare.push('裸数字比较');
+  if (/'(artboard|image|text|divider|pill|card|container|other)'/.test(cls)) bare.push('裸类型字面量');
+  if (/'(fill|gradient)'/.test(cls)) bare.push('裸 role 字面量');
+  ok('classifyBlock 只引用 KINDS/COLOR_ROLES/LIMITS，无裸数字与裸字面量', bare.length === 0, bare.join(' + '));
+  ok('LIMITS 真的被逻辑引用（不是摆设）',
+    (src.match(/LIMITS\./g) ?? []).length >= 10,
+    `LIMITS.x 出现 ${(src.match(/LIMITS\./g) ?? []).length} 次`);
+}
+
+/* ═══════ 单一出口：工具返回的 ok 契约 + 坏输入的「下一步」（父代理健壮性测试发现） ═══════ */
+{
+  const _root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const idxSrc = fs.readFileSync(path.join(_root, 'lib/index.js'), 'utf8');
+  const { TOOLS } = await import(path.join(_root, 'lib/index.js'));
+
+  // ① 出口必须收口：成功路径要过 withOk（源码级，覆盖全部工具 —— 不只测含 id 的那几个）
+  ok('工具出口调用 withOk（保证任何工具都不会漏 ok）',
+    /return toLossless\(withUpstreamHint\(withOk\(r\)\)\)/.test(idxSrc), '');
+
+  // ② 行为层：含 id 参数的工具传坏 id → 必须 ok:false 且 **hint 非空**（离线，走本地预检）
+  const idTools = TOOLS.filter((t) => {
+    const props = t.parameters?.properties ?? {};
+    return ['projectId', 'imageId', 'teamId', 'docId', 'versionId'].some((k) => props[k]);
+  });
+  ok('确实找到含 id 参数的工具（不是空跑）', idTools.length >= 5, `找到 ${idTools.length} 个`);
+  let checked = 0; const noOk = []; const noHint = [];
+  for (const t of idTools) {
+    const props = t.parameters?.properties ?? {};
+    const args = {};
+    for (const k of ['projectId', 'imageId', 'teamId', 'docId', 'versionId']) if (props[k]) args[k] = 'not-a-uuid';
+    let r;
+    try { r = await t.execute(args); } catch { continue; }   // 抛异常的不算（另有断言管）
+    checked += 1;
+    if (typeof r?.ok !== 'boolean') noOk.push(t.name);
+    if (r?.ok === false && String(r?.hint ?? '').trim() === '') noHint.push(t.name);
+  }
+  ok('坏 id 的每个工具都返回 boolean ok', noOk.length === 0, noOk.join(', '));
+  ok('坏 id 的失败**必须带非空 hint**（报错要指出下一步）', noHint.length === 0, noHint.join(', '));
+  ok('确实跑了足够多的工具（不是空跑）', checked >= 5, `实际调用 ${checked} 个`);
+
+  // ③ 上游错误**不许改写**：源码里 error 取自上游原文，不许在出口重写
+  ok('出口不改写 error（只补 hint）',
+    /withUpstreamHint/.test(idxSrc) && !/error:\s*['"`][^'"`]*通常/.test(idxSrc), '');
+  // ④ UUID_RE 只有一个定义（复用，不写第二个）
+  const reDefs = (fs.readFileSync(path.join(_root, 'lanhu.mjs'), 'utf8').match(/const UUID_RE =/g) ?? []).length;
+  ok('UUID_RE 全项目只有一处定义（工具层复用它）', reDefs === 1, `lanhu.mjs 里 ${reDefs} 处`);
+}
+
 /* ═══════════════ 汇总 ═══════════════ */
 const passed = results.filter((r) => r.ok).length;
 const failed = results.length - passed;
