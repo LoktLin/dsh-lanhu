@@ -132,7 +132,17 @@ group('④ 发布说明与公开纪律');
     ok(`${f} 首行是双语锚点`, first === `[中文](#cn-${v}) | [English](#en-${v})`, first);
     ok(`${f} 有 cn / en 两个 HTML 锚点`,
       s.includes(`<h3 id="cn-${v}">`) && s.includes(`<h3 id="en-${v}">`));
-    ok(`${f} 中英之间用 --- 分隔`, stripEol(s).includes('\n---\n'));
+    // ⚠️ 只查"有没有 `---`"是不够的 —— **实测踩过**：中文的「其他变更」段被排到英文区之后，
+    //    文件里照样有个 `---`（只不过跑到了文末），旧断言仍然全绿。所以这里验**结构**：
+    //    ① 所有 cn- 锚点必须全部排在所有 en- 锚点之前；② `---` 必须落在两半之间。
+    const cnAt = [...s.matchAll(new RegExp(`<h3 id="cn-${v}">`, 'g'))].map((m) => m.index);
+    const enAt = [...s.matchAll(new RegExp(`<h3 id="en-${v}">`, 'g'))].map((m) => m.index);
+    const sepAt = s.indexOf('\n---\n');
+    ok(`${f} 中文段全部排在英文段之前（不是"只要有个 ---"）`,
+      cnAt.length > 0 && enAt.length > 0 && Math.max(...cnAt) < Math.min(...enAt),
+      `cn ${cnAt.length} 段 / en ${enAt.length} 段；cn 末位 ${Math.max(...cnAt)} vs en 首位 ${Math.min(...enAt)}`);
+    ok(`${f} --- 落在中英两半之间`,
+      sepAt > Math.max(...cnAt) && sepAt < Math.min(...enAt), `--- 位置 ${sepAt}`);
     ok(`${f} 两半各有 Full Changelog`, (s.match(/\*\*Full Changelog\*\*/g) ?? []).length === 2);
     ok(`${f} 不含本机绝对路径`, !LOCAL_PATH.test(s), (s.match(LOCAL_PATH) ?? []).join(', '));
   }
