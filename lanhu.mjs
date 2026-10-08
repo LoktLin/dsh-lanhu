@@ -1715,7 +1715,14 @@ export function matchAssetsToLayers(assets, layers, sliceScale) {
  */
 export function geometricGaps(items, opts = {}) {
   const maxDistance = Number.isFinite(opts.maxDistance) ? Number(opts.maxDistance) : Infinity;
-  const list = (items ?? []).filter((i) => i && Number.isFinite(i.x) && Number.isFinite(i.y) && Number.isFinite(i.w) && Number.isFinite(i.h));
+  // ⚠️ **内部键必须按"元素身份"而不是 `id`**：调用方可能压根不给 id，或给的是**会重复**的 id
+  //    （Figma 导出的 `I37:2804;3` 这种）。键一撞，"每个元素每方向只留最近一条"就退化成
+  //    "所有撞键的元素共用一个名额"—— **大部分关系被静默丢掉**，输出看着像"这里就只有这几条间距"
+  //    （本仓库最忌讳的"数据有、输出无"；实测踩过：4 个元素的夹具本该 5 条，只出了 2 条）。
+  //    `id` 仍然原样带在 gap.from/to 上，供展示与调用方使用。
+  const list = (items ?? [])
+    .filter((i) => i && Number.isFinite(i.x) && Number.isFinite(i.y) && Number.isFinite(i.w) && Number.isFinite(i.h))
+    .map((it, i) => ({ ...it, __k: `#${i}` }));
   const nearest = new Map();
   const axes = [['x', 'y', 'w', 'h'], ['y', 'x', 'h', 'w']];
   for (let i = 0; i < list.length; i += 1) {
@@ -1746,7 +1753,7 @@ export function geometricGaps(items, opts = {}) {
           distance,
           overlap: { start: round2(low), end: round2(high) },
         };
-        for (const key of [`${gap.from}|${axis}|+`, `${gap.to}|${axis}|-`]) {
+        for (const key of [`${a.__k}|${axis}|+`, `${b.__k}|${axis}|-`]) {
           const cur = nearest.get(key);
           if (!cur || distance < cur.distance) nearest.set(key, gap);
         }
@@ -1763,17 +1770,200 @@ export function geometricGaps(items, opts = {}) {
 }
 
 /** B4 的文本渲染：每个节点每个方向只列**最近的一条**（全列会 O(N²)，没人看得完）。 */
-export function renderGaps(gaps, limit = 60) {
+export function renderGaps(gaps, limit = 60, opts = {}) {
   const L = [];
-  L.push(`## 几何间距（${gaps.length} 条；只在另一轴有重叠的相邻元素之间算，x/y 各自独立）`);
+  L.push(`## 几何间距（${gaps.length} 条；只在另一轴有重叠的相邻元素之间算，x/y 各自独立）｜${unitBasisNote(opts.designWidth)}`);
   L.push('> 用途：还原时**直接抄间距**，不用拿坐标手算。');
   L.push('> 「重叠」= 两条边在另一轴上的共同区间 —— 没有重叠说明是斜对角，那种距离不能当间距用。');
   L.push('');
   L.push('| 从 | 到 | 轴 | 间距 | 重叠区间 |');
   L.push('|---|---|---|---|---|');
   const nm = (id, name) => `${name || '(无名)'}${id ? ` \`${String(id).slice(0, 18)}\`` : ''}`;
-  for (const g of gaps.slice(0, limit)) L.push(`| ${nm(g.from, g.fromName)} | ${nm(g.to, g.toName)} | ${g.axis} | ${g.distance} | ${g.overlap.start}~${g.overlap.end} |`);
+  for (const g of gaps.slice(0, limit)) L.push(`| ${nm(g.from, g.fromName)} | ${nm(g.to, g.toName)} | ${g.axis} | ${dual1(g.distance, opts.designWidth, opts)} | ${g.overlap.start}~${g.overlap.end} |`);
   if (gaps.length > limit) L.push(`| … | | | 其余 ${gaps.length - limit} 条略 | |`);
+  return L.join('\n');
+}
+
+/**
+ * 两个元素是不是**同一个**（同一图层）。
+ *
+ * 优先比 `path`（蓝湖的图层路径唯一且带层级）；没有 path 时退回"矩形完全重合"——
+ * 但那条**只能当兜底**：父子层尺寸几乎重合时它认不出来，所以调用方**应该给 path**。
+ */
+function sameElement(a, b) {
+  if (a?.path && b?.path) return a.path === b.path;
+  return a === b;
+}
+
+/**
+ * `b` 是不是 `a` 的**祖先或后代**（同一棵树上的上下层关系）。
+ *
+ * ⚠️ 必须先于任何"边界重合"判定执行：阴影层/背景层几乎撑满父层，四条边全部落在容差内，
+ * 会被报成"齐平" —— 那是**子层撑满父层**，不是设计上的对齐决策，抄进 CSS 毫无意义。
+ * 实测（示例弹窗）：`Section - ModalDialogCard`(depth1) 与它的 `:shadow`(depth2) 尺寸几乎相同，
+ * 一次就产出 4 条 `X 顶 ≡ X 顶` 这种"自己跟自己"。
+ */
+function isAncestor(a, b) {
+  const pa = a?.path;
+  const pb = b?.path;
+  if (!pa || !pb) return false;
+  return pb.startsWith(`${pa}/`) || pa.startsWith(`${pb}/`);
+}
+
+/**
+ * **对齐检测**（纯函数）—— `renderGapDigest` 的第二类关系。
+ *
+ * `geometricGaps` 只报"两块之间**有距离**"的关系，报不出"两块**齐平**"（两条边重合时它是 `continue`，
+ * 因为那不算间距）。而实测里"说明块底 ≡ 头像底"这类关系跟间距一样要抄进 CSS，所以单独算。
+ *
+ * 判据（**写死在这里，别散落**）：
+ *   · 两条边的坐标差 ≤ `tol`（默认 0.5px —— 设计稿坐标是浮点，字面等于几乎不可靠）
+ *   · 另一轴"有关联"：**有重叠** 或 **间隙 ≤ `maxCrossGap`**（默认 120px）
+ *     —— 少了这一条，同一张画布上任意两块只要数值凑巧接近都会被报成"对齐"，输出就没人看了。
+ */
+export function alignedEdges(items, opts = {}) {
+  const tol = Number.isFinite(opts.tol) ? Number(opts.tol) : 0.5;
+  const maxCrossGap = Number.isFinite(opts.maxCrossGap) ? Number(opts.maxCrossGap) : 120;
+  const list = (items ?? []).filter((i) => i && Number.isFinite(i.x) && Number.isFinite(i.y) && Number.isFinite(i.w) && Number.isFinite(i.h));
+  const crossOk = (lo1, hi1, lo2, hi2) => {
+    const overlap = Math.min(hi1, hi2) - Math.max(lo1, lo2);
+    if (overlap > 0) return true;                      // 另一轴有重叠
+    const gap = Math.max(lo1, lo2) - Math.min(hi1, hi2); // 另一轴的间隙
+    return gap <= maxCrossGap;
+  };
+  const out = [];
+  for (let i = 0; i < list.length; i += 1) {
+    for (let j = i + 1; j < list.length; j += 1) {
+      const a = list[i];
+      const b = list[j];
+      // ⚠️ 自我成对 / 祖先-后代成对一律排除（实测踩过）：
+      //    · `X ≡ X`（"我的顶和我的顶齐平"）对读的人是**纯噪声**；
+      //    · 父子更常见也更隐蔽 —— 阴影层/背景层会**几乎撑满**父层，四条边全部"重合"，
+      //      输出成 `Section - ModalDialogCard 顶 ≡ Section - ModalDialogCard:shadow 顶` 这种
+      //      （截断后看着就是自己跟自己）。**子层撑满父层不是设计决策，抄进 CSS 没有意义。**
+      //    身份判定优先用 `path`（唯一且含层级）；没有 path 的老调用方退回"矩形完全重合"这一条。
+      if (sameElement(a, b) || isAncestor(a, b)) continue;
+      // 完全重合的重复图层（Figma 实例 id 会重复）之间的"对齐"没有信息量
+      if (a.x === b.x && a.y === b.y && a.w === b.w && a.h === b.h) continue;
+      const cands = [
+        ['顶', a.y, b.y, crossOk(a.x, a.x + a.w, b.x, b.x + b.w)],
+        ['底', a.y + a.h, b.y + b.h, crossOk(a.x, a.x + a.w, b.x, b.x + b.w)],
+        ['左', a.x, b.x, crossOk(a.y, a.y + a.h, b.y, b.y + b.h)],
+        ['右', a.x + a.w, b.x + b.w, crossOk(a.y, a.y + a.h, b.y, b.y + b.h)],
+      ];
+      for (const [label, ea, eb, ok] of cands) {
+        if (!ok) continue;
+        if (Math.abs(ea - eb) <= tol) out.push({ from: a, to: b, edge: label, value: round2(ea) });
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * **「间距一览」段** —— 可直接抄进 CSS 的块间关系（**§4.2**）。
+ *
+ * ⚠️ 几何**一律复用 `geometricGaps()`**（region 用的同一套纯函数）：同一个稿子换个入口看
+ *    必须得到同一个答案。本仓库刚因为"同一个 bug 出现两次"做过一次重构（CHANGELOG 0.4.1），
+ *    **不许再写第二份间距实现**。
+ *
+ * ⚠️ 这是本批最险的一段：**几何算错的输出比没有更糟**（AI 会照抄）。
+ *    所以：① 两类关系的判据都写死在上面的纯函数里；② 名字取不到就用坐标兜底而不是瞎猜；
+ *    ③ 条数封顶，宁可少列也不列错。
+ *
+ * @param {Array<{id?:string,name?:string,x:number,y:number,w:number,h:number}>} items
+ */
+/**
+ * 「间距一览」里的**显示名**（带去歧义）。
+ *
+ * 两个坑，都会让输出"看着像自己跟自己"：
+ *   · **同名**：同名兄弟/父子层（`Section - ModalDialogCard` 与它的 `:shadow`）；
+ *   · **截断后撞车**：列宽有限只显示 22 字，长名被截到同一个前缀 —— 上面那一对截完都是
+ *     `Section - ModalDialogC`，读的人**分不清是哪两块**（实测踩过）。
+ * 撞车时补 `#d<深度>`；深度也一样就再编号。判据只看"截断后的名字是否有多个不同元素在用"。
+ */
+function makeLabeler(list) {
+  const short = (o) => String(o.name ?? `(${round2(o.x)},${round2(o.y)})`).replace(/\|/g, '\\|').slice(0, 22);
+  const identity = (it, idx) => it.path ?? `#${idx}`;
+  const users = new Map(); // 截断名 → 有几个**不同元素**在用它
+  list.forEach((it, idx) => {
+    const k = short(it);
+    if (!users.has(k)) users.set(k, new Set());
+    users.get(k).add(identity(it, idx));
+  });
+  const byId = new Map();
+  for (const it of list) if (it.id != null) byId.set(String(it.id), it);
+  const used = new Map();  // 最终名 → 已用次数（同名的再撞就编号）
+  const cache = new Map();
+  const of = (it, idx) => {
+    if (!it) return '?';
+    // ⚠️ 身份键**必须**按元素取：没有 path 时退回 `#下标`，而 `of()` 常被直接传元素调用 ——
+    //    若这里不补 `indexOf`，所有无 path 的元素会共用 `#0` 这一个键，标签**全部变成第一个元素的名字**
+    //    （实测踩过：齐平段一夜之间全成了"头像 ≡ 头像"）。
+    const i = idx ?? list.indexOf(it);
+    const key = identity(it, i);
+    if (cache.has(key)) return cache.get(key);
+    let out = short(it);
+    if ((users.get(out)?.size ?? 0) > 1) out = `${out} #d${it.depth ?? '?'}`;
+    const n = (used.get(out) ?? 0) + 1;
+    used.set(out, n);
+    if (n > 1) out = `${out}(${n})`;
+    cache.set(key, out);
+    return out;
+  };
+  return {
+    of,
+    /** 间距行只带 `from`/`to`（= item.id）与名字 —— 用 id 找回元素，走同一套去歧义。 */
+    byRef: (id, name) => {
+      const it = id != null ? byId.get(String(id)) : null;
+      if (it) return of(it, list.indexOf(it));
+      return String(name ?? '?').replace(/\|/g, '\\|').slice(0, 22);
+    },
+  };
+}
+
+export function renderGapDigest(items, opts = {}) {
+  const designWidth = Number(opts.designWidth);
+  const limit = Number.isFinite(opts.limit) ? Number(opts.limit) : 24;
+  // ⚠️ 进来先保证**每个元素都有唯一 id**：`geometricGaps` 只会把 `from`/`to`（= id）带回来，
+  //    没有 id 时它给的是 `null`，间距行就只能退回**原始截断名** —— 同名/截断撞车时会显示成
+  //    两个一模一样的名字（"看着像自己跟自己"）。有 id 才能走同一套去歧义。
+  const list = (items ?? [])
+    .filter((i) => i && Number.isFinite(i.x) && Number.isFinite(i.y) && Number.isFinite(i.w) && Number.isFinite(i.h))
+    .map((it, i) => ({ ...it, id: it.id ?? it.path ?? `#${i}` }));
+  if (list.length < 2) return '';
+  const gapsAll = geometricGaps(list, { maxDistance: opts.maxDistance });
+  // ⚠️ **0 距离（贴边）不计入间距表**：实测 610 层的稿会产出 315 条，绝大多数是"文字碎片紧挨着"
+  //    的 0px 行 —— 它们把真正的间距（2/6/8/20px 那种竖向节奏）**全挤出了前几行**，
+  //    表就失去"可抄 CSS"的意义了。贴边是"相邻"，不是"间距"。表头会写明这条口径。
+  //    排序也改成**按距离**（最紧的在前），否则"先 x 轴后 y 轴"会让竖向节奏永远排在横向后面。
+  const gaps = gapsAll.filter((g) => g.distance > 0).sort((a, b) => a.distance - b.distance);
+  const aligns = alignedEdges(list, opts);
+  if (gaps.length === 0 && aligns.length === 0) return '';
+
+  const lab = makeLabeler(list);
+  const L = [];
+  L.push(`## 间距一览（可抄 CSS —— ${unitBasisNote(designWidth)}）`);
+  L.push('> 间距只在**另一轴有重叠**的相邻两块之间算（斜对角的距离不是间距）；↕ = 上下关系，↔ = 左右关系。');
+  L.push('> **贴边（0px）不计入** —— 那是"相邻"不是"间距"，列进来会把真正的间距挤出前几行。按距离从紧到松排。');
+  L.push('> `≡` 是**齐平**（两条边重合，容差 0.5px）—— 这一类不是间距，但同样要抄。');
+  if (gaps.length > 0) {
+    L.push('');
+    L.push(`### 间距（${gaps.length} 条）`);
+    for (const g of gaps.slice(0, limit)) {
+      const arrow = g.axis === 'y' ? '↕' : '↔';
+      L.push(`- ${lab.byRef(g.from, g.fromName)} ${arrow} ${lab.byRef(g.to, g.toName)} = **${dual1(g.distance, designWidth, opts)}**`);
+    }
+    if (gaps.length > limit) L.push(`- … 其余 ${gaps.length - limit} 条略（用 region + gapMaxDistance 收窄）`);
+  }
+  if (aligns.length > 0) {
+    L.push('');
+    L.push(`### 齐平（${aligns.length} 处）`);
+    for (const a of aligns.slice(0, limit)) {
+      L.push(`- ${lab.of(a.from)} ${a.edge} ≡ ${lab.of(a.to)} ${a.edge}（${round2(a.value)}px）`);
+    }
+    if (aligns.length > limit) L.push(`- … 其余 ${aligns.length - limit} 处略`);
+  }
   return L.join('\n');
 }
 
@@ -3214,7 +3404,7 @@ export function renderBlocks(blocks, meta = {}, opts = {}) {
   const noiseCount = blocks.filter((b) => b.noise).length;
   const main = opts.includeNoise ? blocks : blocks.filter((b) => !b.noise);
 
-  L.push(`# 块级清单 — ${titleName(meta)}（${meta.width ?? '?'}×${meta.height ?? '?'}）`);
+  L.push(`# 块级清单 — ${titleName(meta)}（${meta.width ?? '?'}×${meta.height ?? '?'}）${metaSuffix(meta)}`);
   L.push('');
   L.push(`共 **${blocks.length}** 块：` + (Object.entries(counts).map(([k, v]) => `${BLOCK_KINDS[k] ?? k} ${v}`).join(' / ') || '—'));
   if (noiseCount > 0) {
@@ -3229,11 +3419,7 @@ export function renderBlocks(blocks, meta = {}, opts = {}) {
     const r = b.radius
       ? (b.radius.pill ? `${b.radius.max}(全圆)` : String(b.radius.max))
       : '—';
-    const bg = b.bg
-      ? (b.bg.stops?.length > 1
-        ? b.bg.stops.map((s) => `${s.hex}${s.alpha < 1 ? `@${Math.round(s.alpha * 100)}%` : ''}`).join('→')
-        : `${b.bg.hex}${b.bg.alpha < 1 ? `@${Math.round(b.bg.alpha * 100)}%` : ''}`)
-      : '无';
+    const bg = bgText(b.bg);
     const op = b.opacity != null && b.opacity < 1 ? String(b.opacity) : '—';
     const bd = b.border
       ? `${b.border.color ?? '(无颜色)'} ${b.border.width}px${b.border.single ? `(${b.border.single})` : ''}`
@@ -3244,7 +3430,7 @@ export function renderBlocks(blocks, meta = {}, opts = {}) {
       ? `${b.font.size ?? '?'}/${b.font.weight ?? '?'}${b.color ? `/${b.color}` : ''}`
       : '—';
     const fam = b.font?.family ? shortFamily(b.font.family) : '—';
-    L.push(`| ${i + 1} | ${BLOCK_KINDS[b.kind] ?? b.kind} | ${b.name ?? ''} | ${b.x},${b.y} | ${b.w}×${b.h} | ${r} | ${bg} | ${op} | ${bd} | ${(b.text ?? '').slice(0, 18)} | ${f} | ${fam} | ${metricsText(b.font)} |`);
+    L.push(`| ${i + 1} | ${BLOCK_KINDS[b.kind] ?? b.kind} | ${b.name ?? ''} | ${b.x},${b.y} | ${opts.dualUnits ? dualUnits(b.w, b.h, meta.width, opts) : `${b.w}×${b.h}`} | ${r} | ${bg} | ${op} | ${bd} | ${(b.text ?? '').slice(0, 18)} | ${f} | ${fam} | ${metricsText(b.font)} |`);
   });
   if (main.length > limit) L.push(`| … | 其余 ${main.length - limit} 块略（可用 --region / --limit 收窄） | | | | | | | | | |`);
 
@@ -3258,6 +3444,24 @@ export function renderBlocks(blocks, meta = {}, opts = {}) {
     }
     if (withBorder.length > 24) L.push(`- … 其余 ${withBorder.length - 24} 处略`);
   }
+
+  // 间距一览（§4.2）：块与块"差多少"直接给出来，省掉拿坐标手算。
+  // ⚠️ 几何复用 `geometricGaps`（region 用的同一套纯函数）—— **不写第二份间距实现**。
+  const digest = renderGapDigest(
+    main.map((b) => ({ id: b.path ?? b.name, name: b.name, path: b.path, depth: b.depth, x: b.x, y: b.y, w: b.w, h: b.h })),
+    { ...opts, designWidth: meta.width },
+  );
+  if (digest) {
+    L.push('');
+    L.push(digest);
+  }
+
+  L.push('');
+  L.push(resultFooter(L.join('\n'), {
+    what: `本稿 ${blocks.length} 块`,
+    shown: main.length > shown.length ? `本次列了 ${shown.length} 块` : null,
+    next: '改完前端用 `lanhu_verify_blocks` 验收（覆盖面比 verify_spec 大，含可直接抄的建议改法）；缺区域用 `region=...`。',
+  }));
   return L.join('\n');
 }
 
@@ -3266,6 +3470,23 @@ export function renderBlocks(blocks, meta = {}, opts = {}) {
  * ========================================================================== */
 
 function kb(str) { return `${(Buffer.byteLength(str, 'utf8') / 1024).toFixed(2)}KB`; }
+
+/**
+ * 结果尾注（**§4.5 下一步提示 + §4.6 体积/落盘提示**）。
+ *
+ * ⚠️ 体积按**正文**算（`body`，不含本尾注自身）—— 把一个"包含了本行长度"的数字报出去，
+ * 数字会随提示文字自己变化，既没意义也无法核对。
+ * ⚠️ 落盘路径只在**真有**（`format=full`）时才打；没有就不提，不编一个路径。
+ */
+function resultFooter(body, opts = {}) {
+  const bits = [`≈${kb(body)}`];
+  if (opts.what) bits.push(opts.what);
+  if (opts.shown) bits.push(opts.shown);
+  if (opts.filePath) bits.push(`完整 ${opts.layered ? `${opts.layered} 层` : '数据'}已落盘 \`${opts.filePath}\`（用 region/kind 精确取，**勿全文读**）`);
+  const next = opts.next
+    ?? '还原布局优先用 `lanhu_read_blocks`；缺哪个区域用 `region=...` 精确取（配 `gapMaxDistance` 过滤间距），别拿 `format=full` 的 JSON 自己写脚本解析。';
+  return `— ${bits.join('；')}\nℹ️ ${next}`;
+}
 
 /**
  * 字体族短名 —— 表格列宽有限，"Alibaba PuHuiTi 2.0" 这种长名会撑爆整张表。
@@ -3288,15 +3509,112 @@ function shortFamily(name) {
  *
  * 描边 role 也在这里标出：只有描边的图层（glow / 分割线）不该被当成底色。
  */
+/**
+ * 区块（`buildBlocks` 的块级模型）的填充文案 —— 与图层侧的 `fillText` **同口径**。
+ *
+ * 两侧输入形状不同（图层给 `colors[]`（带 r/g/b/a），区块给 `bg {hex, alpha, stops[]}`），
+ * 所以函数是两个；但**半透明色的 rgba 后缀只走 `rgbaSuffix()` 一处** —— hex→rgb 复用 `parseColor()`。
+ * 这样 `#574af4@10% (rgba(87,74,244,.1))` 这个格式在 summary / blocks / region 三张表里必然一致。
+ */
+function bgText(bg) {
+  if (!bg) return '无';
+  const one = (hex, alpha) => {
+    if (typeof alpha !== 'number' || alpha >= 1) return hex;
+    return `${hex}@${Math.round(alpha * 100)}%${rgbaSuffix({ ...parseColor(hex), a: alpha })}`;
+  };
+  if (bg.stops?.length > 1) return bg.stops.map((s) => one(s.hex, s.alpha)).join('→');
+  return one(bg.hex, bg.alpha);
+}
+
 function fillText(colors) {
   const arr = colors ?? [];
   const grads = arr.filter((c) => c.role === 'gradient');
-  const one = (c) => `${rgbHex(c)}${c.a < 1 ? `@${Math.round(c.a * 100)}%` : ''}`;
+  const one = (c) => `${rgbHex(c)}${c.a < 1 ? `@${Math.round(c.a * 100)}%` : ''}${rgbaSuffix(c)}`;
   if (grads.length > 1) return grads.map(one).join('→');
   // 保持既有兜底顺序（数组里第一个 fill，再退到首个色）——只是把渐变 stop 提到最前。
   const c = grads[0] ?? arr.find((x) => x.role === 'fill') ?? arr[0];
   if (!c) return '—';
   return `${c.role === 'border' ? '描边 ' : ''}${one(c)}`;
+}
+
+/**
+ * 半透明色值的「可粘贴形式」后缀 —— ` (rgba(87,74,244,.1))`；不透明给空串。
+ *
+ * ⚠️ **复用 `rgbaString()`**（verify 的颜色解析用它把 getComputedStyle 的值解析回来）——
+ * 不要再写一个 rgba 转换：两份实现必然漂移，而这类"看着差不多"的漂移正是假 ❌ 的来源。
+ * 只在 `a < 1` 时附加：不透明色加 ` (rgb(…))` 纯属噪音。
+ */
+function rgbaSuffix(c) {
+  if (!c || !(typeof c.a === 'number' && c.a < 1)) return '';
+  return ` (${rgbaString(c)})`;
+}
+
+/**
+ * 双单位换算比例（**§3.2**）：设计稿宽度决定 —— 基准 750，即 `rpx = px × 750 / 画板宽`。
+ * 宽 375 → ×2；宽 750 → ×1；H5/PC 端按 1:1 用 px（那就是"不换算"）。
+ *
+ * ⚠️ 公式与 `toTarget(px, 'mini', …)` **同源**（那个是 verify 用的）。这里只做"比例 + 说明"，
+ * 数值换算一律走 `toTarget`，避免出现第二份换算实现。
+ */
+function unitScale(designWidth, base = 750) {
+  const w = Number(designWidth);
+  if (!Number.isFinite(w) || w <= 0) return null;
+  return base / w;
+}
+
+/** 换算基准的一句话说明（让输出里能看出用的是哪个基准，而不是一个孤零零的数字）。 */
+export function unitBasisNote(designWidth, base = 750) {
+  const s = unitScale(designWidth, base);
+  if (s === null) return '画板宽度未知 → 只给 px（无法换算 rpx）';
+  if (Math.abs(s - 1) < 1e-9) return `按画板宽 ${designWidth}（基准 ${base}）→ **1:1**，rpx 与 px 同值`;
+  return `按画板宽 ${designWidth}（基准 ${base}）→ **×${round2(s)}**`;
+}
+
+/**
+ * 双单位尺寸：`120×152px / 240×304rpx`。画板宽度拿不到时**只给 px**（不编一个比例）。
+ * @param {number} w @param {number} h @param {number} designWidth
+ */
+export function dualUnits(w, h, designWidth, opts = {}) {
+  const px = `${round2(w)}×${round2(h)}px`;
+  if (opts.dualUnits === false) return px;
+  const s = unitScale(designWidth, opts.rpxBase);
+  if (s === null) return px;
+  // ⚠️ 单位只在末尾出现一次：`240×304rpx`，不是 `240rpx×304rpx`（后者是拼接时想当然的产物，实测踩过）
+  const n = (v) => String(toTarget(v, 'mini', { designWidth, rpxBase: opts.rpxBase })).replace(/rpx$/, '');
+  return `${px} / ${n(w)}×${n(h)}rpx`;
+}
+
+/** 单个长度的双单位：`29.9px / 60rpx`。 */
+function dual1(px, designWidth, opts = {}) {
+  const v = `${round2(px)}px`;
+  const s = unitScale(designWidth, opts.rpxBase);
+  if (s === null) return v;
+  return `${v} / ${toTarget(px, 'mini', { designWidth, rpxBase: opts.rpxBase })}`;
+}
+
+/**
+ * 标题行的溯源后缀（**§4.7**）：` ｜version=abc12345｜更新于 2026-09-29`。
+ *
+ * ⚠️ **拿不到就不打**（本项目铁律：不编）。读**旧版**时不能把"最新版的时间"当成这版的时间 ——
+ * 那种"看着有、其实指错"的信息比没有更糟。
+ */
+export function metaSuffix(meta = {}) {
+  const parts = [];
+  const vid = meta.versionId ?? meta.version;
+  if (vid) parts.push(`version=${String(vid).slice(0, 8)}`);
+  // ⚠️ 蓝湖给的是 **RFC-2822 原文**（`Thu, 17 Sep 2026 10:00:00 GMT`）——
+  //    直接 `slice(0,10)` 会切出 `Thu, 17 Se` 这种残句（实测踩过）。用 parseRfc2822 归一成 ISO 再取日期；
+  //    解析不出来就**原样给全**（宁可用长一点，也不给一个看着像日期、其实是半句的东西）。
+  const rawAt = meta.latestVersionAt ? String(meta.latestVersionAt).trim() : null;
+  const isoAt = rawAt ? parseRfc2822(rawAt) : null;
+  const at = isoAt && /^\d{4}-\d{2}-\d{2}/.test(isoAt) ? isoAt.slice(0, 10) : (isoAt || null);
+  if (at) {
+    if (meta.versionIsLatest === false) parts.push(`最新版更新于 ${at}（你读的是旧版）`);
+    else parts.push(`更新于 ${at}`);
+  } else if (meta.versionIsLatest === false) {
+    parts.push('（旧版，更新时间未取到）');
+  }
+  return parts.length ? ` ｜${parts.join('｜')}` : '';
 }
 
 /**
@@ -3314,7 +3632,7 @@ function metricsText(font) {
 /** tokens 模式：只给色板 / 字号 / 圆角统计。 */
 export function renderTokens(tokens, meta = {}) {
   const L = [];
-  L.push(`# 设计 Token — ${titleName(meta)}（${meta.width ?? '?'}×${meta.height ?? '?'}）`);
+  L.push(`# 设计 Token — ${titleName(meta)}（${meta.width ?? '?'}×${meta.height ?? '?'}）${metaSuffix(meta)}`);
   L.push('');
   L.push(`## 色板（${tokens.colors.length} 个唯一色）`);
   L.push('| 色值 | rgb | 出现次数 |');
@@ -3333,13 +3651,18 @@ export function renderTokens(tokens, meta = {}) {
   L.push('');
   L.push(`## 圆角`);
   L.push(tokens.radii.map((r) => `${r.radius}px×${r.count}`).join('  ') || '—');
+  L.push('');
+  L.push(resultFooter(L.join('\n'), {
+    what: `本稿 ${tokens.colors.length} 个唯一色 / ${tokens.fontSizes.length} 种字号`,
+    next: '要还原到具体某块/某区域，用 `lanhu_read_blocks` 或 `region=...` —— 本表只有统计值，没有位置。',
+  }));
   return L.join('\n');
 }
 
 /** summary 模式：token + 文本层清单（默认紧凑，控制在 4KB 内）。 */
-export function renderSummary({ detail, layers, tokens, meta, maxTextLayers = 36 }) {
+export function renderSummary({ detail, layers, tokens, meta, maxTextLayers = 36, dualUnits: dualOn = false, filePath = null }) {
   const L = [];
-  L.push(`# ${detail.name || titleName(meta) || '设计稿'}（${meta.width}×${meta.height}）`);
+  L.push(`# ${detail.name || titleName(meta) || '设计稿'}（${meta.width}×${meta.height}）${metaSuffix(meta)}`);
   L.push(`图层 ${layers.length} 个 | 文本层 ${layers.filter((l) => l.text).length} 个 | 导出图 ${layers.filter((l) => l.hasImage).length} 个`);
   L.push('');
 
@@ -3354,9 +3677,16 @@ export function renderSummary({ detail, layers, tokens, meta, maxTextLayers = 36
   // 关键容器：非文本的布局块（搜索框 / 卡片 / 按钮底…）。
   // 布局还原第一手就是容器 —— 只给文本层不够（实测反馈 P5：形状容器要自己父子相减手算内边距）。
   // 只留**有样式**的（带填充或圆角）：iPhoneX / Notch / Section 这类无样式的结构层是噪音。
+  // ⚠️ **但 `hasImage` 必须放行**（§4.1）：切图块（头像这类）**天然没有填充也没有圆角**，
+  //    被这条过滤掉之后，AI 只能看到"缺东西"→ 转 `format=full` → 自己写脚本解析（实测就是这么绕的弯路）。
+  //    实测：头像 120×152 就是这么被滤掉的，而它恰恰是最容易做错高度的那一块。
+  // ⚠️ 排除 `depth === 0`（**画板自己**）：它的 x/y 是**画布绝对坐标**（实测 -12638 这种大负数），
+  //    而其它层是画板相对坐标 —— 混在一张表里既会多一行没用的"容器"，更要命的是拿它算间距会得到
+  //    `12279px / 24558rpx` 这种**垃圾数字**，而 AI 会照抄（实测踩过）。画板尺寸标题行里已经有了。
   const boxes = layers
+    .filter((l) => l.depth !== 0)
     .filter((l) => l.visible && !l.text && l.w >= 40 && l.h >= 18)
-    .filter((l) => l.radius !== null || l.colors.some((c) => c.role === 'fill'))
+    .filter((l) => l.radius !== null || l.colors.some((c) => c.role === 'fill') || l.hasImage)
     .sort((a, b) => (a.y - b.y) || (a.x - b.x));
   const maxBoxes = 14;
   // 半透明图层预警：漏读 opacity 会把「渐隐的厚度层 / 底纹」做成生硬实心块（实测踩过）。
@@ -3374,10 +3704,13 @@ export function renderSummary({ detail, layers, tokens, meta, maxTextLayers = 36
     const bins = b.inset ? `${b.inset.left}/${b.inset.top}/${b.inset.right}/${b.inset.bottom}` : '—';
     const bnm = String(b.name).replace(/\|/g, '\\|').slice(0, 26);
     // 填充列：多段渐变打**全部** stop；描边 role 标出（只有描边的 glow 型图层不该被当底色）。
-    const bfill = fillText(b.colors);
+    // 切图块（hasImage）没有填充 —— 显式标 `切图`：否则一行"填充=— 圆角=—"看着像噪音，
+    // 没人知道它为什么会在表里（§4.1 放行 hasImage 之后，这些块会进来）。
+    const bfillRaw = fillText(b.colors);
+    const bfill = bfillRaw === '—' && b.hasImage ? '切图' : bfillRaw;
     const bopRaw = b.effectiveOpacity ?? b.opacity ?? 1;
     const bop = bopRaw < 1 ? String(bopRaw) : '—';
-    L.push(`| ${bnm} | ${b.x},${b.y} | ${b.w}×${b.h} | ${b.radius ? `${b.radius.max}px` : '—'} | ${bfill} | ${bop} | ${bins} |`);
+    L.push(`| ${bnm} | ${b.x},${b.y} | ${dualOn ? dualUnits(b.w, b.h, meta.width) : `${b.w}×${b.h}`} | ${b.radius ? `${b.radius.max}px` : '—'} | ${bfill} | ${bop} | ${bins} |`);
   }
   if (boxes.length > maxBoxes) L.push(`| … | 其余 ${boxes.length - maxBoxes} 个容器略（用 --region 按区域精确取） | | | | |`);
   L.push('');
@@ -3392,12 +3725,32 @@ export function renderSummary({ detail, layers, tokens, meta, maxTextLayers = 36
     const c = t.colors.find((x) => x.role === 'text') ?? t.colors[0];
     const txt = String(t.text).replace(/\|/g, '\\|').replace(/\n/g, '⏎').slice(0, 40);
     const fam = t.font?.family ? shortFamily(t.font.family) : '—';
-    L.push(`| ${txt} | ${t.x},${t.y} | ${t.w}×${t.h} | ${t.font?.size ?? '?'}px/${t.font?.weight ?? '?'} | ${fam} | ${metricsText(t.font)} | ${c ? rgbHex(c) : '—'} |`);
+    L.push(`| ${txt} | ${t.x},${t.y} | ${dualOn ? dualUnits(t.w, t.h, meta.width) : `${t.w}×${t.h}`} | ${t.font?.size ?? '?'}px/${t.font?.weight ?? '?'} | ${fam} | ${metricsText(t.font)} | ${c ? rgbHex(c) : '—'} |`);
   }
   if (texts.length > maxTextLayers) L.push(`| … | 其余 ${texts.length - maxTextLayers} 个文本层略（用 format=full 取全量） | | | |`);
 
-  const out = L.join('\n');
-  return out;
+  // 间距一览（§4.2）：容器与文本层**放在一起**算 —— 跨容器的关系（如「说明块底 ≡ 头像底」）才出得来；
+  // 只算同容器内的兄弟块，恰恰漏掉实测里最难手算的那几个（还要跨容器比 y）。
+  const digest = renderGapDigest(
+    [...boxes.slice(0, maxBoxes), ...texts.slice(0, maxTextLayers)].map((l) => ({
+      id: l.path ?? l.name, name: l.name, path: l.path, depth: l.depth, x: l.x, y: l.y, w: l.w, h: l.h,
+    })),
+    { designWidth: meta.width },
+  );
+  if (digest) {
+    L.push('');
+    L.push(digest);
+  }
+
+  L.push('');
+  L.push(resultFooter(L.join('\n'), {
+    what: `本稿 ${layers.length} 层`,
+    shown: `本次列了 ${Math.min(boxes.length, maxBoxes)} 个容器 / ${Math.min(texts.length, maxTextLayers)} 个文本层`,
+    filePath,
+    layered: layers.length,
+    next: '还原布局优先用 `lanhu_read_blocks`（一次拿全，比本摘要更适合照抄）；缺哪个区域用 `region=...` 精确取（配 `gapMaxDistance`）。',
+  }));
+  return L.join('\n');
 }
 
 /**
@@ -3427,7 +3780,7 @@ export function renderRegion(layers, opts = {}) {
 
   const L = [];
   L.push(`# 区域图层 y∈[${y0}, ${y1}] x∈[${x0}, ${x1}]（命中 ${hit.length} 层${hit.length > limit ? `，**只列前 ${limit}** —— 传更大的 limit（工具）/ --limit（CLI）可看全量` : ''}）`);
-  L.push(`> 内边距 = 该层相对**父容器**的四边距离（已算好，×2 即 rpx）`);
+  L.push(`> 内边距 = 该层相对**父容器**的四边距离（已算好）；尺寸列的 rpx 换算：${unitBasisNote(opts.designWidth)}`);
   L.push('> ⚠️ 「不透明」= 图层 opacity（已累乘祖先链），与填充后的 `@xx%`（**填充色** alpha）是两回事，独立叠加，两者都要还原。');
   if (mapped) {
     L.push(`> 📐 坐标已映射：设计稿 [${mb.x0},${mb.y0},${mb.x1},${mb.y1}] → 目标 [${tb.x0},${tb.y0},${tb.x1},${tb.y1}]；`
@@ -3449,7 +3802,7 @@ export function renderRegion(layers, opts = {}) {
       `d${l.depth} ${String(l.name).replace(/\|/g, '\\|').slice(0, 22)}`,
       l.type,
       `${l.x},${l.y}`,
-      `${l.w}×${l.h}`,
+      `${dualUnits(l.w, l.h, opts.designWidth)}`,
     ];
     if (mapped) cells.push(`${toMx(l.x)},${toMy(l.y)}`, `${round2(l.w * sx)}×${round2(l.h * sy)}`);
     cells.push(
@@ -3493,6 +3846,11 @@ export async function readDesign(args = {}) {
     name: artboard.name ?? detail.name,
     width: round2(artboard.frame?.width ?? detail.width),
     height: round2(artboard.frame?.height ?? detail.height),
+    // 溯源（§4.7）：设计稿会更新，标题行带上版本与更新时间，验收/复现时不必再查一遍。
+    // ⚠️ 一律 `?? null` 传原值 —— 有没有由 metaSuffix() 判断，**拿不到就不打**（不编）。
+    versionId: detail.versionId ?? null,
+    versionIsLatest: detail.versionIsLatest ?? null,
+    latestVersionAt: detail.latestVersionAt ?? null,
     device: tree.meta?.device,
     assets: Array.isArray(tree.assets) ? tree.assets.length : 0,
   };
@@ -3577,7 +3935,9 @@ export async function readDesign(args = {}) {
       ro.mapBox = box(args.mapBox, 'mapBox');
       ro.toBox = box(args.toBox, 'toBox');
     }
-    const r = renderRegion(layers, ro);
+    // region 输出**默认给双单位**（§4.3）：这一屏就是拿去抄 CSS 的，换算别留给调用方。
+    // 换算基准由**画板宽度**决定，不写死 ×2（§3.2）—— 见 renderRegion 里的 unitBasisNote。
+    const r = renderRegion(layers, { ...ro, designWidth: meta.width });
     // B4 · 几何间距：只在**另一轴有重叠**的元素之间算最近边距（斜对角的距离在还原时没有意义）。
     // 过滤条件与 renderRegion 保持一致（可见 + 落在区域 + 宽度阈值），否则间距会算到区域外的元素上。
     // ⚠️ 默认值必须与 renderRegion **逐字一致**（-Infinity/Infinity）：
@@ -3591,7 +3951,12 @@ export async function readDesign(args = {}) {
       .filter((l) => l.y >= ry0 && l.y <= ry1 && l.x >= rx0 && l.x <= rx1 && l.w >= rminW)
       .map((l) => ({ id: l.id, name: l.name, x: l.x, y: l.y, w: l.w, h: l.h }));
     const gaps = geometricGaps(hits, { maxDistance: args.gapMaxDistance });
-    const text = gaps.length ? `${r.text}\n\n${renderGaps(gaps)}` : r.text;
+    const body = gaps.length ? `${r.text}\n\n${renderGaps(gaps, 60, { designWidth: meta.width })}` : r.text;
+    const shownN = ro.limit ?? 80;
+    const text = `${body}\n\n${resultFooter(body, {
+      what: `命中 ${r.count} 层${r.count > shownN ? `（本次列了前 ${shownN} 层，传更大的 limit 看全量）` : ''}`,
+      next: '间距直接用上表，**不用拿坐标手算**；范围再窄一点就收小 `region`，或用 `minWidth` 滤掉碎片。',
+    })}`;
     return {
       ...base, format: 'region', regionCount: r.count, gaps, gapCount: gaps.length,
       text, textBytes: Buffer.byteLength(text, 'utf8'),
@@ -3618,11 +3983,12 @@ export async function readDesign(args = {}) {
     fs.writeFileSync(file, JSON.stringify({
       meta, tokens, layers, assets: tree.assets ?? [], fetchedAt: new Date().toISOString(),
     }, null, 2));
-    const text = renderSummary({ detail, layers, tokens, meta });
+    // full 的正文就是 summary，但**落盘路径一并带上**（§4.6：让 AI 知道"全量在哪、别全文读"）。
+    const text = renderSummary({ detail, layers, tokens, meta, dualUnits: Boolean(args.dualUnits), filePath: file });
     return { ...base, format: 'full', filePath: file, fileBytes: fs.statSync(file).size, text, textBytes: Buffer.byteLength(text, 'utf8') };
   }
 
-  const text = renderSummary({ detail, layers, tokens, meta });
+  const text = renderSummary({ detail, layers, tokens, meta, dualUnits: Boolean(args.dualUnits) });
   return { ...base, format: 'summary', text, textBytes: Buffer.byteLength(text, 'utf8') };
 }
 
@@ -3671,6 +4037,10 @@ export async function readBlocks(args = {}) {
     name: artboard.name ?? detail.name,
     width: round2(artboard.frame?.width ?? detail.width),
     height: round2(artboard.frame?.height ?? detail.height),
+    // 溯源（§4.7）：与 readDesign 同口径 —— 拿不到就不打（由 metaSuffix 判断）
+    versionId: detail.versionId ?? null,
+    versionIsLatest: detail.versionIsLatest ?? null,
+    latestVersionAt: detail.latestVersionAt ?? null,
     // 画板原点：块坐标是"相对画板"的，比对层换算坐标必须减掉它
     // （实测画板 left 是 -10279 这种大负数，直接用块的绝对坐标会和页面完全错位）
     origin: {
@@ -3682,7 +4052,7 @@ export async function readBlocks(args = {}) {
   };
   const kindCounts = {};
   for (const b of blocks) kindCounts[b.kind] = (kindCounts[b.kind] ?? 0) + 1;
-  let text = renderBlocks(blocks, meta, { limit: args.limit, includeNoise: args.includeNoise });
+  let text = renderBlocks(blocks, meta, { limit: args.limit, includeNoise: args.includeNoise, dualUnits: Boolean(args.dualUnits) });
   if (acct) {
     text += `\n\n— 账号：**${acct}**${picked.by === 'explicit' ? '（显式指定）' : `（自动判定 · ${picked.by}）`}`;
   }
@@ -5492,6 +5862,7 @@ async function cmdRead({ args, cookie }) {
     limit: args.limit === undefined ? undefined : Number(args.limit),
     mapBox: args['map-box'], toBox: args['to-box'],
     version: args.version, gapMaxDistance: args['gap-max-distance'] === undefined ? undefined : Number(args['gap-max-distance']),
+    dualUnits: Boolean(args['dual-units']),
     dds: Boolean(args.dds),
     cookie, account: args.account, outDir: args.out,
   });
@@ -5512,6 +5883,7 @@ async function cmdBlocks({ args, cookie }) {
     minWidth: args['min-width'],
     limit: args.limit === undefined ? undefined : Number(args.limit),
     includeNoise: Boolean(args.all),
+    dualUnits: Boolean(args['dual-units']),
     version: args.version,
     cookie, account: args.account,
   });
@@ -5797,6 +6169,9 @@ const USAGE = `dsh-lanhu —— 蓝湖设计稿读取
            读原型的页面树 + 命中页正文（**先不带 --page-id 看树**，一份原型常有上百个节点）
            --page-id 跨版本稳定，推荐；正文取自页面 HTML（data.js 里常为空）
   read/blocks/product-doc/slices 均可加 --version <版本id>（默认 latest；给错会报错，不静默回退）
+  read/blocks 可加 --dual-units：**宽表**的尺寸列也给双单位（形如 120×152px / 240×304rpx）
+             换算比按**画板宽度**算（rpx = px × 750 ÷ 画板宽；宽 375 的稿即 ×2），输出里会写明基准。
+             「间距一览」与 region 输出**始终**双单位 —— 那两处就是要直接抄进 CSS 的。
   log      [--limit N]                   插件使用记录（工具调用 / 面板读取）
   accounts                                列账号（公司 / 团队 / 有效期 / 默认）
            --add --alias <别名> [--company "<公司>"] [--note "…"] [--cookie "<粘贴>" | --clipboard]

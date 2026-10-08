@@ -20,7 +20,7 @@
 > **没有它**：AI 写页面前只能看设计稿**截图**，色值和字号靠视觉估算（OCR 小字经常错）。
 > **有了它**：设计稿的真实数值直接进上下文 —— 等于把「设计标注」喂给模型；还能反过来拿它**自动验收**页面还原度。
 
-**版本 `0.4.4`**（见 [CHANGELOG](https://github.com/LoktLin/dsh-lanhu/blob/main/CHANGELOG.md)） · MIT · 已发布到 npm：[`dsh-lanhu`](https://www.npmjs.com/package/dsh-lanhu)
+**版本 `0.5.0`**（见 [CHANGELOG](https://github.com/LoktLin/dsh-lanhu/blob/main/CHANGELOG.md)） · MIT · 已发布到 npm：[`dsh-lanhu`](https://www.npmjs.com/package/dsh-lanhu)
 适用于 [DeepSeek Harness](https://github.com/deepseek-ai)（DSH）Web GUI，需要 **Node ≥ 20**。自带 15 个原生工具 + 侧边面板 + CLI。
 
 > ⚠️ **免责与数据说明**
@@ -46,7 +46,7 @@
 | **侧边面板** | 块级 / 账号 / 记录，三个 Tab，不用敲命令 |
 | **多账号** | 一账号一套 Cookie；贴链接自动判归属（索引命中零请求） |
 | **零运行时依赖** | 真机验收才需要 `puppeteer-core`（`optionalDependencies`，不装也能用） |
-| **离线自检 611 项** | 秒级、零网络；改完代码先跑它（另有**文档绊线** `test/readme-test.mjs`：生成块 / `docs/` 链接与孤立文件 / 版本号五处 / 发布说明格式 / 写死的数字） |
+| **离线自检 651 项** | 秒级、零网络；改完代码先跑它（另有**文档绊线** `test/readme-test.mjs`：生成块 / `docs/` 链接与孤立文件 / 版本号五处 / 发布说明格式 / 写死的数字） |
 
 ---
 
@@ -193,6 +193,7 @@
 | `toBox` | `string` | 否 | — | 配合 region：目标参照框 "X0,Y0,X1,Y1"（如本地自绘 SVG 的内容 bbox）。x/y 各自独立缩放（非等比），长宽比不同也能对 |
 | `version` | `string` | 否 | — | 版本 id（默认取最新版 latest）。**设计稿会更新，不指定版本时"代码与稿子是否同一版"无从判断**；给了具体 id 就必须命中，命中不了会明确报错、不会静默回退到最新版。结果里的 version 字段会写明实际用了哪一版、是否最新 |
 | `gapMaxDistance` | `number` | 否 | — | 配合 region：几何间距只保留 ≤ 该值的（不传则全留）。间距=**只在另一轴有重叠**的相邻元素之间的最近边距，可直接抄进 CSS，不用拿坐标手算 |
+| `dualUnits` | `boolean` | 否 | — | 默认关闭。开启后**宽表**（关键容器 / 文本层的尺寸列）也给双单位 `120×152px / 240×304rpx`；「间距一览」与 region 输出**始终**双单位 —— 那两处就是要直接抄进 CSS 的。换算比按**画板宽度**算（rpx = px × 750 ÷ 画板宽），基准确会写在输出里 |
 | `dds` | `boolean` | 否 | — | 默认关闭。开启后额外尝试取蓝湖 **DDS（设计数据服务）** 的 schema，结果以 source:"dds" 标注。⚠️ 那是社区实测的**非官方**通道（另域 + 独立 Cookie），随时可能失效——**失败只如实记录原因，不影响常规解析结果**，也**不要把它当主路径** |
 | `account` | `string` | 否 | — | 可选：指定蓝湖账号别名（多账号场景，如 acme）。不给时会按链接里的团队 id 自动判定，再退到默认账号。先用 lanhu_accounts 看有哪些账号。 |
 
@@ -211,6 +212,7 @@
 | `limit` | `number` | 否 | — | 文本清单最多列多少块（默认 80） |
 | `includeNoise` | `boolean` | 否 | — | 是否包含系统 UI / 图形碎片块（默认折叠） |
 | `version` | `string` | 否 | — | 版本 id（默认 latest）；与 read_design 同义。设计稿更新后要复现"当时那一版"就传它 |
+| `dualUnits` | `boolean` | 否 | — | 默认关闭。开启后「尺寸」列给双单位 `120×152px / 240×304rpx`（换算比按画板宽度算）；末尾的「间距一览」始终双单位 |
 | `account` | `string` | 否 | — | 可选：指定蓝湖账号别名（多账号场景，如 acme）。不给时会按链接里的团队 id 自动判定，再退到默认账号。先用 lanhu_accounts 看有哪些账号。 |
 
 #### `lanhu_list_product_documents`

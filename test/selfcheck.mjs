@@ -45,6 +45,8 @@ const {
   renderFonts,
   renderRegion,
   renderSummary,
+  renderGapDigest,
+  alignedEdges,
   collectTokens,
   flattenArtboard,
   imageMeta,
@@ -1739,6 +1741,127 @@ group('⑨ 产品文档（A1/A2）与算法（B1~B4）');
   ok('search：三类全空 → 明说"没有匹配"（**不许零输出**）',
     empty.length === 1 && /没有匹配/.test(empty[0]), JSON.stringify(empty));
   ok('search：字段缺失时不许抛（防御性）', searchLines({}, 'kw')[0].includes('没有匹配'));
+}
+
+/* ═══════ 注入内容与工具结果优化（规划文档 2026-09-29：P0-1..P2-1） ═══════ */
+group('注入与结果优化');
+{
+  const ROOT = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const tokensEmpty = { colors: [], fontSizes: [], fontWeights: [], fontFamilies: [], radii: [] };
+  const mkLayer = (o) => ({
+    visible: true, text: null, w: 120, h: 152, x: 20, y: 20, radius: null, colors: [],
+    hasImage: true, name: '头像', effectiveOpacity: 1, opacity: 1, inset: null, font: null, type: 'image', depth: 1, ...o,
+  });
+  const sumOpts = (layers, meta = { width: 375, height: 800 }, extra = {}) => ({
+    detail: { name: 'T' }, layers, tokens: tokensEmpty, meta, ...extra,
+  });
+
+  // ── P0-1（§3.1/3.2/3.3/3.4/3.5/3.6）：注入必须教会"什么时候用哪个工具" ──
+  const hintSrc = fs.readFileSync(path.join(ROOT, 'lib', 'index.js'), 'utf8');
+  const hm = /const SYSTEM_HINT = \[([\s\S]*?)\]\.join/.exec(hintSrc);
+  ok('SYSTEM_HINT 能定位', Boolean(hm), '找不到定义 → 后面全部无从谈起');
+  const hint = hm ? hm[1] : '';
+  for (const kw of ['read_blocks', 'gapMaxDistance', 'verify_blocks', 'rpx', 'region', 'format=tokens', 'version']) {
+    ok(`注入含「${kw}」（决策树 / 换算 / 溯源）`, hint.includes(kw), `缺「${kw}」→ AI 不知道有这个能力，就会退回"summary 不够→full→自己写脚本"`);
+  }
+  ok('注入不再说「拿到 token 后」（§3.6 过时术语）', !/拿到 token/.test(hint), '会被理解成"得先拿 token 才能干活"——实际返回的是图层数值');
+  ok('注入含「以稿为准」三条硬约束（字重/间距/色值）',
+    /以稿为准/.test(hint) && /字重/.test(hint) && /alpha/.test(hint) && /实色/.test(hint), '这三条是实测踩过的坑');
+
+  // ── P0-2（§4.1）：summary 的关键容器必须放行 hasImage ──
+  const headOnly = mkLayer({});
+  const sum = renderSummary(sumOpts([headOnly, mkLayer({ name: '普通无样式层', hasImage: false, w: 200, h: 60 })]));
+  ok('summary 关键容器放行 hasImage（头像这类切图块天然无填充无圆角）',
+    /头像/.test(sum) && /120×152/.test(sum), '被滤掉的话 AI 只能拉 full + 自己写脚本 —— 实测就是这么绕的弯路');
+  ok('切图块在「填充」列标了 `切图`（否则一行 —/— 看着像噪音）', /切图/.test(sum), '标记是为了说明它为什么在表里');
+  ok('无填充无圆角**且无图**的层仍被过滤（不是把噪音全放进来）', !/普通无样式层/.test(sum), '放行 hasImage 不该捎带把结构层噪音也放了');
+
+  // ── P0-3（§4.3/4.4）：色值直出 rgba + 双单位只在该给的地方 ──
+  const semi = { role: 'fill', r: 87, g: 74, b: 244, a: 0.1 };
+  const sumC = renderSummary(sumOpts([
+    mkLayer({ name: '徽章', hasImage: false, radius: null, colors: [semi] }),
+    mkLayer({ name: '底卡', hasImage: false, radius: null, colors: [semi], x: 0, y: 200, w: 300, h: 60 }),
+  ]));
+  ok('半透明填充**同时**给 `@10%` 与 `rgba(…)`（保留原串便于回查 + 可直接粘贴）',
+    /@10%/.test(sumC) && /rgba\(87, 74, 244, 0\.1\)/.test(sumC), '只给 @10% 的话调用方还得手转一次');
+  ok('双单位默认**不**出现在宽表（免每行撑到 200+ 字符）',
+    !/rpx/.test(sumC.split('## 间距')[0]), '默认就双单位会与 §4.6 的省字节目标打架');
+  ok('「间距一览」段**始终**双单位（那一段就是要直接抄进 CSS 的）', /rpx/.test(sumC));
+  const sumD = renderSummary(sumOpts([mkLayer({})], { width: 375, height: 800 }, { dualUnits: true }));
+  ok('开了 dualUnits 宽表才给双单位（`120×152px / 240×304rpx`）',
+    /120×152px \/ 240×304rpx/.test(sumD), '开关没接上的话这条会红');
+  ok('双单位的单位只出现一次（`240×304rpx`，不是 `240rpx×304rpx`）',
+    !/rpx×/.test(sumD), '这是拼接时想当然的产物，实测踩过');
+
+  // ── P0-4（§4.2）：间距一览的数字与方向必须对 —— 用文档里的手算值当夹具 ──
+  const items = [
+    { name: '头像', x: 20, y: 20, w: 120, h: 152 },
+    { name: '姓名行', x: 160, y: 49.94, w: 100, h: 24 },
+    { name: '角色', x: 160, y: 79.94, w: 80, h: 20 },
+    { name: '说明块', x: 160, y: 120.34, w: 299, h: 51.66 },
+  ];
+  const dg = renderGapDigest(items, { designWidth: 375 });
+  ok('间距段给出「角色 ↕ 说明块 = **20.4px / 41rpx**」（=文档手算值）',
+    /角色 ↕ 说明块 = \*\*20\.4px \/ 41rpx\*\*/.test(dg), dg.slice(0, 160));
+  ok('间距段给出「姓名行 ↕ 角色 = **6px / 12rpx**」', /姓名行 ↕ 角色 = \*\*6px \/ 12rpx\*\*/.test(dg));
+  ok('间距段给出齐平「头像 底 ≡ 说明块 底」（geometricGaps 给不出、单独算的那类）',
+    /头像 底 ≡ 说明块 底/.test(dg), '这类"齐平"关系同样要抄进 CSS');
+  ok('间距段写明换算基准（看得出 ×2 是怎么来的）', /按画板宽 375/.test(dg));
+  ok('画板宽度未知 → 一个 rpx 数值都不给（不编比例；注释里提到 rpx 不算）',
+    !/\d+rpx/.test(renderGapDigest(items, {})), '基准拿不到时只能给 px');
+  ok('斜对角**不算**间距（另一轴无重叠）',
+    !/斜对A/.test(renderGapDigest([{ name: '斜对A', x: 0, y: 0, w: 10, h: 10 }, { name: '斜对B', x: 500, y: 500, w: 10, h: 10 }], { designWidth: 375 })),
+    '斜对角的距离在还原时毫无意义，混进来就是假间距');
+  ok('对齐判据不认"离得老远但数值凑巧相等"',
+    alignedEdges([{ name: 'A', x: 0, y: 100, w: 20, h: 20 }, { name: 'B', x: 3000, y: 100, w: 20, h: 20 }]).length === 0,
+    '少了"另一轴有关联"这条，任意两块都可能被报成对齐');
+
+  // ── 齐平段：自我成对 / 祖先-后代成对必须排除（实测踩过），但真·兄弟不能一起砍 ──
+  const R = { x: 10, y: 10, w: 100, h: 50 };
+  ok('同一元素（同 path）**绝不**与自己成对（`X ≡ X` 是纯噪声）',
+    alignedEdges([{ path: 'A', name: 'A', ...R }, { path: 'A', name: 'A', ...R }]).length === 0,
+    '实测真机上出现过 `Section - ModalDialogC 顶 ≡ Section - ModalDialogC 顶`');
+  ok('祖先/后代成对也排除（子层撑满父层不是设计决策）',
+    alignedEdges([
+      { path: 'A', name: 'Card', depth: 1, ...R },
+      { path: 'A/A:shadow', name: 'Card:shadow', depth: 2, ...R },
+    ]).length === 0, '阴影/背景层几乎撑满父层，四条边全"重合" → 抄进 CSS 毫无意义');
+  ok('真·兄弟边齐平**仍要报**（别一刀切把好的一起砍）',
+    alignedEdges([
+      { path: 'A/1', name: '张顾问', depth: 2, x: 0, y: 0, w: 40, h: 20 },
+      { path: 'A/2', name: 'Verified Badge', depth: 2, x: 50, y: 0, w: 30, h: 16 },
+    ]).some((a) => a.from.name === '张顾问' && a.edge === '顶'), '这条是好数据，砍了就是过度修正');
+  // 显示名去歧义：同名（或长名被截断后同名）必须能分清是哪两块
+  const ambLines = renderGapDigest([
+    { path: 'P/Section - ModalDialogCard', name: 'Section - ModalDialogCard', depth: 1, x: 0, y: 0, w: 100, h: 50 },
+    { path: 'P/Q', name: 'Section - ModalDialogCard:shadow', depth: 2, x: 0, y: 0, w: 90, h: 40 },
+    { path: 'P/Z', name: 'Z', depth: 3, x: 300, y: 0, w: 10, h: 10 },
+  ], { designWidth: 375 }).split('\n').filter((l) => l.startsWith('- '));
+  ok('长名截断撞车时，**间距行**也显示去歧义后的名字（不是两个一模一样的截断名）',
+    ambLines.some((l) => /#d\d/.test(l)), ambLines.slice(0, 2).join(' || ').slice(0, 130));
+  const ambAl = renderGapDigest([
+    { path: 'P/A', name: `${'X'.repeat(25)}A`, depth: 1, x: 0, y: 0, w: 100, h: 50 },
+    { path: 'P/B', name: `${'X'.repeat(25)}B`, depth: 2, x: 0, y: 0, w: 90, h: 40 },
+  ], { designWidth: 375 });
+  ok('齐平行同样去歧义（截断后同前缀 → 补 #d<深度>）',
+    /#d\d/.test(ambAl.split('\n').filter((l) => l.includes('≡')).join(' ')),
+    ambAl.split('\n').filter((l) => l.includes('≡')).join(' || ').slice(0, 130));
+
+  // ── P1-1/P1-2（§4.5/4.6）：结果自带下一步 + 体积 ──
+  ok('summary 尾部有「下一步提示」且提到 region', /ℹ️/.test(sum) && /region/.test(sum.slice(sum.indexOf('ℹ️'))), '把决策树同时放进结果里，AI 读结果时也能被纠正');
+  ok('结果尾注给体积（`≈x.xxKB`）', /≈\d+\.\d+KB/.test(sum), '有成本意识才不会动辄读全文');
+  const mkBlock = (o) => ({ kind: 'card', name: '卡片', x: 0, y: 0, w: 343, h: 458, radius: { max: 14, pill: false }, bg: { hex: '#574af4', alpha: 0.1, stops: [] }, opacity: 1, border: null, text: null, font: null, color: null, noise: false, ...o });
+  const blk = renderBlocks([mkBlock({}), mkBlock({ name: '底卡2', x: 0, y: 500, w: 343, h: 80 })], { width: 375, height: 800 });
+  ok('blocks 尾注也有体积 + 间距一览', /≈\d+\.\d+KB/.test(blk) && /间距一览/.test(blk));
+  ok('blocks 的底色列给了 rgba（区块侧走 bgText，与图层侧同口径）', /@10% \(rgba\(87, 74, 244, 0\.1\)\)/.test(blk), blk.split('\n').find((l) => l.includes('574af4')) ?? '');
+  ok('落盘路径只在真有 full 时才提（这里没有，所以不该出现「已落盘」）', !/已落盘/.test(blk));
+
+  // ── P2-1（§4.7）：meta 进标题行，且**拿不到不编** ──
+  const sumV = renderSummary(sumOpts([headOnly], { name: 'T', width: 375, height: 800, versionId: 'abcdef1234567890', versionIsLatest: true, latestVersionAt: '2026-09-29T10:00:00Z' }));
+  ok('标题行带 version 与更新时间', /version=abcdef12/.test(sumV) && /更新于 2026-09-29/.test(sumV));
+  ok('拿不到版本时**不编**（标题行不出现 version= / 更新于）', !/version=/.test(sum) && !/更新于/.test(sum), '编一个版本号比没有更糟');
+  const sumOld = renderSummary(sumOpts([headOnly], { name: 'T', width: 375, height: 800, versionId: 'deadbeef0000', versionIsLatest: false, latestVersionAt: '2026-09-29T10:00:00Z' }));
+  ok('读旧版时**不**把"最新版时间"说成这版的时间', /最新版更新于 2026-09-29（你读的是旧版）/.test(sumOld), '看着有、其实指错的信息比没有更糟');
 }
 
 /* ═══════════════ 汇总 ═══════════════ */
