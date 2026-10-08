@@ -1864,6 +1864,77 @@ group('注入与结果优化');
   ok('读旧版时**不**把"最新版时间"说成这版的时间', /最新版更新于 2026-09-29（你读的是旧版）/.test(sumOld), '看着有、其实指错的信息比没有更糟');
 }
 
+/* ═══════ 画板内边距：画板是画布绝对坐标，子层是画板相对坐标（实测 26 个层中招） ═══════ */
+{
+  // 真实案例：某大屏稿，画板 x=14599 y=258，子层「大标题」在 0,0 且铺满宽
+  const flat = flattenArtboard({
+    id: 'ab', name: '画板', realFrame: { left: 14599, top: 258, width: 1920, height: 1080 },
+    layers: [
+      { id: 'c1', name: '大标题', realFrame: { left: 0, top: 0, width: 1920, height: 160 } },
+      { id: 'c2', name: '菜单栏', realFrame: { left: 0, top: 287, width: 215, height: 630 } },
+      // 深层：父是普通容器，**不该**被这条改动影响
+      { id: 'c3', name: '组', realFrame: { left: 100, top: 50, width: 400, height: 300 }, layers: [
+        { id: 'c4', name: '组内块', realFrame: { left: 120, top: 80, width: 100, height: 60 } },
+      ] },
+    ],
+  });
+  const byName = Object.fromEntries(flat.map((l) => [l.name, l]));
+  ok('画板不在原点时，深度 1 的内边距**按画板原点**算（不是画布绝对坐标）',
+    JSON.stringify(byName['大标题'].inset) === JSON.stringify({ left: 0, top: 0, right: 0, bottom: 920 }),
+    JSON.stringify(byName['大标题'].inset));
+  ok('深度 1 的另一层同样正确（独立手算值 0/287/1705/163）',
+    JSON.stringify(byName['菜单栏'].inset) === JSON.stringify({ left: 0, top: 287, right: 1705, bottom: 163 }),
+    JSON.stringify(byName['菜单栏'].inset));
+  ok('画板自己没有父层 → inset 为 null（合法 lossless JSON）', byName['画板'].inset === null, String(byName['画板'].inset));
+  // ⚠️ 防过度修正：普通容器链**必须**继续用父子相减（父 100,50 → 子 120,80 ⇒ left 20 / top 30）
+  ok('普通容器链不受影响（父 100,50 → 子 120,80 ⇒ 20/30）',
+    JSON.stringify(byName['组内块'].inset) === JSON.stringify({ left: 20, top: 30, right: 280, bottom: 210 }),
+    JSON.stringify(byName['组内块'].inset));
+  ok('深度 1 但**画板在原点**时也正确（不因改动而变）',
+    JSON.stringify(flattenArtboard({ name: 'A', realFrame: { left: 0, top: 0, width: 375, height: 812 },
+      layers: [{ name: 'X', realFrame: { left: 10, top: 20, width: 100, height: 50 } }] })[1].inset)
+      === JSON.stringify({ left: 10, top: 20, right: 265, bottom: 742 }));
+}
+
+/* ═══════ 间距一览：画板（画布绝对坐标）不得进入候选集（实测 3/10 条是垃圾） ═══════ */
+{
+  // 真实案例：某稿，画板在画布 1312,6805，子块在画板相对坐标 1143,763 一带 →
+  // 相减得 5987px，而画板对角只有 551px。
+  // ⚠️ 夹具必须**几何上真的能触发**那条垃圾关系：间距只在**另一轴有重叠**时才算，
+  //    所以块的 x 区间要**压住画板的 x 区间**（真机就是这么构成的：画板 x 1312 起，
+  //    子块 x 1143..1331 —— 在 1312..1331 上重叠，于是 y 方向算出 5987px）。
+  //    我第一版把块放在 x=0（与画板 x 1312..3232 完全不重叠）→ 加了画板也算不出间距 →
+  //    **变异不红、断言是瞎的**（靠变异测试才发现）。
+  const d = renderGapDigest([
+    { id: 'ab', name: '画板 – 1', depth: 0, x: 1312, y: 6805, w: 1920, h: 1080 },
+    { id: 'a', name: '块A', depth: 1, x: 1250, y: 700, w: 100, h: 50 },
+    { id: 'b', name: '块B', depth: 1, x: 1250, y: 760, w: 100, h: 50 },
+  ], { designWidth: 1920 });
+  // ⚠️ 只查**数据行**（`- ` 开头）——表头里本来就有「按画板宽 1920」，
+  //    拿整段做 includes 会误判（我第一版就是这么写的，被自己的断言骗了一次）。
+  const gapRows = d.split('\n').filter((l) => l.startsWith('- '));
+  ok('间距一览的**数据行**不含画板（画布绝对坐标 vs 画板相对坐标，跨坐标系）',
+    gapRows.length > 0 && !gapRows.some((l) => l.includes('画板')),
+    gapRows.filter((l) => l.includes('画板')).slice(0, 2).join(' / ') || `查了 ${gapRows.length} 行，无画板`);
+  ok('间距一览**仍给出真块之间的关系**（防过度排除）', /块A ↕ 块B = \*\*10px/.test(d), d.split('\n').find((l) => l.includes('块A')) ?? '(没找到)');
+  // 画板是唯一元素时，不应产出任何内容（< 2 个候选）
+  ok('只剩画板时不给表（不硬凑）',
+    renderGapDigest([{ name: '画板', depth: 0, x: 1, y: 2, w: 10, h: 10 }], { designWidth: 10 }) === '');
+}
+
+/* ═══════ list_designs 的尺寸是「缩略图预览尺寸」（实测 ¼），别让 AI 拿它算 rpx ═══════ */
+{
+  // SYSTEM_HINT 是 lib/index.js 的私有常量（未导出），所以按**源码文本**断言。
+  const _root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const idxSrc = fs.readFileSync(path.join(_root, 'lib/index.js'), 'utf8');
+  const cliSrc = fs.readFileSync(path.join(_root, 'lanhu.mjs'), 'utf8');
+  ok('注入里警告了「列表尺寸是预览尺寸，别拿它算 rpx」',
+    /列表接口（list_designs）给的是缩略图预览尺寸/.test(idxSrc) && /别拿它算 rpx/.test(idxSrc), '');
+  ok('工具侧列表行标注了「（预览）」', /（预览）/.test(idxSrc), '');
+  ok('工具描述点明了尺寸是预览', /缩略图预览尺寸/.test(idxSrc), '');
+  ok('CLI 列表也标注了「（预览）」并给出一行警告', /（预览）/.test(cliSrc) && /缩略图预览尺寸/.test(cliSrc), '');
+}
+
 /* ═══════════════ 汇总 ═══════════════ */
 const passed = results.filter((r) => r.ok).length;
 const failed = results.length - passed;

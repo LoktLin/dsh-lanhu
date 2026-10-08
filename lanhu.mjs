@@ -1930,6 +1930,12 @@ export function renderGapDigest(items, opts = {}) {
   //    两个一模一样的名字（"看着像自己跟自己"）。有 id 才能走同一套去歧义。
   const list = (items ?? [])
     .filter((i) => i && Number.isFinite(i.x) && Number.isFinite(i.y) && Number.isFinite(i.w) && Number.isFinite(i.h))
+    // ⚠️ **画板自己（depth 0）必须排除**：它的 x/y 是**画布绝对坐标**，而其余元素是**画板相对坐标** ——
+    //    两者相减就是跨坐标系相减，出来的是垃圾间距。实测（某稿，画板在画布 1312,6805）：
+    //    10 条间距里 **3 条是「XX ↕ 画板 – 1 = 5987px / 6018px」**，而该稿画板对角只有 551px。
+    //    这与「内边距」、以及「region 间距」是同**一个病根**的**第三个漏网分支** ——
+    //    三处都排除掉，别再让第四个出现（新加几何计算时先问一句：这堆元素的坐标系一致吗？）。
+    .filter((i) => i.depth !== 0)
     .map((it, i) => ({ ...it, id: it.id ?? it.path ?? `#${i}` }));
   if (list.length < 2) return '';
   const gapsAll = geometricGaps(list, { maxDistance: opts.maxDistance });
@@ -3066,16 +3072,27 @@ export function flattenArtboard(artboard) {
     const visible = node.visible !== false && inheritedVisible;
     const text = node.text?.style;
     const font = text?.font;
-    // 内边距：子层坐标 − 父层坐标。蓝湖的 frame 是相对画板原点的，所以直接相减就是 inset —— 省掉人工手算。
+    // 内边距：子层坐标 − 父层坐标 —— 省掉人工手算。
+    //
+    // ⚠️ **但父层是画板时不能直接相减**：画板（depth 0）的 x/y 是**画布绝对坐标**，
+    //    而它的子层是**画板相对坐标** —— 两者不在同一坐标系。
+    //    实测（某大屏稿，画板 x=14599 y=258）：
+    //    深度 1 的 **26 个层内边距全部变成 -14xxx/14xxx 这种垃圾值**，
+    //    而其中就有「大标题」这种本该 `0/0/0/920` 的层。
+    //    凡画板不在画布原点（Figma 里极常见）就会中招。
+    //    修法：父层是画板时，把它的原点当 (0,0)；宽高仍用画板自己的（那个是对的）。
+    //    与间距表排除 `depth===0` 是**同一个病根**（那次只修了间距那条链）。
     //
     // ⚠️ 顶层（画板）没有父层，这时给 **null 而不是 undefined**。
     //    `undefined` 不是合法 lossless JSON —— DSH 宿主会**拒收整个工具结果**
     //    （报 `value is not lossless JSON`），agent 一点数据都拿不到。实测踩过。
+    const pOriginX = parent && parent.depth === 0 ? 0 : parent?.x;
+    const pOriginY = parent && parent.depth === 0 ? 0 : parent?.y;
     const inset = parent ? {
-      left: round2(frame.x - parent.x),
-      top: round2(frame.y - parent.y),
-      right: round2((parent.x + parent.w) - (frame.x + frame.w)),
-      bottom: round2((parent.y + parent.h) - (frame.y + frame.h)),
+      left: round2(frame.x - pOriginX),
+      top: round2(frame.y - pOriginY),
+      right: round2((pOriginX + parent.w) - (frame.x + frame.w)),
+      bottom: round2((pOriginY + parent.h) - (frame.y + frame.h)),
     } : null;
     const layer = {
       id: node.id,
@@ -5810,7 +5827,9 @@ async function cmdDesigns({ args, cookie }) {
   if (args.json) printJson(r);
   else {
     console.log(`${r.projectName ?? r.projectId}：${r.images.length} 张稿`);
-    for (const i of r.images) console.log(`  ${i.imageId}  ${i.name}  ${i.width}×${i.height}`);
+    // ⚠️ 列表给的是**缩略图预览尺寸**（实测常见 ¼），不是画板真实尺寸 —— 标出来，别让 AI 拿它算 rpx。
+    for (const i of r.images) console.log(`  ${i.imageId}  ${i.name}  ${i.width}×${i.height}（预览）`);
+    console.log('  ⚠️ 上面的尺寸是**缩略图预览尺寸**，不是画板真实尺寸；算 rpx 请用读稿标题行里的画板宽。');
   }
   return r;
 }

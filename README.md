@@ -20,7 +20,7 @@
 > **没有它**：AI 写页面前只能看设计稿**截图**，色值和字号靠视觉估算（OCR 小字经常错）。
 > **有了它**：设计稿的真实数值直接进上下文 —— 等于把「设计标注」喂给模型；还能反过来拿它**自动验收**页面还原度。
 
-**版本 `0.5.0`**（见 [CHANGELOG](https://github.com/LoktLin/dsh-lanhu/blob/main/CHANGELOG.md)） · MIT · 已发布到 npm：[`dsh-lanhu`](https://www.npmjs.com/package/dsh-lanhu)
+**版本 `0.5.1`**（见 [CHANGELOG](https://github.com/LoktLin/dsh-lanhu/blob/main/CHANGELOG.md)） · MIT · 已发布到 npm：[`dsh-lanhu`](https://www.npmjs.com/package/dsh-lanhu)
 适用于 [DeepSeek Harness](https://github.com/deepseek-ai)（DSH）Web GUI，需要 **Node ≥ 20**。自带 15 个原生工具 + 侧边面板 + CLI。
 
 > ⚠️ **免责与数据说明**
@@ -46,7 +46,7 @@
 | **侧边面板** | 块级 / 账号 / 记录，三个 Tab，不用敲命令 |
 | **多账号** | 一账号一套 Cookie；贴链接自动判归属（索引命中零请求） |
 | **零运行时依赖** | 真机验收才需要 `puppeteer-core`（`optionalDependencies`，不装也能用） |
-| **离线自检 651 项** | 秒级、零网络；改完代码先跑它（另有**文档绊线** `test/readme-test.mjs`：生成块 / `docs/` 链接与孤立文件 / 版本号五处 / 发布说明格式 / 写死的数字） |
+| **离线自检 663 项** | 秒级、零网络；改完代码先跑它（另有**文档绊线** `test/readme-test.mjs`：生成块 / `docs/` 链接与孤立文件 / 版本号五处 / 发布说明格式 / 写死的数字） |
 
 ---
 
@@ -156,7 +156,7 @@
 
 #### `lanhu_list_designs`
 
-列出某个项目下的全部设计稿（稿名 / 尺寸 / imageId）。**可以直接贴蓝湖链接**（里面的 tid/pid 自动解析，不用手拆）；也可以给 projectId。要看**产品文档/原型**请用 lanhu_list_product_documents。
+列出某个项目下的全部设计稿（稿名 / 尺寸 / imageId）。⚠️ **尺寸是缩略图预览尺寸**，不是画板真实尺寸（常见 ¼）——算 rpx 请用读稿标题行里的画板宽。**可以直接贴蓝湖链接**（里面的 tid/pid 自动解析，不用手拆）；也可以给 projectId。要看**产品文档/原型**请用 lanhu_list_product_documents。
 
 | 参数 | 类型 | 必填 | 取值 | 说明 |
 |---|---|---|---|---|
