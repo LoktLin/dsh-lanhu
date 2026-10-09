@@ -21,7 +21,7 @@
 > **有了它**：设计稿的真实数值直接进上下文 —— 等于把「设计标注」喂给模型；还能反过来拿它**自动验收**页面还原度。
 
 **版本 `0.6.1`**（见 [发布说明](https://github.com/LoktLin/dsh-lanhu/releases)） · MIT · 已发布到 npm：[`dsh-lanhu`](https://www.npmjs.com/package/dsh-lanhu)
-适用于 [DeepSeek Harness](https://github.com/deepseek-ai)（DSH）Web GUI，需要 **Node ≥ 20**。自带 17 个原生工具 + 侧边面板 + CLI。
+适用于 [DeepSeek Harness](https://github.com/deepseek-ai)（DSH）Web GUI，需要 **Node ≥ 20**。自带 18 个原生工具 + 侧边面板 + CLI。
 
 > ⚠️ **免责与数据说明**
 >
@@ -36,7 +36,7 @@
 
 | 能力 | 说明 |
 |---|---|
-| **17 个原生工具** | 参数带 schema 校验；不用拼 shell 命令调脚本 |
+| **18 个原生工具** | 参数带 schema 校验；不用拼 shell 命令调脚本 |
 | **贴链接就行** | 不用手拆 `tid/pid/image_id`，**也不用知道稿子属于哪个账号**（自动判定，零请求优先） |
 | **块级清单** | 把几百个图层收敛成「人一眼能核对」的块：六项属性 + **字体族** + **行高·字距** + **多段渐变全 stop** |
 | **两种稿件格式都读** | **Sketch 插件导出**（`type: sketchPlugin`：图层平铺在 `info[]` 里、没有 `artboard`，实测某项目占一半以上）与 Figma/Sketch 常规稿走**同一条**解析链；认不出的树**明说**（`unsupported: true` + `sourceFormat`），绝不静默给一个空结果 |
@@ -81,7 +81,8 @@
 |---|---|---|
 | **① 确认登录态** | `lanhu_check_auth {}` | Cookie 是否有效 + 有效期 + 团队列表；失效时给更新步骤。**开工先跑这个** |
 | **② 读稿** | `lanhu_read_blocks {"url":"<蓝湖链接>"}` | 几百个图层收敛成「人一眼能核对」的**块级清单**：六项属性 + 字体族 + 行高字距 + 多段渐变全 stop。链接里的 `tid/pid/image_id` **不用手拆**，属于哪个账号**自动判定**；稿上**人类留的评论 / 标注**也会一并读回来（每条映射到落在哪个块，见 [docs/评论.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/评论.md)） |
-| **③ 验收** | `lanhu_verify_blocks {"pageUrl":"http://localhost:5173/","url":"<蓝湖链接>"}` | 每个可见块与页面的**四态报告**（✅ 完全匹配 / 🟡 容差内 / ❌ 不匹配 / ⚪ 无法比对）+ **可直接抄的建议改法** |
+| **③ 生成代码** | `lanhu_gen_code {"url":"<蓝湖链接>","target":"both"}` | **可直接整段粘贴**的 CSS / WXSS（`both` 给两套：px 与 rpx）。详见 [docs/生成代码.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/生成代码.md) |
+| **④ 验收** | `lanhu_verify_blocks {"pageUrl":"http://localhost:5173/","url":"<蓝湖链接>"}` | 每个可见块与页面的**四态报告**（✅ 完全匹配 / 🟡 容差内 / ❌ 不匹配 / ⚪ 无法比对）+ **可直接抄的建议改法** |
 
 **在 DSH 会话里更简单**：把链接直接丢给 agent，它会自己挑工具。**多账号、三级 id、Cookie 归属，调用方一概不用管。**
 
@@ -131,7 +132,7 @@
 
 <!-- BEGIN GENERATED:tools -->
 
-**17 个工具。** 下面每一个字都来自 AI 在 schema 里看到的那份 —— 本节由 `node tools/gen-readme-tools.mjs --write` 生成，**别手改**；改了工具忘了跑生成器，`test/readme-test.mjs` 会**逐字比对**并报红。
+**18 个工具。** 下面每一个字都来自 AI 在 schema 里看到的那份 —— 本节由 `node tools/gen-readme-tools.mjs --write` 生成，**别手改**；改了工具忘了跑生成器，`test/readme-test.mjs` 会**逐字比对**并报红。
 
 #### `lanhu_check_auth`
 
@@ -346,6 +347,24 @@
 | `includeNoise` | `boolean` | 否 | — | 是否也比对系统 UI / 图形碎片（默认不比） |
 | `account` | `string` | 否 | — | 可选：指定蓝湖账号别名（多账号场景，如 acme）。不给时会按链接里的团队 id 自动判定，再退到默认账号。先用 lanhu_accounts 看有哪些账号。 |
 
+#### `lanhu_gen_code`
+
+把设计稿的块生成**可直接整段粘贴**的 CSS / WXSS —— 回答「**我该往文件里写什么**」，与 `lanhu_read_blocks`（回答「设计稿是什么」，给人核对的表格）分工不同：这个出口是**代码块**，不是表格。**双平台**：`target:"web"`（默认整个 both）给 px 1:1；`mini` 给 rpx（`rpx = px × 750 ÷ 画板宽`，宽 375 的稿即 ×2）；`both` 两套都给，输出里写明换算基准。每块给一个**可读的 class**（块名归一化，中文保留，重名自动加 `-2`）。覆盖：尺寸 / 背景（纯色 + **多段渐变含角度、全部 stop、小数百分比**）/ `opacity` / `box-shadow`（**多重、inset、spread、hex 阴影色**）/ `text-shadow` / **四值** `border-radius` / 边框（实色 → `border`；**渐变 → `border-image`**）/ 毛玻璃 `backdrop-filter` / 字体族·字重·字号·色·行高·字距·对齐 / **富文本 `<span>` 分段**（稿里一段文字有多种样式时，蓝湖自己的 web 输出会压扁成一段，这里给分段规则）。⭐ **比蓝湖「代码」面板多做的三件事**（照抄它那三处会画错）：**椭圆图元给 `50%`**（它给 `border-radius: 0`，会画成方形环）；**渐变文字补 `background-clip:text` + `-webkit-text-fill-color:transparent`**（它只给 `background`，会渲染成文字背后的色块）；渐变描边一律走 `border-image`。**数据里没有的属性一个字都不出**（没 `line-height` 就不写），但**有数据而值为 0 要出**（全 0 圆角 → `0px 0px 0px 0px`）。与蓝湖的已知写法差异（圆角统一四值 / rgba 逗号后带空格 / 颜色小写 / 字体族含 `.` 时加引号）见 `docs/生成代码.md`。**只读**：从不写任何东西；直接粘贴蓝湖链接即可（多账号自动判定、版本可溯源）。
+
+| 参数 | 类型 | 必填 | 取值 | 说明 |
+|---|---|---|---|---|
+| `url` | `string` | 否 | — | 蓝湖设计稿链接（详情页地址整条粘贴，自动解析 tid/pid/image_id） |
+| `projectId` | `string` | 否 | — | 项目 UUID（与 imageId 搭配；给了 url 可不传） |
+| `imageId` | `string` | 否 | — | 设计稿 id（与 projectId 搭配） |
+| `target` | `string` | 否 | `web` / `mini` / `both` | 目标端：`web` = px（1:1，H5/PC 用）；`mini` = rpx（`rpx = px × 750 ÷ 画板宽`，小程序用）；`both`（**默认**）两套都出，各自成段、可直接整段复制。画板宽度拿不到时**只出 px**（不拿 375 硬算，`miniAvailable:false` 会告诉你） |
+| `region` | `string` | 否 | — | 可选：只生成某区域的块，"y0,y1" 或 "x0,y0,x1,y1"（大屏稿动辄几百块，用它收窄） |
+| `kind` | `string` | 否 | — | 可选：只生成某几类块，逗号分隔（card/container/pill/text/image/divider） |
+| `minWidth` | `number` | 否 | — | 可选：只生成宽度 ≥ 该值的块 |
+| `limit` | `number` | 否 | — | 最多生成几块（默认 60）。生成器**故意有上限**：一张大屏稿几百块全吐出来没人粘贴得了；被截断时 truncated:true |
+| `includeNoise` | `boolean` | 否 | — | 是否把系统 UI / 图形碎片块也生成（默认 false，与 lanhu_read_blocks 同一个折叠口径） |
+| `version` | `string` | 否 | — | 版本 id（默认 latest）。设计稿会更新，要复现"当初那一版"就传它；给了具体 id 必须命中，命中不了会报错、不静默回退 |
+| `account` | `string` | 否 | — | 可选：指定蓝湖账号别名（多账号场景，如 acme）。不给时会按链接里的团队 id 自动判定，再退到默认账号。先用 lanhu_accounts 看有哪些账号。 |
+
 #### `lanhu_cookie_set`
 
 更新蓝湖 Cookie。**直接粘贴浏览器里复制的内容即可**：F12 → Network → 任意 lanhuapp.com 请求 → 右键 → Copy as cURL → 把整段贴进来（会自动解析出 Cookie，不用手工抠串）。也接受 "Cookie: ..." 原始请求头或裸 Cookie 串。写前用真实请求校验；**传 `account` 就写进那个账号**（`~/.dsh/lanhu/cookies/<alias>`），不传则落盘到默认的 `~/.dsh/lanhu/cookie`（均 600）。
@@ -406,6 +425,7 @@ cd <plugin-dir> && npm i puppeteer-core   # 只装这一个（它是 optional �
 | 读**产品文档 / 原型（PRD）** / 原型和设计稿分不清 | [docs/产品文档.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/产品文档.md) |
 | **项目没有设计稿、只有原型**，要照着它实现 | [docs/原型样式.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/原型样式.md) |
 | 还原完要验收 / 导出切图 | [docs/验收.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/验收.md) |
+| **照着稿写页面的 CSS / WXSS**（可直接粘贴，含渐变/阴影/富文本分段） | [docs/生成代码.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/生成代码.md) |
 | **设计改了，要知道改了哪**（版本对比） | [docs/设计变更.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/设计变更.md) |
 | **整个项目的设计系统是不是漂了**（跨稿一致性审计） | [docs/设计系统审计.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/设计系统审计.md) |
 | 用侧边面板 / 配多账号 / Cookie 失效了 | [docs/面板与账号.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/面板与账号.md) |
@@ -429,7 +449,7 @@ cd <plugin-dir> && npm i puppeteer-core   # 只装这一个（它是 optional �
 > exact structured data (coordinates, colours, font size/weight/family, line-height, letter-spacing,
 > corner radius, stroke, gradients, text, layer opacity) and feeds it to the coding agent, so it stops
 > guessing values from a screenshot. It can also verify a built page against the same spec.
-> **17 tools + a sidebar panel + a CLI**, MIT, macOS/Windows, DSH Web GUI, Node ≥ 20.
+> **18 tools + a sidebar panel + a CLI**, MIT, macOS/Windows, DSH Web GUI, Node ≥ 20.
 > The Chinese sections above are the full manual; this section is the one-screen entry point.
 
 **30-second quick start**
@@ -445,7 +465,7 @@ cd <plugin-dir> && npm i puppeteer-core   # 只装这一个（它是 optional �
 > page's style values (colours / font sizes / coordinates) — the only route when a project has **no design artboards**.
 > Prototype styles are typed in by hand by the designer, so **a design always wins when one exists**. See [docs/原型样式.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/原型样式.md).
 
-**The 17 tools, one line each**
+**The 18 tools, one line each**
 
 | Tool | What it is for |
 |---|---|
@@ -467,7 +487,7 @@ cd <plugin-dir> && npm i puppeteer-core   # 只装这一个（它是 optional �
 
 **Install essentials**
 
-1. `dsh plugin --profile web add <plugin-dir>`, then **restart `dsh web`** — the 17 tools become visible to every session.
+1. `dsh plugin --profile web add <plugin-dir>`, then **restart `dsh web`** — the 18 tools become visible to every session.
 2. For development, symlink the package into the web profile's `node_modules` **and** add `"dsh-lanhu"` to `dsh.profile.bundles` — without the bundles entry the plugin is not loaded at all.
 3. `lanhu_verify_spec` needs a browser engine: `npm i puppeteer-core` (it is an optional dependency — everything else works without it). **On macOS 12 or older, always use puppeteer-core**; Playwright's Chromium cannot be installed there.
 

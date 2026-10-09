@@ -99,6 +99,9 @@ export const LIMITS = Object.freeze({
   largeTextBoldWeight: 700, // 「bold」的字重门槛
   contrastMaxRows: 24,      // 「对比度」段不达标行的封顶（与「间距一览」同口径）
   contrastSearchSteps: 24,  // 建议色的二分搜索步数
+  // —— 生成代码（§4.10）——
+  // 一张大屏稿动辄几百块，全量吐出来没人能粘贴 —— 默认封顶（用 region / limit 收窄）。
+  codeMaxBlocks: 60,        // lanhu_gen_code 默认最多生成几块
   // —— 设计变更 diff（§6.5）——
   diffApproxMaxCenter: 24,      // 近似匹配：两块的**中心点**偏移上限（px）
   diffApproxReachRatio: 0.25,   // 近似匹配的宽松兜底：偏移 ≤ 较大边的这个比例也算（大块天然挪得远）
@@ -3504,11 +3507,208 @@ export function normalizeSketchPluginTree(tree) {
   };
 }
 
+/* ==========================================================================
+ * 3f. 「生成代码」用的**富图层信息**（§4.10）
+ *
+ * 下面这几个函数**只被 `flattenArtboard(artboard, { rich: true })` 调用**，
+ * 也就是只被 `lanhu_gen_code` 这条链用。既有链路（read_design / read_blocks / 面板 / diff /
+ * audit / verify）一律不传 `rich` —— 图层对象多一个键就会改变它们的输出，
+ * 而本项目对既有输出是**逐字节**要求。
+ *
+ * 采什么、为什么：
+ *   · `shadows`       —— 块模型里**没有**阴影（`read_blocks` 也不显示）。生成 CSS 必须给
+ *                        `box-shadow` / `text-shadow`，否则按钮的立体感全丢。
+ *   · `blurs`         —— 毛玻璃（`backdrop-filter: blur()`）。`type==='Background'` 是背景模糊。
+ *   · `fillGradient`  —— 块模型的 `bg.stops` **只有 hex+alpha**，没有**角度**；
+ *                        而 `linear-gradient(90deg, …)` 的角度是必须还原的信息（实测①③）。
+ *   · `borderGradient`—— 渐变描边（`border-image`）。蓝湖把它放在 `style.borders[].gradient` 里，
+ *                        既有 `borderOf()` 只取 `color`，渐变描边会被整条丢掉。
+ *   · `hasRadius`     —— 「全 0 圆角」与「没有圆角数据」是**两回事**：前者要出
+ *                        `border-radius: 0px 0px 0px 0px`（蓝湖也这么出），后者一个字都不出。
+ *                        `radiusOf()` 只返回 max>0 的，所以这里单独记一个布尔。
+ *   · `textRuns`      —— 富文本（一段文字里多种样式，§4.10 ⑪）。Figma 的 `text.styles[]`
+ *                        按 run 给了 font/color；既有链路只取 `text.font`（主样式），
+ *                        会把 4 段压成 1 段 —— **实测该字段真的存在**（青圭稿 4 个 run，
+ *                        与蓝湖 ObjC 模板的 NSMakeRange 逐段对得上）。
+ * ========================================================================== */
+
+/** 阴影规范化：只保留真正画得出来的（enabled 且颜色 alpha>0）。 */
+function normShadows(list) {
+  const out = [];
+  for (const s of list ?? []) {
+    if (!s || typeof s !== 'object' || s.isEnabled === false) continue;
+    const c = parseColor(s.color);
+    if (!c || c.a <= 0) continue;
+    out.push({
+      x: round2(s.x ?? 0),
+      y: round2(s.y ?? 0),
+      blur: round2(s.blur ?? 0),
+      spread: round2(s.spread ?? 0),
+      inset: Boolean(s.inset),
+      color: { r: c.r, g: c.g, b: c.b, a: round2(c.a) },
+    });
+  }
+  return out;
+}
+
+/** 模糊：`Background` → 背景模糊（`backdrop-filter`），`Gaussian`/其它 → `filter`。 */
+function normBlurs(list) {
+  const out = [];
+  for (const b of list ?? []) {
+    if (!b || typeof b !== 'object' || b.isEnabled === false) continue;
+    const r = round2(b.radius ?? 0);
+    if (!(r > 0)) continue;
+    out.push({ type: typeof b.type === 'string' ? b.type : null, radius: r });
+  }
+  return out;
+}
+
+/**
+ * 渐变方向 → CSS 角度（deg，整数，规范化到 `[0,360)`）。
+ *
+ * 数据是 **from/to 两个归一化坐标点**（相对图层 bbox 的 0..1 空间，可能超出）：
+ * 方向从 `from` 指向 `to`。CSS 的 `0deg` 指**向上**、顺时针增大，而 Figma 的 y 轴**向下**，
+ * 所以 `deg = atan2(dx, -dy)`。
+ *
+ * 实测校准（三张真稿，全部吻合，见 docs/生成代码.md 的对照表）：
+ *   ① 311×42 按钮  from(0,0.5)→to(1,0.5)        → 90°  蓝湖 `90deg`
+ *   ③ 48×48  图标  from(.1464,.75)→to(.8536,.25) → 54.7356 → 55°  蓝湖 `55deg`
+ *   ⑦ 500×159 卡片 from(.1,.5006)→to(.1,.4994)   → 0°   蓝湖 `360deg`（等价，见差异说明）
+ *
+ * ⚠️ **不乘图层宽高**：实测的三个样本里两个是轴对齐、一个是正方形，乘不乘同值；
+ *    但蓝湖给的角度**全是整数**，而乘宽高会把 `.1464/.75` 这种点算成 116.57° 这类怪值。
+ *    这是个**有意的选择**，不是遗漏 —— 已在文档里标为「未验证：非轴对齐×非正方形的样本」。
+ */
+export function gradientAngle(from, to) {
+  const dx = Number(to?.x) - Number(from?.x);
+  const dy = Number(to?.y) - Number(from?.y);
+  if (!Number.isFinite(dx) || !Number.isFinite(dy) || (dx === 0 && dy === 0)) return null;
+  let deg = (Math.atan2(dx, -dy) * 180) / Math.PI;
+  if (deg < 0) deg += 360;
+  return Math.round(deg) % 360; // 359.6 → 360 → 0（0 与 360 视觉等价，统一成 0）
+}
+
+/** 渐变（填充与描边共用）：角度 + **全部** stop（位置 / hex / alpha）。 */
+export function gradientInfoOf(g) {
+  if (!g || !Array.isArray(g.stops) || g.stops.length === 0) return null;
+  const stops = [];
+  for (const s of g.stops) {
+    const c = parseColor(s?.color);
+    if (!c) continue;
+    stops.push({
+      hex: rgbHex(c),
+      alpha: round2(c.a),
+      /**
+       * ⚠️ **位置不取整**（原样保留）：它是 `0..1` 的归一化值，`round2` 一下就等于
+       * 把百分比精度砍到 1 位 —— 实测参考⑧那段就是 `29.66%`，`round2(0.2966)=0.3` → `30%`
+       * （数值合法、只是被抹平，属于最阴的一类错）。要 2 位百分比就给 4 位归一化值。
+       */
+      position: Number.isFinite(Number(s.position)) ? Number(s.position) : 0,
+      color: { r: c.r, g: c.g, b: c.b, a: round2(c.a) },
+    });
+  }
+  if (stops.length === 0) return null;
+  return { angle: gradientAngle(g.from, g.to), stops };
+}
+
+/** 取第一个**渐变**填充（`style.fills[]` 里 `type==='gradient'` 的那条）。 */
+function fillGradientOf(node) {
+  for (const f of node.style?.fills ?? []) {
+    if (!f || f.isEnabled === false) continue;
+    if (f.type === 'gradient') {
+      const g = gradientInfoOf(f.gradient);
+      if (g) return g;
+    }
+  }
+  return null;
+}
+
+/**
+ * 取**渐变描边**。蓝湖的表达是 `style.borders[]` 里 `style:'gradient'` + `gradient`（没有 `color`）。
+ * 粗细/哪几边复用 `borderOf()`（含"widths 全 0 但 width 有值"那条兜底），**不写第二份**。
+ */
+function borderGradientOf(node, bd) {
+  const list = (node.style?.borders ?? []).filter((b) => b && b.isEnabled !== false);
+  for (const b of list) {
+    if (!b.gradient) continue;
+    const g = gradientInfoOf(b.gradient);
+    if (!g) continue;
+    return {
+      ...g,
+      width: bd?.width ?? round2(b.width ?? 0),
+      sides: bd?.sides ?? null,
+      widths: bd?.widths ?? null,
+    };
+  }
+  return null;
+}
+
+/** 有没有**圆角数据**（哪怕四角全 0）—— "全 0" 与 "没这个字段" 要分开对待。 */
+function hasRadiusData(node) {
+  if (node.radius && typeof node.radius === 'object') return true;
+  for (const p of node.paths ?? []) if (p?.radius && typeof p.radius === 'object') return true;
+  return false;
+}
+
+/**
+ * 富文本 runs（Figma 的 `text.styles[]`）。
+ * ⚠️ 只在 **run 数 ≥ 2** 时返回 —— 单 run 与主样式同源，返回它只会让生成器把同一份样式写两遍。
+ */
+export function textRunsOf(text) {
+  const styles = text?.styles;
+  if (!Array.isArray(styles) || styles.length < 2) return null;
+  const runs = [];
+  for (const s of styles) {
+    if (!s || typeof s !== 'object') continue;
+    const f = s.font ?? {};
+    const c = parseColor(s.color);
+    runs.push({
+      from: s.from ?? null,
+      to: s.to ?? null,
+      content: typeof s.content === 'string' ? s.content : '',
+      font: {
+        family: f.name ?? null,
+        size: round2(f.size) ?? null,
+        weight: typeof f.fontWeight === 'number' ? f.fontWeight : (f.bold ? 700 : 400),
+        lineHeight: round2(f.lineHeight?.value) ?? null,
+        letterSpacing: round2(f.letterSpacing?.value) ?? null,
+      },
+      color: c ? { hex: rgbHex(c), alpha: round2(c.a), color: { r: c.r, g: c.g, b: c.b, a: round2(c.a) } } : null,
+    });
+  }
+  return runs.length >= 2 ? runs : null;
+}
+
+/** 旋转（度）。0 与"没这个字段"对生成 CSS 是一回事（都不出 `transform`），统一给 null。 */
+function rotationOf(node) {
+  const r = Number(node?.rotation);
+  return Number.isFinite(r) && r !== 0 ? round2(r) : null;
+}
+
+/** 一个原始节点 → 富信息（只被 `rich` 模式调用）。 */
+export function richInfoOf(node) {
+  const bd = borderOf(node);
+  return {
+    shadows: normShadows(node.style?.shadows),
+    blurs: normBlurs(node.style?.blurs),
+    fillGradient: fillGradientOf(node),
+    borderGradient: borderGradientOf(node, bd),
+    hasRadius: hasRadiusData(node),
+    rotation: rotationOf(node),
+    textRuns: textRunsOf(node.text),
+  };
+}
+
 /**
  * 把 artboard 递归摊平成图层数组。
  * 注：蓝湖给的子图层 frame 坐标是**相对画板原点**的（已验证：画板 left=-10279，子层 left=155.5）。
+ *
+ * `opts.rich`（默认 **false**）：多采生成代码要用的富信息（阴影 / 模糊 / 渐变方向 / 富文本 runs /
+ * 「有没有圆角数据」）。**默认关闭是硬约束** —— 图层对象是全项目的共同数据源，
+ * 多一个键就会改变 read_design / read_blocks / 面板的输出。
  */
-export function flattenArtboard(artboard) {
+export function flattenArtboard(artboard, opts = {}) {
+  const rich = Boolean(opts.rich);
   const layers = [];
   // ⚠️ 父级 opacity 必须顺链**累乘**：Figma 里组的 opacity 会与子层相乘，
   //    只读 node.opacity 会把「组 50% 里的子层」误报成 100% 不透明（实测踩过）。
@@ -3575,6 +3775,8 @@ export function flattenArtboard(artboard) {
       } : null,
       hasImage: Boolean(node.hasExportImage || node.hasExportDDSImage),
     };
+    // ⭐ 只有 `rich`（生成代码）才追加富信息 —— 见上面 §3f 的说明。默认路径**一个键都不加**。
+    if (rich) Object.assign(layer, richInfoOf(node));
     layers.push(layer);
     for (const child of node.layers ?? []) walk(child, path, depth + 1, layer, effectiveOpacity, visible);
   };
@@ -5450,7 +5652,453 @@ export async function readDesign(args = {}) {
  * 与 readDesign 的区别：readDesign 输出的是**图层**（334 条），这里输出的是**块**（161 条），
  * 每块带齐六项属性（圆角/大小/文字色/文字大小/有无底色/边框），是"人一眼能核对"的粒度。
  */
-export async function readBlocks(args = {}) {
+/* ==========================================================================
+ * 3g. 生成代码（§4.10）—— `lanhu_gen_code`：把块生成**可直接粘贴**的 CSS / WXSS
+ *
+ * 与「读稿」的分工：读稿回答"设计稿是什么"（表格，给人核对），
+ * 生成代码回答"**我该往文件里写什么**"（代码块，能整段复制）。
+ *
+ * 三条设计原则（都是实测踩出来的）：
+ *
+ * ① **双平台共用一套换算**：`web` → px(1:1)，`mini` → `rpx = px × 750 ÷ 画板宽`。
+ *    rpx 一律走既有 `toTarget(px,'mini',…)`，**不写第二套**（第二套必然与 verify 漂移）。
+ *    画板宽拿不到时**只给 px**，不拿 375 硬算（那正是"基准用错"的典型）。
+ *
+ * ② **颜色的字符串化只有一个出口**：不透明走 `rgbHex()`、半透明走 `rgbaString()`，
+ *    两者都是既有函数（`bgText()` 用的也是它们）。生成器只做"选哪个"的判断，
+ *    **绝不自己拼** `#rrggbb` / `rgba(...)` —— 拼出来的第二份实现迟早与读稿输出不一致。
+ *    因此本项目输出的半透明色形如 `rgba(87, 74, 244, 0.1)`（**逗号后有空格**），
+ *    与蓝湖面板的写法（**逗号后无空格**）不同 —— 两者都是合法 CSS，我们沿用自己那份。
+ *
+ * ③ **数据里没有的属性就不出**（本项目铁律）：没有 `line-height` 就一个字都不写
+ *    （实测：中文族那段文字稿里就是没有，硬补一个行高等于编）；没有背景就**不写**
+ *    `background: none`。另一边，"**有数据但值为 0**"要出（全 0 圆角 → `0px 0px 0px 0px`）。
+ *
+ * 「照抄蓝湖会画错」的三处（我们**有意**不同，见 docs/生成代码.md）：
+ *   · **椭圆**（`shape==='ellipse'`）蓝湖给 `border-radius: 0` → 会画成**方形环**；我们给 `50%`。
+ *   · **渐变文字**（文字层 + 填充是渐变 + 没有 color）蓝湖只给 `background` → 会画成**色块**；
+ *     我们补 `background-clip: text` + `-webkit-text-fill-color: transparent`。
+ *   · **渐变描边**只能用 `border-image`（`border: Npx solid <色>` 表达不了渐变）——
+ *     本项目给 AI 的提示里"divider 别用 border-image"那条**只对实色分割线成立**，两者分开处理。
+ * ========================================================================== */
+
+/**
+ * 颜色的**唯一出口**：`{r,g,b,a}` → CSS 颜色串。
+ * 不透明 → `rgbHex()`（`#6f67f9`）；半透明 → `rgbaString()`（`rgba(87, 74, 244, 0.1)`）。
+ * ⚠️ 不许在这里拼字符串 —— 见本节 ②。
+ */
+export function cssColor(c) {
+  if (!c || typeof c !== 'object') return null;
+  const a = typeof c.a === 'number' ? clamp01(c.a) : 1;
+  return a >= 1 ? rgbHex(c) : rgbaString({ r: c.r, g: c.g, b: c.b, a });
+}
+
+/** hex + 单独给的 alpha → CSS 颜色串（块模型里的 `bg` / `color` / `border` 都是这种形状）。 */
+function cssColorOfHex(hex, alpha) {
+  if (!hex) return null;
+  const c = parseColor(hex);
+  if (!c) return null;
+  return cssColor({ ...c, a: typeof alpha === 'number' ? alpha : c.a });
+}
+
+/** 渐变 stop 位置：`0.2966` → `29.66%`（小数百分比要保留，实测⑧就是 `29.66%`）。 */
+function cssPercent(p) {
+  return `${round2((Number(p) || 0) * 100)}%`;
+}
+
+/** 渐变 → `linear-gradient(<角>deg, <色> <位置>%, …)`。角度拿不到时**不打角度**（合法写法）。 */
+export function cssGradient(g, to) {
+  const stops = (g?.stops ?? []).map((s) => `${cssColor(s.color)} ${cssPercent(s.position)}`).join(', ');
+  if (!stops) return null;
+  return g.angle === null || g.angle === undefined
+    ? `linear-gradient(${stops})`
+    : `linear-gradient(${g.angle}deg, ${stops})`;
+}
+
+/**
+ * 一层阴影 → `[inset] <x> <y> <blur> <spread> <色>`。
+ * `opts.text`（text-shadow）时**不出 inset 也不出 spread** —— `text-shadow` 语法里没有这两项。
+ */
+export function cssShadow(sh, to, opts = {}) {
+  const p = [];
+  if (sh.inset && !opts.text) p.push('inset');
+  p.push(to(sh.x), to(sh.y), to(sh.blur));
+  if (!opts.text) p.push(to(sh.spread));
+  p.push(cssColor(sh.color));
+  return p.join(' ');
+}
+
+/**
+ * 圆角 —— **一律四值**（本项目决策：一致性 > 模仿蓝湖的"相等就写单值"）。
+ * 全 0 **也要四值**（`0px 0px 0px 0px`），但"压根没有圆角数据"时**一个字都不出**。
+ *
+ * ⚠️ **椭圆例外**：`shape==='ellipse'` 的图层蓝湖给 `border-radius: 0`，
+ *    照抄会画成方形。圆的形状来自矢量路径，CSS 里要用 `50%` 表达（见文档「已知差异」）。
+ */
+export function cssRadius(block, layer, to) {
+  if (block?.shape === 'ellipse') return '50% 50% 50% 50%';
+  if (block?.radius) return block.radius.corners.map((v) => to(v)).join(' ');
+  // ⚠️ **文字层不出"全 0 四值"**：文字没有圆角概念。实测④那份稿里 Rectangle / Ellipse
+  //    都有 `radius: {0,0,0,0}`，蓝湖给矩形和椭圆出了 `0px 0px 0px 0px`、给文字层**没出** ——
+  //    我们跟它一致（对文字层出这行只是噪音，还会让人以为"这里有个 0 圆角的盒子"）。
+  const isText = typeof block?.text === 'string' && block.text !== '';
+  if (layer?.hasRadius && !isText) return [0, 0, 0, 0].map((v) => to(v)).join(' ');
+  return null;
+}
+
+/**
+ * 边框 —— 实色与**渐变**分开走：
+ *   · 实色 → `border: Npx solid <色>`（单边分割线 → `border-top: 1px solid <色>`）
+ *   · 渐变 → `border: Npx solid;` + `border-image: linear-gradient(…) 1 1;`
+ *     （CSS 里表达渐变描边**只有** border-image 这条路，`border` 的颜色不能是渐变）
+ * 蓝湖一模一样：⑦ 就是 `border: 1px solid;` 紧跟 `border-image: … 1 1`。
+ */
+export function cssBorder(block, layer, to) {
+  const out = [];
+  const bg = layer?.borderGradient;
+  if (bg && Array.isArray(bg.stops) && bg.stops.length) {
+    out.push(`border: ${to(bg.width)} solid;`);
+    out.push(`border-image: ${cssGradient(bg, to)} 1 1;`);
+    return out;
+  }
+  const bd = block?.border;
+  if (!bd) return out;
+  const w = to(bd.width);
+  const c = bd.colorKnown ? cssColorOfHex(bd.color, bd.alpha) : null;
+  const spec = `${w} solid${c ? ` ${c}` : ''}`;
+  if (bd.single) out.push(`border-${bd.single}: ${spec};`);
+  else out.push(`border: ${spec};`);
+  return out;
+}
+
+/**
+ * 字体族写法：**只在含非标识符字符时加引号**。
+ *   `Source Han Sans CN`   → 原样（一串标识符在 CSS 里就是一个族名，合法）
+ *   `Alibaba PuHuiTi 2.0`  → `"Alibaba PuHuiTi 2.0"`（含 `.`，不加引号不合法）
+ * ⚠️ 蓝湖在这里**没加引号**，于是它把 `2.0` 处理成了 `20`（实测⑪的 web 输出
+ *    `Alibaba PuHuiTi 2.0, Alibaba PuHuiTi 20` 两条都不是原样）—— 这条算我们更对。
+ */
+export function cssFontFamily(family) {
+  const f = String(family ?? '').trim();
+  if (!f) return null;
+  const parts = f.split(/\s+/).filter(Boolean);
+  const safe = parts.length > 0 && parts.every((p) => /^[A-Za-z_][A-Za-z0-9_-]*$/.test(p));
+  return safe ? f : `"${f.replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
+}
+
+/**
+ * 块名 → 合法且可读的 CSS 类名。
+ * 中文**保留**（CSS 允许非 ASCII 标识符，保留中文比硬转拼音可读得多）；
+ * 重名追加 `-2` / `-3`；以数字开头的补 `b-` 前缀（CSS 里不能以数字开头）。
+ */
+export function cssClassName(name, kind, used = new Map()) {
+  let base = String(name ?? '')
+    .trim()
+    .toLowerCase()
+    .replace(/[^0-9a-z\u4e00-\u9fa5_-]+/g, '-')
+    .replace(/-{2,}/g, '-')
+    .replace(/^-+|-+$/g, '');
+  if (!base) base = String(kind ?? 'block');
+  if (!/^[a-z_\u4e00-\u9fa5]/.test(base)) base = `b-${base}`;
+  const n = (used.get(base) ?? 0) + 1;
+  used.set(base, n);
+  return n === 1 ? base : `${base}-${n}`;
+}
+
+const htmlEscape = (s) => String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+/**
+ * 一块 → CSS 属性行（不含 class 包裹）。
+ * 顺序刻意贴近蓝湖面板：尺寸 → 背景 → opacity → 阴影 → 圆角 → 边框 → 模糊 → 文字。
+ */
+export function blockCssLines(block, layer, opts = {}) {
+  const target = opts.target ?? 'web';
+  const to = (v) => toTarget(v, target, { designWidth: opts.designWidth, rpxBase: opts.rpxBase });
+  const L = [];
+  const isText = typeof block.text === 'string' && block.text !== '';
+  const g = layer?.fillGradient ?? null;
+  // ⭐ 渐变文字判据（用户拍的板，实测⑬）：**文字层 + 填充是渐变 + 没有 color** ⇒ 渐变文字。
+  const gradientText = isText && Boolean(g) && !block.color;
+  const shadows = layer?.shadows ?? [];
+
+  L.push(`width: ${to(block.w)};`);
+  L.push(`height: ${to(block.h)};`);
+
+  if (g) {
+    const css = cssGradient(g, to);
+    if (css) L.push(`background: ${css};`);
+  } else if (block.bg) {
+    const c = cssColorOfHex(block.bg.hex, block.bg.alpha);
+    if (c) L.push(`background: ${c};`);
+  }
+
+  // 图层不透明度（**与填充色的 alpha 是两回事**，两个都要还原）
+  if (typeof block.opacity === 'number' && block.opacity < 1) L.push(`opacity: ${round2(block.opacity)};`);
+
+  // 非文字层：阴影 → box-shadow（文字层的阴影是 text-shadow，放在文字属性之后）
+  if (!isText && shadows.length) L.push(`box-shadow: ${shadows.map((s) => cssShadow(s, to)).join(', ')};`);
+
+  const radius = cssRadius(block, layer, to);
+  if (radius) L.push(`border-radius: ${radius};`);
+
+  for (const line of cssBorder(block, layer, to)) L.push(line);
+
+  for (const bl of layer?.blurs ?? []) {
+    L.push(bl.type === 'Background'
+      ? `backdrop-filter: blur(${to(bl.radius)});`
+      : `filter: blur(${to(bl.radius)});`);
+  }
+
+  // 旋转（§4.10 ⑮）：蓝湖的**代码**面板不给这一项，但**标注**面板里有（`旋转 180°`）——
+  // 属于"数据里有、蓝湖输出里没有"的一条。角度**照抄数据真值**（不因为"180° 看着一样"就省掉）。
+  // ⚠️ 蓝湖/Figma 的 `rotation` 方向与 CSS `rotate()` 的正方向是否同号**尚未与标注面板核对过**
+  //    （现有样本只有 180°，无方向性）—— 见 docs/生成代码.md 的「未验证」一节。
+  if (typeof layer?.rotation === 'number' && layer.rotation !== 0) {
+    L.push(`transform: rotate(${round2(layer.rotation)}deg);`);
+  }
+
+  if (isText) {
+    if (block.font) {
+      const fam = cssFontFamily(block.font.family);
+      if (fam) L.push(`font-family: ${fam};`);
+      if (block.font.weight !== null && block.font.weight !== undefined) L.push(`font-weight: ${block.font.weight};`);
+      if (block.font.size !== null && block.font.size !== undefined) L.push(`font-size: ${to(block.font.size)};`);
+      if (block.color) {
+        const c = cssColorOfHex(block.color, block.colorAlpha);
+        if (c) L.push(`color: ${c};`);
+      }
+      // ⚠️ line-height **只在稿里有值时**才出（实测⑤那段中文族文字就没有，补一个等于编）
+      if (block.font.lineHeight !== null && block.font.lineHeight !== undefined) L.push(`line-height: ${to(block.font.lineHeight)};`);
+      if (block.font.align) L.push(`text-align: ${String(block.font.align).toLowerCase()};`);
+      L.push('font-style: normal;');
+      L.push('text-transform: none;');
+      if (block.font.letterSpacing) L.push(`letter-spacing: ${to(block.font.letterSpacing)};`);
+      if (shadows.length) L.push(`text-shadow: ${shadows.map((s) => cssShadow(s, to, { text: true })).join(', ')};`);
+    }
+    if (gradientText) {
+      // 渐变文字三件套 + color 兜底：只给 background 会渲染成"文字背后的色块"（实测⑬）
+      L.push('-webkit-background-clip: text;');
+      L.push('background-clip: text;');
+      L.push('-webkit-text-fill-color: transparent;');
+      L.push('color: transparent;');
+    }
+  }
+  return L;
+}
+
+/**
+ * 富文本 runs → `<span>` 分段（§4.10 ⑪）。
+ *
+ * 稿里 `text.styles[]` 是**多 run**的（实测青圭稿 4 段：默认段 / `表号` 换灰 / 空格 / `MTR-001` 粗+青），
+ * 蓝湖自己的 web 输出也会**压扁**成单一样式 —— 我们比它多给一步：
+ * 主样式照常写进块规则，**与主样式不同的 run** 各给一条 `.cls .rN` 差异规则，
+ * 并附一行 HTML 蓝图说明哪段用哪个 class。**不改块模型**（runs 只存在于 `rich` 模式的图层上）。
+ */
+export function textRunsCss(block, layer, className, opts = {}) {
+  const runs = layer?.textRuns;
+  if (!Array.isArray(runs) || runs.length < 2) return null;
+  const designWidth = opts.designWidth;
+  const target = opts.target ?? 'web';
+  const to = (v) => toTarget(v, target, { designWidth, rpxBase: opts.rpxBase });
+  const main = block.font ?? {};
+  const mainColor = cssColorOfHex(block.color, block.colorAlpha);
+  const html = [];
+  const rules = [];
+  let n = 0;
+  for (const r of runs) {
+    const diff = [];
+    const f = r.font ?? {};
+    if (f.family && f.family !== main.family) {
+      const fam = cssFontFamily(f.family);
+      if (fam) diff.push(`font-family: ${fam};`);
+    }
+    if (f.size !== null && f.size !== undefined && f.size !== main.size) diff.push(`font-size: ${to(f.size)};`);
+    if (f.weight !== null && f.weight !== undefined && f.weight !== main.weight) diff.push(`font-weight: ${f.weight};`);
+    const c = cssColor(r.color?.color);
+    if (c && c !== mainColor) diff.push(`color: ${c};`);
+    if (f.letterSpacing && f.letterSpacing !== main.letterSpacing) diff.push(`letter-spacing: ${to(f.letterSpacing)};`);
+    if (diff.length === 0) {
+      html.push(htmlEscape(r.content));
+      continue;
+    }
+    n += 1;
+    html.push(`<span class="r${n}">${htmlEscape(r.content)}</span>`);
+    rules.push(`.${className} .r${n} { ${diff.join(' ')} }`);
+  }
+  return { html: html.join(''), rules, runCount: runs.length };
+}
+
+/** 块 → 结构化生成项（web / mini 两套属性行 + 富文本）。 */
+export function buildCodeItems(blocks, layers, meta, opts = {}) {
+  const target = opts.target ?? 'both';
+  const canMini = unitScale(meta?.width, opts.rpxBase) !== null;
+  const used = new Map();
+  const items = [];
+  for (const b of blocks) {
+    const layer = Number.isInteger(b.layerIndex) ? layers[b.layerIndex] : null;
+    const className = cssClassName(b.name, b.kind, used);
+    const web = (target === 'web' || target === 'both')
+      ? blockCssLines(b, layer, { ...opts, target: 'web', designWidth: meta.width })
+      : null;
+    const mini = (target === 'mini' || target === 'both') && canMini
+      ? blockCssLines(b, layer, { ...opts, target: 'mini', designWidth: meta.width })
+      : null;
+    if (mini === null && target === 'mini' && !canMini) {
+      // 画板宽未知 → **不硬算 rpx**（拿 375 兜底会给出错的基准）
+    }
+    const runsOfTarget = (t) => textRunsCss(b, layer, className, { ...opts, target: t, designWidth: meta.width });
+    items.push({
+      index: items.length + 1,
+      name: b.name ?? null,
+      kind: b.kind,
+      label: blockLabel(b),
+      className,
+      x: b.x, y: b.y, w: b.w, h: b.h,
+      web,
+      mini,
+      runs: (web || mini) ? (runsOfTarget(target === 'mini' ? 'mini' : 'web')) : null,
+    });
+  }
+  return { items, canMini };
+}
+
+/** 结构化生成项 → **可直接整段复制**的文本（工具/CLI 的人读出口）。 */
+export function renderGenCode(items, meta, opts = {}) {
+  const target = opts.target ?? 'both';
+  const canMini = opts.canMini !== false;
+  const width = meta?.width;
+  const L = [];
+  const head = target === 'mini' ? 'WXSS' : (target === 'both' ? 'CSS + WXSS' : 'CSS');
+  L.push(`/* ${head} —— ${titleName(meta)}（${round2(width)}×${round2(meta?.height)}）${metaSuffix(meta)} */`);
+  L.push(`/* 共 ${items.length} 块 ｜ ${unitBasisNote(width)} */`);
+  L.push('/* 与蓝湖「代码」面板的已知写法差异见 docs/生成代码.md（圆角统一四值 · rgba 逗号后带空格 · 颜色小写 · 椭圆 50% · 渐变文字补三件套） */');
+
+  const section = (title, key) => {
+    const list = items.filter((it) => Array.isArray(it[key]));
+    if (list.length === 0) return;
+    L.push('');
+    L.push(`/* ═══════════ ${title} ═══════════ */`);
+    for (const it of list) {
+      L.push('');
+      L.push(`/* ${String(it.index).padStart(2, ' ')}. ${it.label} · ${round2(it.w)}×${round2(it.h)} · ${BLOCK_KINDS[it.kind] ?? it.kind} */`);
+      L.push(`.${it.className} {`);
+      for (const line of it[key]) L.push(`  ${line}`);
+      L.push('}');
+      if (it.runs && it.runs.rules.length) {
+        L.push(`/* 富文本：该层有 ${it.runs.runCount} 段样式（蓝湖的 web 输出会压扁成一段，我们给分段） */`);
+        L.push(`/*   ${it.runs.html} */`);
+        for (const r of it.runs.rules) L.push(r);
+      } else if (it.runs) {
+        L.push(`/* 富文本：该层有 ${it.runs.runCount} 段样式，各段与主样式一致，无需分段 */`);
+      }
+    }
+  };
+
+  if (target === 'both' || target === 'web') {
+    section('Web（px，1:1）', 'web');
+  }
+  if (target === 'mini' || target === 'both') {
+    if (canMini) section(`小程序（rpx）— ${unitBasisNote(width)}`, 'mini');
+    else L.push('/* ⚠️ 画板宽度未知 → 只给 px（无法换算 rpx，不拿 375 硬算） */');
+  }
+  L.push('');
+  return L.join('\n');
+}
+
+/**
+ * 工具入口：给一张稿（或指定块）→ 可直接粘贴的 CSS / WXSS。
+ * **只读**：只调既有的读稿接口（GET），从不写任何东西。
+ */
+export async function genCode(args = {}) {
+  const target = ['web', 'mini', 'both'].includes(args.target) ? args.target : 'both';
+  const opened = await openDesign(args);
+  const { detail, tree, sourceFormat, unsupported, picked, acct, teamId, target: tgt } = opened;
+  if (unsupported) {
+    return unsupportedDesignResult(unsupported, { target: tgt, detail, acct, format: 'code', teamId, nameIsPath: false });
+  }
+  const artboard = tree.artboard ?? tree;
+  // ⭐ 只有这里传 `rich: true` —— 既有链路（read_blocks / read_design / 面板）不传，输出逐字节不变。
+  const layers = flattenArtboard(artboard, { rich: true });
+  let blocks = buildBlocks(layers);
+
+  // 过滤口径与 `read_blocks` **完全一致**（region / kind / minWidth 三项，同一顺序）
+  if (args.region) {
+    const nums = String(args.region).split(/[,:\s]+/).map(Number).filter((n) => Number.isFinite(n));
+    const ro = nums.length >= 4
+      ? { x0: nums[0], y0: nums[1], x1: nums[2], y1: nums[3] }
+      : nums.length >= 2 ? { y0: nums[0], y1: nums[1] } : {};
+    blocks = blocks.filter((b) => {
+      if (ro.y0 !== undefined && (b.y < ro.y0 || b.y > ro.y1)) return false;
+      if (ro.x0 !== undefined && (b.x < ro.x0 || b.x > ro.x1)) return false;
+      return true;
+    });
+  }
+  if (args.minWidth !== undefined) blocks = blocks.filter((b) => b.w >= (Number(args.minWidth) || 0));
+  if (args.kind) {
+    const kinds = String(args.kind).split(/[,|]/).map((s) => s.trim()).filter(Boolean);
+    blocks = blocks.filter((b) => kinds.includes(b.kind));
+  }
+  const totalBlocks = blocks.length;
+  const visible = visibleBlocks(blocks, { includeNoise: args.includeNoise });
+  const limit = Number.isFinite(Number(args.limit)) && Number(args.limit) > 0 ? Number(args.limit) : LIMITS.codeMaxBlocks;
+  const shown = visible.slice(0, limit);
+
+  const meta = designMetaOf(artboard, detail, tree);
+  const { items, canMini } = buildCodeItems(shown, layers, meta, { target, rpxBase: args.rpxBase });
+  const text = renderGenCode(items, meta, { target, canMini });
+
+  const kindCounts = {};
+  for (const b of shown) kindCounts[b.kind] = (kindCounts[b.kind] ?? 0) + 1;
+
+  return {
+    ok: true,
+    format: 'code',
+    name: meta.name,
+    viewport: { width: meta.width, height: meta.height },
+    target,
+    /** rpx 基准能不能算 —— 画板宽度未知时为 false（那时只出 px，**不拿 375 硬算**）。 */
+    miniAvailable: canMini,
+    unitBasis: unitBasisNote(meta.width),
+    blockCount: items.length,
+    totalBlocks,
+    truncated: visible.length > shown.length,
+    noiseCount: blocks.filter((b) => b.noise).length,
+    kindCounts,
+    codeClassNames: items.map((it) => it.className),
+    codes: items.map((it) => ({
+      index: it.index,
+      name: it.name,
+      kind: it.kind,
+      className: it.className,
+      selector: `.${it.className}`,
+      web: it.web,
+      mini: it.mini,
+    })),
+    layerCount: layers.length,
+    teamId,
+    projectId: tgt?.projectId ?? null,
+    imageId: tgt?.imageId ?? null,
+    account: acct ?? null,
+    accountBy: picked.by ?? null,
+    version: versionInfo(meta, detail),
+    versionIsLatest: meta.versionIsLatest ?? null,
+    latestVersionAt: meta.latestVersionAt ?? null,
+    ...(sourceFormat ? { sourceFormat } : {}),
+    text,
+  };
+}
+
+/**
+ * 打开一张稿的**公共上半段**（`readBlocks` / `readDesign` 之外的第三个调用方：`genCode`）。
+ *
+ * 抽出来的理由：这一段有 4 件容易写歪的事 —— 目标解析、**多账号自动判定**、
+ * 版本读取（`version` / `urlVersionId`）、`unsupported` 透传。三个入口各抄一遍，
+ * 迟早出现"read_blocks 能读、gen_code 说读不到"这种漂移。
+ *
+ * ⚠️ 抽的时候**逐字保留**原 `readBlocks` 开头的行为（连注释里的取舍都保留）——
+ *    它是"既有输出逐字节不变"这条硬约束覆盖的路径。
+ */
+export async function openDesign(args = {}) {
   const target = resolveTarget({ projectId: args.projectId, imageId: args.imageId, url: args.url });
   let teamId = null;
   if (args.url) {
@@ -5460,9 +6108,35 @@ export async function readBlocks(args = {}) {
   // 同 readDesign：没指定账号就按链接自动判定
   const picked = await pickAccount({ ...args, projectId: target.projectId, imageId: target.imageId, teamId: target.teamId });
   const acct = picked.alias;
-  const { detail, tree, bytes, sourceFormat, unsupported } = await fetchDesignTree(target.projectId, target.imageId, {
+  const fetched = await fetchDesignTree(target.projectId, target.imageId, {
     cookie: args.cookie, account: acct, version: args.version, urlVersionId: target.versionId, teamId: target.teamId, pageId: args.pageId,
   });
+  return { target, teamId, picked, acct, ...fetched };
+}
+
+/** 画板元信息（`readBlocks` 与 `genCode` 共用同一份组装 —— 两处各写一遍必然漂移）。 */
+export function designMetaOf(artboard, detail, tree) {
+  return {
+    name: artboard.name ?? detail.name,
+    width: round2(artboard.frame?.width ?? detail.width),
+    height: round2(artboard.frame?.height ?? detail.height),
+    // 溯源（§4.7）：与 readDesign 同口径 —— 拿不到就不打（由 metaSuffix 判断）
+    versionId: detail.versionId ?? null,
+    versionIsLatest: detail.versionIsLatest ?? null,
+    latestVersionAt: detail.latestVersionAt ?? null,
+    // 画板原点：块坐标是"相对画板"的，比对层换算坐标必须减掉它
+    // （实测画板 left 是 -10279 这种大负数，直接用块的绝对坐标会和页面完全错位）
+    origin: {
+      x: round2(artboard.frame?.left ?? artboard.realFrame?.left ?? 0),
+      y: round2(artboard.frame?.top ?? artboard.realFrame?.top ?? 0),
+    },
+    device: tree.meta?.device,
+    assets: Array.isArray(tree.assets) ? tree.assets.length : 0,
+  };
+}
+
+export async function readBlocks(args = {}) {
+  const { target, teamId, picked, acct, detail, tree, bytes, sourceFormat, unsupported } = await openDesign(args);
   // ⭐ 「解析不出图层」→ **明说**。这一条就是本次要修的缺陷：
   //    以前这里会一路走到底、输出「共 1 块：画板 1」+ 空表 —— 看着跑成功、其实什么都没解析出来。
   if (unsupported) {
@@ -5494,23 +6168,7 @@ export async function readBlocks(args = {}) {
     blocks = blocks.filter((b) => kinds.includes(b.kind));
   }
 
-  const meta = {
-    name: artboard.name ?? detail.name,
-    width: round2(artboard.frame?.width ?? detail.width),
-    height: round2(artboard.frame?.height ?? detail.height),
-    // 溯源（§4.7）：与 readDesign 同口径 —— 拿不到就不打（由 metaSuffix 判断）
-    versionId: detail.versionId ?? null,
-    versionIsLatest: detail.versionIsLatest ?? null,
-    latestVersionAt: detail.latestVersionAt ?? null,
-    // 画板原点：块坐标是"相对画板"的，比对层换算坐标必须减掉它
-    // （实测画板 left 是 -10279 这种大负数，直接用块的绝对坐标会和页面完全错位）
-    origin: {
-      x: round2(artboard.frame?.left ?? artboard.realFrame?.left ?? 0),
-      y: round2(artboard.frame?.top ?? artboard.realFrame?.top ?? 0),
-    },
-    device: tree.meta?.device,
-    assets: Array.isArray(tree.assets) ? tree.assets.length : 0,
-  };
+  const meta = designMetaOf(artboard, detail, tree);
   const kindCounts = {};
   for (const b of blocks) kindCounts[b.kind] = (kindCounts[b.kind] ?? 0) + 1;
   // 无障碍对比度审计（§4.8）：与表格**同一套可见集**（noise 折叠口径一致），

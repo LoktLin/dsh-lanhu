@@ -141,7 +141,25 @@ const {
   ddsSchema,
   // —— 「示例与真值同源」（⑫）：色值示例唯一出口 ——
   rgbaString,
+  rgbHex,
   bgText,
+  // —— 生成代码（§4.10）——
+  genCode,
+  cssColor,
+  cssClassName,
+  cssFontFamily,
+  cssGradient,
+  cssShadow,
+  cssBorder,
+  cssRadius,
+  blockCssLines,
+  textRunsCss,
+  buildCodeItems,
+  renderGenCode,
+  gradientAngle,
+  gradientInfoOf,
+  textRunsOf,
+  richInfoOf,
   // —— 评论 / 标注（§4.9）——
   fetchComments,
   renderComments,
@@ -5455,6 +5473,468 @@ group('⑫ 提示示例同源 / 徽标令牌化');
       badge.map((b) => stripVars(b.props.style.border)).join(' , '));
     eq('7 类徽标渲染出 7 个互不相同的颜色（互相可区分）',
       new Set(badge.map((b) => b.props.style.color)).size, 7);
+  }
+}
+
+/* ═══════════════ ⑯ 生成代码（lanhu_gen_code，§4.10） ═══════════════ */
+group('⑯ 生成代码（lanhu_gen_code，§4.10）');
+
+{
+  // ── 离线夹具：一棵覆盖各种「数值形状」的树 ──
+  // 形状**照真稿抄**（色分量 0..1、渐变方向 from/to 归一化 0..1、阴影 spread/inset、rotation 度数）。
+  const C = (r, g, b, a = 1) => ({ r: r / 255, g: g / 255, b: b / 255, a });
+  const G = (from, to, stops) => ({
+    type: 'gradient',
+    isEnabled: true,
+    gradient: { type: 0, from, to, stops: stops.map(([position, color]) => ({ position, color })) },
+  });
+  const SH = (o) => ({ isEnabled: true, x: 0, y: 0, blur: 0, spread: 0, inset: false, ...o });
+  const RD = (tl, tr, br, bl) => ({ topLeft: tl, topRight: tr, bottomRight: br, bottomLeft: bl });
+  const BORDER = (o) => ({ isEnabled: true, style: 'solid', width: 1, widths: { left: 1, top: 1, right: 1, bottom: 1 }, ...o });
+  const N = (name, frame, style = {}, extra = {}) => ({
+    name,
+    type: 'frame',
+    frame,
+    style: { fills: [], borders: [], shadows: [], blurs: [], ...style },
+    paths: [],
+    layers: [],
+    ...extra,
+  });
+  const TXT = (name, frame, content, font, color, extra = {}) => ({
+    name,
+    type: 'textLayer',
+    frame,
+    style: { fills: color ? [{ type: 'color', isEnabled: true, color }] : [], borders: [], shadows: [], blurs: [], ...(extra.style ?? {}) },
+    paths: [],
+    layers: [],
+    text: { value: content, style: { content, font, color, ...(extra.text ?? {}) } },
+    ...(extra.node ?? {}),
+  });
+
+  const TREE = {
+    artboard: {
+      name: '生成夹具',
+      frame: { left: 0, top: 0, width: 375, height: 800 },
+      layers: [
+        // ① 渐变按钮：两层阴影（一层 inset）+ 四角相等
+        N('Button', { left: 32, top: 100, width: 311, height: 42 }, {
+          fills: [G({ x: 0, y: 0.5 }, { x: 1, y: 0.5 }, [[0, C(111, 103, 249)], [1, C(84, 70, 243)]])],
+          shadows: [
+            SH({ x: 0, y: 4, blur: 12, spread: 0, inset: true, color: C(232, 230, 255, 0.35) }),
+            SH({ x: 0, y: 4, blur: 10, spread: 0, inset: false, color: C(0, 0, 0, 0.12) }),
+          ],
+        }, { paths: [{ type: 'rect', radius: RD(9999, 9999, 9999, 9999) }] }),
+        // ② 半透明胶囊：底色 + 同色 1px 描边
+        N('Verified Badge', { left: 216, top: 223, width: 66, height: 21 }, {
+          fills: [{ type: 'color', isEnabled: true, color: C(87, 74, 244, 0.1) }],
+          borders: [BORDER({ color: C(87, 74, 244, 0.1) })],
+        }, { paths: [{ type: 'rect', radius: RD(9999, 9999, 9999, 9999) }] }),
+        // ③ 圆形图标：ellipse + 渐变 + 单层阴影
+        N('Icon Round', { left: 44, top: 388, width: 48, height: 48 }, {
+          fills: [G({ x: 0.1464466, y: 0.75 }, { x: 0.8535534, y: 0.25 }, [[0, C(104, 92, 245)], [1, C(151, 142, 251)]])],
+          shadows: [SH({ x: 0, y: 1, blur: 2, spread: 0, color: C(191, 219, 254, 0.5) })],
+        }, { paths: [{ type: 'ellipse', radius: RD(0, 0, 0, 0) }] }),
+        // ⑫ 椭圆环：12px 半透明描边、没有填充（蓝湖给 border-radius: 0 → 会画成方形）
+        N('Ring', { left: 100, top: 388, width: 93, height: 93 }, {
+          borders: [BORDER({ width: 12, widths: { left: 0, top: 0, right: 0, bottom: 0 }, color: C(26, 148, 255, 0.3) })],
+        }, { paths: [{ type: 'ellipse', radius: RD(0, 0, 0, 0) }] }),
+        // ⑭ 发光圆点：spread ≠ 0、阴影色 ≠ 背景色
+        N('Glow Dot', { left: 1826, top: 210, width: 10, height: 10 }, {
+          fills: [{ type: 'color', isEnabled: true, color: C(112, 232, 255) }],
+          shadows: [SH({ x: 0, y: 0, blur: 10, spread: 3, color: C(51, 255, 255) })],
+        }, { paths: [{ type: 'ellipse', radius: RD(0, 0, 0, 0) }] }),
+        // ④ 文字标题：**有** line-height；且**有全 0 的圆角数据**（文字层不许因此出 border-radius）
+        TXT('核心能力', { left: 879, top: 1022, width: 133, height: 60 }, '核心能力',
+          { name: 'YouSheBiaoTiHei', size: 36, fontWeight: 400, align: 'left', lineHeight: { unit: 'PIXELS', value: 60 } },
+          C(11, 25, 51), { node: { radius: RD(0, 0, 0, 0) } }),
+        // ⑤ 文字：**没有** line-height（一个字都不许出）
+        TXT('副标题', { left: 30, top: 300, width: 238, height: 21 }, '来源：中国碳足迹平台',
+          { name: 'Source Han Sans CN', size: 14, fontWeight: 400, align: 'left' }, C(63, 77, 102)),
+        // ⑥ 文字 + text-shadow
+        TXT('数字', { left: 40, top: 340, width: 35, height: 31 }, '89',
+          { name: 'Inter', size: 24, fontWeight: 700, align: 'left' }, C(70, 147, 255), {
+            style: { shadows: [SH({ x: 0, y: 0, blur: 6, spread: 0, color: C(17, 61, 3, 0.1) })] },
+          }),
+        // ⑬ 渐变文字：文字层 + 填充是渐变 + **没有** color
+        TXT('渐变数字', { left: 60, top: 400, width: 48, height: 42 }, '220.8',
+          { name: 'YouSheBiaoTiHei', size: 32, fontWeight: 400, align: 'left' }, null, {
+            style: { fills: [G({ x: 0, y: 0.5 }, { x: 1, y: 0.5 }, [[0, C(239, 255, 255)], [1, C(83, 251, 248)]])] },
+          }),
+        // ⑧ 卡片：3 段渐变（小数百分比 + rgba/hex 混用）+ opacity + 全 0 圆角
+        N('Grad Card', { left: 0, top: 500, width: 464, height: 396 }, {
+          fills: [G({ x: 0.1, y: 0.9 }, { x: 0.9, y: 0.1 }, [
+            [0, C(230, 230, 230, 0)], [0.2966, C(216, 235, 211, 0.48)], [1, C(201, 240, 189)],
+          ])],
+        }, { opacity: 0.5, paths: [{ type: 'rect', radius: RD(0, 0, 0, 0) }] }),
+        // ⑩ 毛玻璃
+        N('Glass', { left: 0, top: 950, width: 120, height: 90 }, {
+          fills: [G({ x: 0, y: 0.5 }, { x: 1, y: 0.5 }, [[0, C(245, 255, 241)], [1, C(255, 255, 255)]])],
+          shadows: [SH({ x: 0, y: 0, blur: 10, spread: 0, color: C(17, 61, 3, 0.1) })],
+          borders: [BORDER({ color: C(255, 255, 255) })],
+          blurs: [{ type: 'Background', radius: 10, isEnabled: true }],
+        }, { paths: [{ type: 'rect', radius: RD(4, 4, 4, 4) }] }),
+        // ⑦ 渐变边框（+ 背景渐变）
+        N('Grad Border', { left: 16, top: 1100, width: 500, height: 159 }, {
+          fills: [G({ x: 0.1, y: 0.5006 }, { x: 0.1, y: 0.4994 }, [[0, C(6, 48, 124)], [1, C(1, 18, 50)]])],
+          borders: [{
+            isEnabled: true,
+            style: 'gradient',
+            width: 1,
+            lineAlignment: 'inside',
+            widths: { left: 1, top: 1, right: 1, bottom: 1 },
+            gradient: {
+              type: 0,
+              from: { x: 0.1, y: 0.5006 },
+              to: { x: 0.1, y: 0.4994 },
+              stops: [{ position: 0, color: C(55, 109, 202) }, { position: 1, color: C(44, 106, 165, 0) }],
+            },
+          }],
+        }, { paths: [{ type: 'rect', radius: RD(0, 0, 0, 0) }] }),
+        // 实色四边（半透明色）+ 单边分割线
+        N('Outline', { left: 0, top: 1300, width: 100, height: 40 }, {
+          borders: [BORDER({ width: 2, widths: { left: 2, top: 2, right: 2, bottom: 2 }, color: C(226, 232, 240, 0.5) })],
+        }),
+        N('Divider', { left: 0, top: 1360, width: 375, height: 1 }, {
+          borders: [BORDER({ widths: { left: 0, top: 1, right: 0, bottom: 0 }, color: C(226, 232, 240) })],
+        }),
+        // ⑯ 同一个块**同时**有渐变背景与渐变边框 + alpha 0.02 的精度陷阱
+        N('Dual Gradient', { left: 0, top: 1700, width: 90, height: 58 }, {
+          fills: [G({ x: 0.5, y: 0 }, { x: 0.5, y: 1 }, [[0, C(0, 128, 229, 0)], [1, C(17, 76, 123)]])],
+          borders: [{
+            isEnabled: true,
+            style: 'gradient',
+            width: 1,
+            lineAlignment: 'inside',
+            widths: { left: 1, top: 1, right: 1, bottom: 1 },
+            gradient: {
+              type: 0,
+              from: { x: 0.5, y: 0 },
+              to: { x: 0.5, y: 1 },
+              stops: [
+                { position: 0, color: C(255, 255, 255, 0.02) },
+                { position: 1, color: C(255, 255, 255, 0.1) },
+              ],
+            },
+          }],
+        }, { paths: [{ type: 'rect', radius: RD(10, 10, 10, 10) }] }),
+        // 非对称四值圆角 + 旋转（⑮）
+        N('Asym', { left: 0, top: 1400, width: 60, height: 60 }, {}, {
+          rotation: 180,
+          paths: [{ type: 'rect', radius: RD(1, 2, 3, 4) }],
+        }),
+        // 没有圆角 / 边框（有底色才算块）—— 除尺寸与底色外一个字都不该出
+        N('Plain', { left: 0, top: 1480, width: 20, height: 20 }, {
+          fills: [{ type: 'color', isEnabled: true, color: C(120, 120, 120) }],
+        }),
+        // 重名 + 数字开头 + 空名
+        N('Button', { left: 300, top: 1500, width: 40, height: 40 }, { fills: [{ type: 'color', isEnabled: true, color: C(92, 201, 59) }] }),
+        N('2x Icon', { left: 0, top: 1550, width: 24, height: 24 }, {
+          fills: [{ type: 'color', isEnabled: true, color: C(0, 0, 0) }],
+        }),
+        N('', { left: 0, top: 1600, width: 24, height: 24 }, {
+          fills: [{ type: 'color', isEnabled: true, color: C(0, 0, 0) }],
+        }),
+        // ⑪ 富文本：一段文字 4 个 run
+        (() => {
+          const runs = [
+            { from: 0, to: 10, content: '1号车间电能表 · ', font: { name: 'Alibaba PuHuiTi 2.0', size: 12, fontWeight: 500 }, color: C(243, 250, 255) },
+            { from: 10, to: 12, content: '表号', font: { name: 'Alibaba PuHuiTi 2.0', size: 12, fontWeight: 500 }, color: C(143, 169, 193) },
+            { from: 12, to: 13, content: ' ', font: { name: 'Alibaba PuHuiTi 2.0', size: 12, fontWeight: 500 }, color: C(243, 250, 255) },
+            { from: 13, to: 20, content: 'MTR-001', font: { name: 'Alibaba PuHuiTi 2.0', size: 12, fontWeight: 700 }, color: C(112, 232, 255) },
+          ];
+          return {
+            name: '设备名称',
+            type: 'textLayer',
+            frame: { left: 1449, top: 924, width: 206, height: 18 },
+            style: { fills: [{ type: 'color', isEnabled: true, color: C(243, 250, 255) }], borders: [], shadows: [], blurs: [] },
+            paths: [],
+            layers: [],
+            text: {
+              value: '1号车间电能表 · 表号 MTR-001',
+              // ⚠️ runs 在 `text.styles`（与 `value` / `style` **并列**）—— 这是实测的 Figma 形状，
+              //    放进 `text.style` 里就取不到了（本夹具一开始就写错过，被 H4 那条断言抓出来）。
+              styles: runs,
+              style: {
+                content: '1号车间电能表 · 表号 MTR-001',
+                font: { name: 'Alibaba PuHuiTi 2.0', size: 12, fontWeight: 500, align: 'left', lineHeight: { unit: 'PIXELS', value: 18 } },
+                color: C(243, 250, 255),
+              },
+            },
+          };
+        })(),
+      ],
+    },
+  };
+
+  const gen = (t, o = {}) => {
+    const ab = t.artboard ?? t;
+    const { width: widthOverride, ...rest } = o;
+    const ls = flattenArtboard(ab, { rich: true });
+    const bs = buildBlocks(ls);
+    const meta = {
+      name: ab.name,
+      width: widthOverride ?? ab.frame.width,
+      height: ab.frame.height,
+      origin: { x: 0, y: 0 },
+    };
+    const target = rest.target ?? 'both';
+    const built = buildCodeItems(bs, ls, meta, { ...rest, target });
+    const text = renderGenCode(built.items, meta, { target, canMini: built.canMini });
+    return { ...built, text, blocks: bs, layers: ls, meta };
+  };
+  const at = (R, label) => R.items.find((it) => it.label === label) ?? { web: [], mini: [], runs: null, className: null };
+  const find = (arr, re) => (arr ?? []).find((l) => re.test(l)) ?? '';
+
+  const A = gen(TREE);
+  const btn = at(A, 'Button');
+
+  /* ── A. 双平台：同一份实现、只换单位 ── */
+  ok('A1 web 给 px（1:1）', btn.web.includes('width: 311px;') && btn.web.includes('height: 42px;'), btn.web.join(' '));
+  ok('A2 mini 给 rpx（画板 375 → ×2）', btn.mini.includes('width: 622rpx;') && btn.mini.includes('height: 84rpx;'), btn.mini.join(' '));
+  ok('A3 mini 与 web 属性条数一一对应（不是两套实现）', btn.web.length === btn.mini.length, `${btn.web.length} vs ${btn.mini.length}`);
+  {
+    const A750 = gen(TREE, { width: 750 });
+    const b750 = at(A750, 'Button');
+    ok('A4 换算基准跟着画板走：宽 750 → rpx 与 px 同值', b750.mini.includes('width: 311rpx;'), b750.mini.join(' '));
+    const A0 = gen(TREE, { width: 0 });
+    ok('A5 画板宽度未知 → 只给 px，不拿 375 硬算 rpx',
+      A0.canMini === false && at(A0, 'Button').mini === null, `canMini=${A0.canMini}`);
+    ok('A6 画板宽度未知时文本里明说了', A0.text.includes('画板宽度未知'), A0.text.split('\n').slice(0, 3).join(' | '));
+    ok('A7 文本里写明用的是哪个基准', A.text.includes('×2'), A.text.split('\n')[1]);
+  }
+
+  /* ── B. 圆角：一律四值 ── */
+  ok('B1 四角相等也要四值（不许写单值 9999px）',
+    btn.web.includes('border-radius: 9999px 9999px 9999px 9999px;'), find(btn.web, /border-radius/));
+  ok('B2 全 0 也要四值（有圆角数据时）',
+    at(A, 'Grad Card').web.includes('border-radius: 0px 0px 0px 0px;'), find(at(A, 'Grad Card').web, /border-radius/));
+  ok('B3 四值按 TL TR BR BL 顺序出（1/2/3/4 不许重排）',
+    at(A, 'Asym').web.includes('border-radius: 1px 2px 3px 4px;'), find(at(A, 'Asym').web, /border-radius/));
+  ok('B4 压根没有圆角数据时一个字都不出',
+    !at(A, 'Plain').web.some((l) => l.startsWith('border-radius')), at(A, 'Plain').web.join(' '));
+  ok('B5 mini 的四值也跟着换算（9999 → 19998）',
+    btn.mini.includes('border-radius: 19998rpx 19998rpx 19998rpx 19998rpx;'), find(btn.mini, /border-radius/));
+  ok('B6 文字层的"全 0 圆角数据"不出 border-radius（文字没有圆角概念，蓝湖也不出）',
+    !at(A, '核心能力').web.some((l) => l.startsWith('border-radius')), at(A, '核心能力').web.join(' '));
+
+  /* ── C. ⑫/⑭ 椭圆与阴影 ── */
+  ok('C1 椭圆图元不许给 0px 四值（那样会画成方形环），必须 50%',
+    at(A, 'Ring').web.includes('border-radius: 50% 50% 50% 50%;') && !at(A, 'Ring').web.some((l) => l.includes('0px 0px 0px 0px')),
+    at(A, 'Ring').web.join(' '));
+  ok('C2 椭圆图元同样不许出 border-radius: 0（另一种写法也要拦住）',
+    !at(A, 'Icon Round').web.some((l) => /border-radius: 0/.test(l)), at(A, 'Icon Round').web.join(' '));
+  {
+    const bs = find(btn.web, /^box-shadow:/);
+    ok('C3 多层阴影合成一条、逗号分隔两层', bs.split('), ').length === 2, bs);
+    ok('C4 inset 只出现在它自己那一层',
+      (bs.match(/inset/g) ?? []).length === 1 && bs.startsWith('box-shadow: inset '), bs);
+    ok('C5 spread 也出（四位齐全 x y blur spread）', (bs.match(/px/g) ?? []).length === 8, bs);
+    ok('C6 阴影色写法：不透明给 hex、半透明给 rgba（同一出口）',
+      bs.includes('rgba(232, 230, 255, 0.35)') && bs.includes('rgba(0, 0, 0, 0.12)'), bs);
+  }
+  {
+    const glow = at(A, 'Glow Dot').web.join(' ');
+    ok('C7 spread ≠ 0 时必须出现（写成 0px 就算漏）',
+      glow.includes('box-shadow: 0px 0px 10px 3px #33ffff;'), find(at(A, 'Glow Dot').web, /box-shadow/));
+    ok('C8 阴影色与背景色是两个色（别弄成同一个）',
+      glow.includes('background: #70e8ff;') && !glow.includes('10px 3px #70e8ff'), glow);
+  }
+  {
+    const t = at(A, '数字').web;
+    ok('C9 文字层的阴影走 text-shadow，而不是 box-shadow',
+      t.some((l) => l.startsWith('text-shadow:')) && !t.some((l) => l.startsWith('box-shadow:')), t.join(' '));
+    ok('C10 text-shadow 没有 inset / spread（语法里就没这两项）',
+      find(t, /^text-shadow:/) === 'text-shadow: 0px 0px 6px rgba(17, 61, 3, 0.1);', find(t, /^text-shadow:/));
+  }
+  ok('C11 毛玻璃（模糊 type=Background → backdrop-filter）',
+    at(A, 'Glass').web.includes('backdrop-filter: blur(10px);'), at(A, 'Glass').web.join(' '));
+  ok('C12 opacity 只在 <1 时出（100% 不出这条）',
+    at(A, 'Grad Card').web.includes('opacity: 0.5;') && !btn.web.some((l) => l.startsWith('opacity')), at(A, 'Grad Card').web.join(' '));
+
+  /* ── D. 渐变：角度 + 全部 stop + 小数百分比 + rgba/hex 混用 ── */
+  ok('D1 渐变角度来自 from/to（水平 → 90deg）',
+    at(A, 'Button').web.includes('background: linear-gradient(90deg, #6f67f9 0%, #5446f3 100%);'), find(at(A, 'Button').web, /^background/));
+  ok('D2 角度换算：⑬那条正方形样本 55°（atan2(dx,-dy) 手算 54.7356）',
+    gradientAngle({ x: 0.1464466, y: 0.75 }, { x: 0.8535534, y: 0.25 }) === 55,
+    String(gradientAngle({ x: 0.1464466, y: 0.75 }, { x: 0.8535534, y: 0.25 })));
+  ok('D3 角度规范化：竖直向上 → 0（与蓝湖的 360 等价，统一成 0）',
+    gradientAngle({ x: 0.5, y: 1 }, { x: 0.5, y: 0 }) === 0,
+    String(gradientAngle({ x: 0.5, y: 1 }, { x: 0.5, y: 0 })));
+  {
+    const cb = find(at(A, 'Grad Card').web, /^background: linear-gradient/);
+    ok('D4 全部 stop 都在（3 段一个不少）', (cb.match(/%/g) ?? []).length === 3, cb);
+    ok('D5 小数百分比原样保留（29.66%）', cb.includes('29.66%'), cb);
+    ok('D6 rgba 与 hex 混用、半透明那一档没被写成实色',
+      cb.includes('rgba(230, 230, 230, 0)') && cb.includes('rgba(216, 235, 211, 0.48)') && cb.includes('#c9f0bd'), cb);
+  }
+
+  /* ── E. 边框：实色 vs 渐变 ── */
+  ok('E1 实色四边 → border: Npx solid <色>', at(A, 'Outline').web.includes('border: 2px solid rgba(226, 232, 240, 0.5);'),
+    at(A, 'Outline').web.join(' '));
+  ok('E2 单边 → border-top: 1px solid <色>（分割线不走 border-image）',
+    at(A, 'Divider').web.includes('border-top: 1px solid #e2e8f0;'), at(A, 'Divider').web.join(' '));
+  {
+    const gb = at(A, 'Grad Border').web;
+    ok('E3 渐变边框 → 不带色的 border + border-image … 1 1',
+      gb.includes('border: 1px solid;') && gb.some((l) => l.startsWith('border-image: linear-gradient(') && l.endsWith(' 1 1;')), gb.join(' '));
+    ok('E4 渐变边框的 stop 全在（含 0% / 100%）',
+      find(gb, /^border-image:/).includes('#376dca 0%') && find(gb, /^border-image:/).includes('rgba(44, 106, 165, 0) 100%'),
+      find(gb, /^border-image:/));
+    ok('E5 渐变边框**不许**退化成 border: Npx solid <色>（那行只有粗细、没有颜色）',
+      !gb.some((l) => /^border: [\d.]+px solid \S/.test(l)), gb.join(' '));
+    ok('E6 背景渐变与边框渐变是两个不同的渐变（别串了）',
+      find(gb, /^background:/) !== find(gb, /^border-image:/), gb.join(' '));
+  }
+  ok('E7 半透明 12px 粗边框（⑫）：粗细 / 颜色 / alpha 三项都对',
+    at(A, 'Ring').web.includes('border: 12px solid rgba(26, 148, 255, 0.3);'), at(A, 'Ring').web.join(' '));
+
+  /* ── F. 文字：line-height 只在有值时出 ── */
+  ok('F1 有 line-height 就出', at(A, '核心能力').web.includes('line-height: 60px;'), at(A, '核心能力').web.join(' '));
+  ok('F2 没有 line-height 一个字都不出', !at(A, '副标题').web.some((l) => l.startsWith('line-height')),
+    at(A, '副标题').web.join(' '));
+  ok('F3 字重给数值（不是 normal/bold）', at(A, '核心能力').web.includes('font-weight: 400;'), at(A, '核心能力').web.join(' '));
+  ok('F4 字体族含 `.` 时加引号（不加引号不合法）',
+    at(A, '数字').web.includes('font-family: Inter;') && at(A, '设备名称').web.includes('font-family: "Alibaba PuHuiTi 2.0";'),
+    at(A, '设备名称').web.join(' '));
+  ok('F5 字体族全是标识符时不加引号（Source Han Sans CN 这样写就是合法的一个族名）',
+    cssFontFamily('Source Han Sans CN') === 'Source Han Sans CN', cssFontFamily('Source Han Sans CN'));
+
+  /* ── G. 颜色只有一个出口 ── */
+  {
+    const semi = rgbaString({ r: 87, g: 74, b: 244, a: 0.1 });
+    ok('G1 半透明色 === rgbaString() 的真实产出（改 rgbaString，生成结果必然跟着变）',
+      at(A, 'Verified Badge').web.includes(`background: ${semi};`), at(A, 'Verified Badge').web.join(' '));
+    ok('G2 形态确实是"逗号后带空格"（不是蓝湖那种无空格写法）', /^rgba\(87, 74, 244, 0\.1\)$/.test(semi), semi);
+    ok('G3 cssColor 与 rgbaString / rgbHex 同源（同一个输入给同一个串）',
+      cssColor({ r: 87, g: 74, b: 244, a: 0.1 }) === semi && cssColor({ r: 111, g: 103, b: 249, a: 1 }) === rgbHex({ r: 111, g: 103, b: 249 }),
+      cssColor({ r: 87, g: 74, b: 244, a: 0.1 }));
+    ok('G4 生成结果里出现的每个半透明色都是"逗号后带空格"的形态（大面积扫一遍）',
+      A.items.every((it) => [].concat(it.web ?? [], it.mini ?? []).every((l) => (l.match(/rgba\([^)]*\)/g) ?? [])
+        .every((c) => /^rgba\(\d{1,3}, \d{1,3}, \d{1,3}, (?:0|1|0\.\d{1,2})\)$/.test(c)))),
+      A.items.flatMap((it) => it.web ?? []).flatMap((l) => l.match(/rgba\([^)]*\)/g) ?? [])
+        .filter((c) => !/^rgba\(\d{1,3}, \d{1,3}, \d{1,3}, (?:0|1|0\.\d{1,2})\)$/.test(c)).join(' , '));
+  }
+
+  /* ── H. 渐变文字（⑬）与富文本（⑪） ── */
+  {
+    const gt = at(A, '渐变数字').web;
+    ok('H1 渐变文字：四件套都在（否则会画成色块）',
+      gt.includes('-webkit-background-clip: text;') && gt.includes('background-clip: text;')
+      && gt.includes('-webkit-text-fill-color: transparent;') && gt.includes('color: transparent;'), gt.join(' '));
+    ok('H2 渐变文字的 background 仍是渐变（不是实色块）',
+      find(gt, /^background:/).startsWith('background: linear-gradient('), find(gt, /^background:/));
+    ok('H3 普通文字不会被误判成渐变文字（不带 background-clip）',
+      !at(A, '核心能力').web.some((l) => l.includes('background-clip')), at(A, '核心能力').web.join(' '));
+  }
+  {
+    const rt = at(A, '设备名称');
+    ok('H4 富文本：识别出 4 段', rt.runs && rt.runs.runCount === 4, JSON.stringify(rt.runs && rt.runs.runCount));
+    ok('H5 富文本：蓝图里用 span 分段，差异段带 class',
+      rt.runs && rt.runs.html.includes('<span class="r1">表号</span>') && rt.runs.html.includes('<span class="r2">MTR-001</span>'),
+      rt.runs ? rt.runs.html : '');
+    ok('H6 富文本：每段自己的颜色 / 字重都出了',
+      rt.runs && rt.runs.rules.some((r) => r.includes('color: #8fa9c1;')) && rt.runs.rules.some((r) => r.includes('font-weight: 700;') && r.includes('color: #70e8ff;')),
+      rt.runs ? rt.runs.rules.join(' ') : '');
+    ok('H7 富文本：文本里写进了代码块（不是只在结构里）',
+      A.text.includes('<span class="r1">表号</span>'), '');
+    ok('H8 单 run 的文字层不产生分段（不重复输出同一份样式）',
+      at(A, '核心能力').runs === null, JSON.stringify(at(A, '核心能力').runs));
+  }
+
+  /* ── I. 旋转（⑮） ── */
+  ok('I1 带旋转的块出 transform: rotate(Ndeg)，角度等于数据真值',
+    at(A, 'Asym').web.includes('transform: rotate(180deg);'), at(A, 'Asym').web.join(' '));
+  ok('I2 180° 不许因为"看着一样"就省掉', /rotate\(180deg\)/.test(A.text), '');
+  ok('I3 没有旋转的块一个字都不出',
+    !at(A, '核心能力').web.some((l) => l.startsWith('transform')), at(A, '核心能力').web.join(' '));
+  ok('I4 rotation 为 0 与"没有这个字段"等价（都不出）',
+    richInfoOf({ rotation: 0 }).rotation === null && richInfoOf({}).rotation === null, '');
+
+  /* ── J. class 名 ── */
+  {
+    const names = A.items.map((it) => it.className);
+    ok('J1 class 名合法（可安全当作选择器）',
+      names.every((n) => /^[a-z_\u4e00-\u9fa5][0-9a-z_\u4e00-\u9fa5-]*$/.test(n)), names.join(','));
+    eq('J2 重名块被区分开（没有两个同名的）', new Set(names).size, names.length);
+    ok('J3 重名的第二块带 -2 后缀', names.includes('button') && names.includes('button-2'), names.join(','));
+    ok('J4 中文名保留（可读性优先）', names.includes('核心能力'), '');
+    ok('J5 以数字开头时补前缀（CSS 里不能以数字开头）', names.includes('b-2x-icon'), names.join(','));
+    ok('J6 空名用类型兜底（不出现空 class）', names.every((n) => n.length > 0), '');
+  }
+
+  /* ── K. 输出形态：可直接整段复制 ── */
+  ok('K1 输出是代码块（选择器 + 花括号），不是表格',
+    /^\.button \{$/m.test(A.text) && A.text.includes('\n}'), A.text.split('\n').slice(4, 8).join(' | '));
+  ok('K2 both 时 web 与 mini 各自成段', A.text.includes('Web（px') && A.text.includes('小程序（rpx'), '');
+  ok('K3 每块都带一行注释说明它是什么', A.text.includes('Button · 311×42'), '');
+  ok('K4 输出里没有 undefined / NaN（宿主对非法 JSON 会拒收整个结果）',
+    !/undefined|NaN/.test(A.text), (A.text.match(/undefined|NaN/g) ?? []).join(','));
+
+  /* ── M. ⑯ 渐变背景 + 渐变边框同块；alpha 精度 ── */
+  {
+    const dg = at(A, 'Dual Gradient').web;
+    ok('M1 同一块上渐变背景与渐变边框**同时**都在（不许互相覆盖/只出一个）',
+      dg.some((l) => l.startsWith('background: linear-gradient(')) && dg.some((l) => l.startsWith('border-image: linear-gradient(')),
+      dg.join(' '));
+    ok('M2 两者各用自己那份 stop（不是同一份被复用了两次）',
+      find(dg, /^background:/).includes('#114c7b') && find(dg, /^border-image:/).includes('rgba(255, 255, 255, 0.02)'),
+      dg.join(' '));
+    ok('M3 两个渐变的方向各自来自自己的 from/to（都是 180deg）',
+      find(dg, /^background:/).includes('linear-gradient(180deg') && find(dg, /^border-image:/).includes('linear-gradient(180deg'),
+      dg.join(' '));
+    ok('M4 alpha 0.02 **不许**被取整掉（抹成 0 就是边框直接消失）',
+      find(dg, /^border-image:/).includes('rgba(255, 255, 255, 0.02)'), find(dg, /^border-image:/));
+    ok('M5 alpha 恰好 0 就写 0（与 0.02 是两回事，别把前者当后者）',
+      find(dg, /^background:/).includes('rgba(0, 128, 229, 0)'), find(dg, /^background:/));
+    ok('M6 cssColor 保留 2 位 alpha 精度（0.02 不许变成 0）',
+      cssColor({ r: 255, g: 255, b: 255, a: 0.02 }) === 'rgba(255, 255, 255, 0.02)',
+      cssColor({ r: 255, g: 255, b: 255, a: 0.02 }));
+    ok('M7 圆角 10px 也照四值出', dg.includes('border-radius: 10px 10px 10px 10px;'), find(dg, /border-radius/));
+    ok('M8 渐变边框仍是"不带色的 border + border-image"（不是实色 border）',
+      dg.includes('border: 1px solid;') && !dg.some((l) => /^border: [\d.]+px solid \S/.test(l)), dg.join(' '));
+  }
+
+  /* ── L. 只读：真跑一次 genCode（桩掉 fetch），断言只发 GET ── */
+  {
+    const calls = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url, init = {}) => {
+      const u = String(url);
+      calls.push({ url: u, method: String(init.method ?? 'GET').toUpperCase() });
+      // ⚠️ json_url 那一层给的是**整棵树**（`{artboard, assets, meta}`），不是 artboard 本身 ——
+      //    直接给 artboard 会被判成「认不出的图层树格式」（本项目最忌讳的静默失败，这里明说）。
+      const payload = u.includes('mock.example')
+        ? { artboard: TREE.artboard, assets: [], meta: {} }
+        : { code: 0, data: { id: 'iid', name: '夹具', width: 375, height: 800, versions: [{ id: 'v1', json_url: 'https://mock.example/tree.json' }] } };
+      const buf = Buffer.from(JSON.stringify(payload), 'utf8');
+      return {
+        ok: true,
+        status: 200,
+        headers: { get: () => 'application/json' },
+        arrayBuffer: async () => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
+      };
+    };
+    let r = null;
+    let err = null;
+    try {
+      r = await genCode({
+        projectId: '00000002-0000-4000-8000-000000000002',
+        imageId: '00000003-0000-4000-8000-000000000003',
+        cookie: 'a=1',
+        target: 'web',
+      });
+    } catch (e) {
+      err = e;
+    } finally {
+      globalThis.fetch = realFetch;
+    }
+    ok('L1 只读：生成过程只发 GET（没有任何写请求）',
+      calls.length >= 1 && calls.every((c) => c.method === 'GET'),
+      err ? `抛错：${err.message}` : calls.map((c) => `${c.method} ${c.url.slice(0, 44)}`).join(' | '));
+    ok('L2 端到端真的出了可粘贴的代码（不是空跑）',
+      Boolean(r) && r.ok === true && /^\.button \{$/m.test(r.text) && r.blockCount === A.items.length,
+      err ? `抛错：${err.message}` : `ok=${r && r.ok} blockCount=${r && r.blockCount}/${A.items.length}`);
+    ok('L3 端到端带版本与账号透明度', Boolean(r) && 'version' in r && 'account' in r, r ? Object.keys(r).join(',') : '');
   }
 }
 
