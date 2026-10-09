@@ -143,6 +143,17 @@ export const LIMITS = Object.freeze({
   versionsCountDefault: 30,     // 默认一批探多少张稿（面板不传 limit 时用它）
   versionsCountMax: 100,        // **硬上限**：limit 传再大也不超过它
   versionsCountConcurrency: 4,  // 同时在飞的最大请求数（与审计同口径：提速，同时对接口礼貌）
+  // —— 评论（标注）读取（§4.9，人类留的需求）——
+  //    成本模型：**+1~N 次请求**（每页 1 次）。评论是**独立接口**（不在图层树里），
+  //    所以 `read_blocks` 从 2 次请求变成 3 次 —— 这正是要有 `comments:false` 能跳过它的原因。
+  commentsPageSize: 20,        // 每页条数（与蓝湖网页端同口径：**别开太大**，一次拉爆对接口不礼貌）
+  commentsMaxPages: 5,         // 分页**硬上限**：`has_next` 一直为 true 也不许无限拉
+  commentsMaxTotal: 100,       // 条数硬上限（= 上面两条的乘积；超了标 truncated，不静默截断）
+  commentsMaxContent: 300,     // 单条评论正文的展示长度上限（超出的截断并标出总字数）
+  commentsMaxReplies: 5,       // 每条评论最多列几条回复
+  commentsNormEpsilon: 0.001,  // 归一化坐标的容差（1.0005 这种浮点毛刺当 1；越界就不当坐标用）
+  commentsNearDistance: 48,    // 未命中时：最近的块在这么多 px 内，才附一句"最近的是…"（线索，不当命中）
+  commentsSameBoxRatio: 0.9,   // 命中多块时：面积落在 [最小, 最小÷它] 区间内的视为"同框副本"，取层级更浅的那个
 });
 
 
@@ -3910,7 +3921,9 @@ export function renderBlocks(blocks, meta = {}, opts = {}) {
   const noiseCount = blocks.filter((b) => b.noise).length;
   const main = visibleBlocks(blocks, opts);
 
-  L.push(`# 块级清单 — ${titleName(meta)}（${meta.width ?? '?'}×${meta.height ?? '?'}）${metaSuffix(meta)}`);
+  // 标题行的**评论提醒**（§4.9）：**只有真有评论时才传 `opts.commentNote`**。
+  // ⚠️ 没有评论 → 这个字符串是 `null` → 标题行与以前**逐字节一致**（"没有评论的稿输出不许变"这条硬约束）。
+  L.push(`# 块级清单 — ${titleName(meta)}（${meta.width ?? '?'}×${meta.height ?? '?'}）${metaSuffix(meta)}${opts.commentNote ? ` ｜${opts.commentNote}` : ''}`);
   L.push('');
   // 来源格式交代（**只在新值存在时打** —— 普通稿不传 `opts.sourceNote`，输出逐字节不变）。
   if (opts.sourceNote) { L.push(opts.sourceNote); L.push(''); }
@@ -3970,6 +3983,16 @@ export function renderBlocks(blocks, meta = {}, opts = {}) {
   //    拿不到审计结果（比如原型那条链）→ **一个字都不加**，输出逐字节不变。
   if (opts.contrast) {
     const seg = renderContrastDigest(opts.contrast, opts);
+    if (seg) {
+      L.push('');
+      L.push(seg);
+    }
+  }
+
+  // 评论（§4.9）：同样"段内容由 readBlocks 算好传进来"，位置在「对比度」之后、尾注之前。
+  // ⚠️ 没有评论 / 没传 `opts.comments` → `renderComments` 返回空串 → **一个字都不加**，输出逐字节不变。
+  if (opts.comments) {
+    const seg = renderComments(opts.comments, { designWidth: meta.width, designHeight: meta.height });
     if (seg) {
       L.push('');
       L.push(seg);
@@ -4343,6 +4366,390 @@ export function renderContrastDigest(audit, opts = {}) {
     if (unknown.length > limit) L.push(`- … 其余 ${unknown.length - limit} 个略`);
   }
   return L.join('\n');
+}
+
+/* ==========================================================================
+ * 4.9 评论 / 标注（**人类留在稿子上的话**）—— 独立接口，不在图层树里
+ *
+ * 为什么要有它：图层树只回答"稿子长什么样"，回答不了"人类要求改成什么样"。
+ * 而「要个png的图片」这种话**只存在于评论里** —— 图层树里一个字都找不到。
+ * （本仓库一度因为"在图层树里搜不到 comment 字段"得出过"蓝湖读不到评论"的结论，**那是错的**：
+ *   评论是**另一个接口**，与图层树无关。结论写在这里，免得下次再去图层树里翻。）
+ *
+ * 接口（真机实测，2026-10，**只读**）：
+ *   GET /api/project/comment?page=1&pageSize=20&image_id=<imageId>
+ *   → {has_comment, has_next, total, result:[{id, content, position_x, position_y, read,
+ *      replies, user:{id,name,nickname,…}, version:{version_id,version_info}, create_time, …}]}
+ *
+ * 三条硬事实（都是实测踩出来的，别再摸一遍）：
+ *   ① **必须给 `image_id`**：只给 project_id 会报 `{"code":"10007","msg":"Project not exist"}`；
+ *   ② `position_x/y` 是**归一化 0~1**，而块坐标是**画板相对 px** —— 必须乘画板宽高再比。
+ *      两套坐标系直接比就是本项目踩过的"坐标系不一致"（这里差 375 倍，看着像"没命中任何块"）；
+ *      `commentPoint` 是**唯一**的换算出口，别在别处再乘一遍；
+ *   ③ **只读**：本模块只发 GET，绝不改 / 删评论，也绝不标记已读（`read` 字段只读不写）。
+ * ========================================================================== */
+
+/** 整数夹取（带兜底）：分页参数这种"调用方能传"的数字，**必须**夹在 LIMITS 的区间里。 */
+function clampInt(v, min, max, fallback) {
+  const n = Number(v);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.max(min, Math.min(max, Math.round(n)));
+}
+
+/** 蓝湖给的时间戳是 **Unix 秒**（实测 1791587876 → 2026-10-09）；13 位毫秒也容错。 */
+export function unixToIso(v) {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0) return null;
+  const d = new Date(n > 1e11 ? n : n * 1000);
+  return Number.isNaN(d.getTime()) ? null : d.toISOString();
+}
+
+/** 有限数才给值，否则 `null`（`undefined` 不是合法 lossless JSON，宿主会拒收整个结果）。 */
+function numOrNull(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? n : null;
+}
+
+/**
+ * 一条评论里的用户 → 稳定小对象。
+ * ⚠️ **别把接口的 `user` 原样透传**：实测那里面有 20 个字段（`bind_mobile` / `mobpush_reg_id` /
+ *    `wechat_nickname` / `open_id` …），与本需求无关，还会把工具返回体撑大。
+ *    `display` = 昵称优先（重名时才是问题，此时文本里会额外括注账号名）。
+ */
+function normalizeCommentUser(u) {
+  const raw = u && typeof u === 'object' ? u : {};
+  const name = typeof raw.name === 'string' && raw.name.trim() ? raw.name.trim() : null;
+  const nickname = typeof raw.nickname === 'string' && raw.nickname.trim() ? raw.nickname.trim() : null;
+  return { id: raw.id ?? null, name, nickname, display: nickname ?? name ?? null };
+}
+
+/** 回复 → 归一化对象（字段与主评论同形，只是没有 replies）。 */
+function normalizeCommentReply(raw) {
+  const r = raw && typeof raw === 'object' ? raw : { content: typeof raw === 'string' ? raw : '' };
+  return {
+    id: r.id ?? null,
+    content: typeof r.content === 'string' ? r.content : '',
+    user: normalizeCommentUser(r.user),
+    createdAt: unixToIso(r.create_time),
+  };
+}
+
+/** 一条评论 → 归一化对象（**故意留下归一化坐标**，换算统一走 `commentPoint`）。 */
+function normalizeComment(raw) {
+  const r = raw && typeof raw === 'object' ? raw : {};
+  const replies = Array.isArray(r.replies) ? r.replies.map(normalizeCommentReply) : [];
+  return {
+    id: r.id ?? null,
+    content: typeof r.content === 'string' ? r.content : (typeof r.content_rich_text === 'string' ? r.content_rich_text : ''),
+    user: normalizeCommentUser(r.user),
+    version: { id: r.version?.version_id ?? null, info: r.version?.version_info ?? null },
+    // 蓝湖给 `read: false` = **未读**（字段名是肯定式，语义是"已读"，别读反）
+    unread: r.read === false,
+    createdAt: unixToIso(r.create_time),
+    updatedAt: unixToIso(r.update_time),
+    position: { x: numOrNull(r.position_x), y: numOrNull(r.position_y) },
+    replies,
+  };
+}
+
+/**
+ * 读一张稿的**评论 / 标注**（人类留的需求）。
+ *
+ * ⚠️ `projectId` **只进错误信息与调用方对称**，不进 URL —— 实测只给 project_id 会报
+ *    `10007 Project not exist`，**必须给 image_id**。
+ * ⚠️ 分页：按 `has_next` 翻页，但**有硬上限**（`commentsMaxPages` / `commentsMaxTotal`）；
+ *    撞上限时返回 `truncated: true`（**不静默截断**，人读文本里也会写明）。
+ * ⚠️ 失败时**抛错**（与其它 fetcher 一致）：`read_blocks` 在调用点 catch 并降级（见 readBlocks）。
+ *
+ * @param {string} projectId
+ * @param {string} imageId
+ * @param {{cookie?:string, account?:string, pageSize?:number, maxPages?:number, retries?:number, timeout?:number}} [opts]
+ */
+export async function fetchComments(projectId, imageId, opts = {}) {
+  if (!imageId) {
+    throw new LanhuError(
+      `读评论必须给 imageId（只给 project_id 会被蓝湖判成 10007 Project not exist）${projectId ? `；本次 projectId=${projectId}` : ''}。`,
+      { code: 'COMMENT_NEED_IMAGE_ID' },
+    );
+  }
+  const pageSize = clampInt(opts.pageSize, 1, LIMITS.commentsPageSize, LIMITS.commentsPageSize);
+  const maxPages = clampInt(opts.maxPages, 1, LIMITS.commentsMaxPages, LIMITS.commentsMaxPages);
+
+  const items = [];
+  const seen = new Set();
+  let total = null;
+  let hasComment = null;
+  let pages = 0;
+  let truncated = false;
+
+  for (let page = 1; page <= maxPages; page += 1) {
+    const url = `${BASE}/api/project/comment?page=${page}&pageSize=${pageSize}&image_id=${encodeURIComponent(imageId)}`;
+    // ⚠️ **只读**：method 永远是 GET、永远没有 body。写请求（改/删/标已读）本项目一概不发。
+    const { json } = await apiRequest(url, { cookie: opts.cookie, account: opts.account, retries: opts.retries, timeout: opts.timeout, method: 'GET' });
+    pages = page;
+    // 这个接口**不走** `unwrap`：外层 {has_comment,has_next,total,result} 本身就是信封，
+    // 而 `unwrap` 见到 `result` 就把**数组**掏出来了 —— 分页信息会整段丢掉（实测坑）。
+    const raw = (json && typeof json === 'object' && Array.isArray(json.result)) ? json : (unwrap(json) ?? {});
+    const list = Array.isArray(raw.result) ? raw.result : [];
+    for (const c of list) {
+      const n = normalizeComment(c);
+      if (n.id && seen.has(n.id)) continue;   // 翻页期间数据变动时别重复计数
+      if (n.id) seen.add(n.id);
+      items.push(n);
+    }
+    if (total === null) total = numOrNull(raw.total);
+    if (hasComment === null) hasComment = raw.has_comment === undefined ? list.length > 0 : Boolean(raw.has_comment);
+    if (raw.has_next !== true) break;
+    if (total !== null && items.length >= total) break;
+    if (items.length >= LIMITS.commentsMaxTotal) { truncated = true; break; }
+    if (page === maxPages) truncated = true;
+  }
+
+  return {
+    imageId,
+    hasComment: Boolean(hasComment),
+    total: total ?? items.length,
+    unread: items.filter((i) => i.unread).length,
+    fetched: items.length,
+    pages,
+    truncated,
+    items,
+  };
+}
+
+/**
+ * 评论的**归一化坐标** → **稿上（画板相对）坐标**。
+ *
+ * ⚠️ 全项目**唯一**的换算出口。`position_x/y` 是 0~1 归一化，块的 `x/y/w/h` 是画板相对 px；
+ *    两者直接比就是"坐标系不一致"（这里差一个画板宽），且**不会报错**，只会静默地一个块都不命中。
+ *
+ * @returns {{x:number,y:number}|null} 拿不到就 `null`（**不猜**）：缺字段 / 画板尺寸不可用 /
+ *   蓝湖对"没定位在这张稿上"的评论给 **(0,0)** 哨兵 / 归一化值越界。
+ */
+export function commentPoint(position, width, height) {
+  const nx = Number(position?.x);
+  const ny = Number(position?.y);
+  const W = Number(width);
+  const H = Number(height);
+  if (!Number.isFinite(nx) || !Number.isFinite(ny) || !Number.isFinite(W) || !Number.isFinite(H)) return null;
+  if (W <= 0 || H <= 0) return null;
+  // (0,0) 是**哨兵**不是坐标：照算的话每条没定位的评论都会命中画板左上角那个块（本项目最忌讳的"硬套"）
+  if (nx === 0 && ny === 0) return null;
+  const eps = LIMITS.commentsNormEpsilon;
+  if (nx < -eps || nx > 1 + eps || ny < -eps || ny > 1 + eps) return null;
+  return { x: round2(clamp01(nx) * W), y: round2(clamp01(ny) * H) };
+}
+
+/** 点到块的**矩形距离**（落在块内 = 0）。 */
+function pointRectDistance(b, x, y) {
+  const bx = b.x ?? 0;
+  const by = b.y ?? 0;
+  const dx = Math.max(bx - x, 0, x - (bx + (b.w ?? 0)));
+  const dy = Math.max(by - y, 0, y - (by + (b.h ?? 0)));
+  return round2(Math.sqrt(dx * dx + dy * dy));
+}
+
+function pointInRect(b, x, y) {
+  return x >= (b.x ?? 0) && x <= (b.x ?? 0) + (b.w ?? 0) && y >= (b.y ?? 0) && y <= (b.y ?? 0) + (b.h ?? 0);
+}
+
+/**
+ * 块内**最细**的那个"真名字"图层（可选线索）。
+ *
+ * 为什么需要它：有些真元素**不成块** —— 比如弹窗里的职业照占位层 `生成男士职业照 1`
+ * （无填充/无边框/无圆角/非切图 → `classifyBlock` 判成 OTHER → 不进块模型）。
+ * 实测：某条「要个png的图片」的评论，块只能定位到"弹窗卡片"，**最细层才正对得上评论说的东西**。
+ * 判据：在块内 + 面积比块小 + 名字**不是工具默认名**（复用 `isAutoLayerName`，不写第二份尺子）
+ * —— 否则会答出 `Vector` / `Group 1321314767` 这种等于没说的名字。
+ */
+function finestNamedLayer(layers, point, blockPath) {
+  let best = null;
+  for (const l of layers ?? []) {
+    if (!l || l.depth === 0) continue;
+    if (blockPath) {
+      const p = l.parentPath ? `${l.parentPath}/${l.name}` : String(l.name ?? '');
+      if (p !== blockPath && !p.startsWith(`${blockPath}/`)) continue;
+    }
+    if (!pointInRect(l, point.x, point.y)) continue;
+    if (isAutoLayerName(l.name).auto) continue;
+    const area = Math.max(0, (l.w ?? 0) * (l.h ?? 0));
+    if (!best || area < best.area) best = { area, name: l.name, type: l.type ?? null, w: l.w ?? null, h: l.h ?? null };
+  }
+  return best ? { name: best.name, type: best.type, w: best.w, h: best.h } : null;
+}
+
+/**
+ * 评论落点 → 块（**这一步才是本功能的用处**：AI 据此知道"该改哪儿"，而不是只知道"有人在说话"）。
+ *
+ * 判据（阈值全在 `LIMITS`，别在逻辑里裸写数字）：
+ *   ① 候选 = **全稿可见块**（`visibleBlocks`，与表格的 noise 折叠同口径）**去掉画板**：
+ *      `depth === 0` 的坐标是**画布绝对坐标**（实测 -12638 这种），拿它当容器会命中一切；
+ *      ⚠️ 候选**不受 region/kind/minWidth 影响** —— 评论是**整张稿**的标注，
+ *         不该因为"你这次只看某个 region"就变成"没落在任何块上"；
+ *   ② 落在多个块里 → 取**面积最小**的（最具体）；面积落在 `[最小, 最小 ÷ commentsSameBoxRatio]`
+ *      区间内的候选视为**同框副本**（实测：卡片与它的 `Section - ModalDialogCard:shadow` 只差 0.02% 面积），
+ *      此时取**层级更浅**的那个 —— 否则评论会挂在 `…:shadow` 这种装饰副本上
+ *      （判据是**双侧**的：只取下界会把"所有更大的块"也算进同一组，正常嵌套就会被错取成最外层）；
+ *   ③ 一个块都没命中 → **如实说"未落在任何块上"**；只有最近的块在 `commentsNearDistance` 内，
+ *      才附一句"最近的是…（约 N px 外）"当线索，并**明说那不是命中**；
+ *   ④ 坐标拿不到（缺字段 / 蓝湖的 (0,0) / 越界）→ 连"最近"都不给（**不硬套一个块**）。
+ *
+ * @param {Array} items `fetchComments` 的 `items`
+ * @param {Array} blocks **全稿**块（未过滤）
+ * @param {{width?:number, height?:number}} meta 画板尺寸（换算是用它算的）
+ * @param {{includeNoise?:boolean, layers?:Array}} [opts] `layers` = `flattenArtboard` 的输出（最细层线索）
+ */
+export function mapCommentsToBlocks(items, blocks, meta = {}, opts = {}) {
+  const W = meta.width;
+  const H = meta.height;
+  const pool = visibleBlocks(blocks ?? [], opts).filter((b) => b && b.depth > 0);
+  return (items ?? []).map((c) => {
+    const point = commentPoint(c.position, W, H);
+    const base = { ...c, point, anchor: null };
+    if (!point) {
+      base.anchor = {
+        hit: false,
+        reason: 'no-position',
+        x: null, y: null,
+        block: null, distance: null, layer: null,
+      };
+      return base;
+    }
+    const inside = pool.filter((b) => pointInRect(b, point.x, point.y));
+    let hit = null;
+    if (inside.length > 0) {
+      const areaOf = (b) => Math.max(0, (b.w ?? 0) * (b.h ?? 0));
+      const minArea = Math.min(...inside.map(areaOf));
+      // 同框副本（面积**几乎相同**）取层级更浅的那个：`X` 与 `X:shadow` 实测只差 0.02% 面积。
+      // ⚠️ 判据是**双侧**的（`[minArea, minArea/ratio]`）：只写下界会把"所有更大的块"都算进同一个
+      //    cluster，于是"按钮(60×30) 落在卡片(300×300) 里"这种正常嵌套会错取外层卡片（自检逮住过）。
+      const maxArea = minArea / LIMITS.commentsSameBoxRatio;
+      const cluster = inside.filter((b) => areaOf(b) <= maxArea);
+      cluster.sort((a, b) => (a.depth ?? 0) - (b.depth ?? 0) || (a.uid ?? 0) - (b.uid ?? 0));
+      hit = cluster[0];
+    }
+    let nearest = null;
+    let distance = null;
+    if (!hit) {
+      for (const b of pool) {
+        const d = pointRectDistance(b, point.x, point.y);
+        if (distance === null || d < distance) { distance = d; nearest = b; }
+      }
+    }
+    const useNear = !hit && nearest && distance !== null && distance <= LIMITS.commentsNearDistance;
+    const chosen = hit ?? (useNear ? nearest : null);
+    base.anchor = {
+      hit: Boolean(hit),
+      reason: hit ? 'hit' : (useNear ? 'near' : (pool.length === 0 ? 'no-blocks' : 'blank')),
+      x: point.x,
+      y: point.y,
+      // "最近"只是个线索：`hit:false` 说得很清楚，别把线索当命中读
+      distance: hit ? 0 : distance,
+      block: chosen ? {
+        uid: chosen.uid ?? null,
+        name: chosen.name ?? null,
+        path: chosen.path ?? null,
+        label: blockLabel(chosen),
+        kind: chosen.kind ?? null,
+        kindLabel: BLOCK_KINDS[chosen.kind] ?? chosen.kind ?? null,
+        x: chosen.x ?? null,
+        y: chosen.y ?? null,
+        w: chosen.w ?? null,
+        h: chosen.h ?? null,
+      } : null,
+      layer: chosen ? finestNamedLayer(opts.layers, point, chosen.path) : null,
+    };
+    return base;
+  });
+}
+
+/** 一个用户名怎么打：`@昵称（账号名）` / `@账号名` / `@（未署名）`。 */
+function commentUserText(user) {
+  const display = user?.display ?? null;
+  const name = user?.name ?? null;
+  if (display && name && display !== name) return `@${display}（${name}）`;
+  return display ? `@${display}` : '@（未署名）';
+}
+
+/** 正文截断（评论能很长；表格/段落的体积要有概念）。 */
+function commentContentText(content) {
+  const s = String(content ?? '');
+  const chars = [...s];
+  if (chars.length <= LIMITS.commentsMaxContent) return s || '（空）';
+  return `${chars.slice(0, LIMITS.commentsMaxContent).join('')}…（共 ${chars.length} 字）`;
+}
+
+/**
+ * 评论段（接在「对比度」之后、尾注之前）。
+ *
+ * ⚠️ **没有评论就返回空串** —— "无评论的稿输出逐字节不变"这条硬约束就是靠它 + `renderBlocks`
+ *    里那个 `if (seg)` 双双守住的（两边都不能自作主张打一个空标题）。
+ * ⚠️ 读取失败时**明说**（不静默）：静默会让 AI 把"读不到"当成"设计师没留言"，
+ *    那正是本项目最忌讳的失败模式。返回体里另有机器可读的 `commentsError`。
+ *
+ * @param {{items?:Array, total?:number, unread?:number, truncated?:boolean, error?:string}} result
+ * @param {{designWidth?:number, designHeight?:number}} [opts]
+ */
+export function renderComments(result, opts = {}) {
+  if (!result) return '';
+  const L = [];
+  if (result.error) {
+    L.push('## 评论（**读取失败**）');
+    L.push('> 评论接口这次没读通 —— **这不代表"没人留评论"**，别当成"设计师没留言"就往下做。');
+    L.push(`> 失败原因：${result.error}`);
+    L.push('> 只读：本插件只发 GET，从不改 / 删评论，也不标记已读。');
+    return L.join('\n');
+  }
+  const items = result.items ?? [];
+  if (items.length === 0) return '';   // ← 无评论：一个字都不加（逐字节不变）
+  const unread = items.filter((i) => i.unread).length;
+  const W = opts.designWidth;
+  const H = opts.designHeight;
+  L.push(`## 评论（${items.length} 条${unread > 0 ? `，含未读 ${unread}` : ''}）`);
+  L.push(`> 来源：蓝湖的**评论 / 标注**（独立接口，**不在图层树里**）—— 人类留的需求就写在这儿（如「要个png的图片」）。`);
+  L.push(`> 落点：接口给的是**归一化 0~1** 坐标 \`position_x/y\`，这里已按画板 ${W ?? '?'}×${H ?? '?'} 换算成稿上坐标再匹配块（**别自己再乘一遍**）；匹配不上就**明说**，不硬套。`);
+  L.push('> 只读：本插件只发 GET，从不改 / 删评论，也不标记已读。');
+  if (result.truncated) {
+    L.push(`> ⚠️ 已达分页上限（每页 ${LIMITS.commentsPageSize} 条 × 最多 ${LIMITS.commentsMaxPages} 页）：本次取到 **${items.length}** 条 / 共 ${result.total ?? '?'} 条。`);
+  }
+  L.push('');
+  for (const it of items) {
+    const ver = it.version?.info || (it.version?.id ? `版本 ${String(it.version.id).slice(0, 8)}` : '版本未知');
+    const marks = [commentUserText(it.user), ver, it.unread ? '**未读**' : null].filter(Boolean).join(' · ');
+    L.push(`- 评论（${marks}）：「${commentContentText(it.content)}」`);
+    const a = it.anchor;
+    if (!a) continue;
+    if (a.reason === 'no-position') {
+      L.push('  - ↳ **未落在任何块上**（这条评论没带定位坐标 —— `position_x/y` 为 0 或不可用）');
+    } else if (a.hit && a.block) {
+      L.push(`  - ↳ 挂在 **${a.block.label}** 这块（${a.block.kindLabel ?? '?'} · ${Math.round(a.block.w ?? 0)}×${Math.round(a.block.h ?? 0)}），落点 (${a.x}, ${a.y})`);
+      if (a.layer) {
+        L.push(`  - ↳ 该块内最细的层：**${a.layer.name}**（${a.layer.type ?? '?'} · ${Math.round(a.layer.w ?? 0)}×${Math.round(a.layer.h ?? 0)}）—— 要精确到元素时看它`);
+      }
+    } else if (a.block) {
+      const d = a.distance === null ? '?' : Math.round(a.distance);
+      L.push(`  - ↳ **未落在任何块上**（落点 (${a.x}, ${a.y}) 是空白）；最近的是 **${a.block.label}**（${a.block.kindLabel ?? '?'} · ${Math.round(a.block.w ?? 0)}×${Math.round(a.block.h ?? 0)}，约 ${d}px 外）—— **只是线索，不是命中**`);
+    } else {
+      L.push(`  - ↳ **未落在任何块上**（落点 (${a.x}, ${a.y}) ${a.reason === 'no-blocks' ? '；这张稿一个可见块都没有' : '处没有块'}）`);
+    }
+    for (const rep of (it.replies ?? []).slice(0, LIMITS.commentsMaxReplies)) {
+      L.push(`  - ↳ 回复 ${commentUserText(rep.user)}：「${commentContentText(rep.content)}」`);
+    }
+    if ((it.replies ?? []).length > LIMITS.commentsMaxReplies) {
+      L.push(`  - ↳ … 另有 ${(it.replies ?? []).length - LIMITS.commentsMaxReplies} 条回复略`);
+    }
+  }
+  return L.join('\n');
+}
+
+/** 标题行的评论提醒（**只有真有评论时才有这个字符串**，见 renderBlocks）。 */
+export function commentNoteText(result) {
+  if (!result || result.error) return null;
+  const n = (result.items ?? []).length;
+  if (n === 0) return null;
+  const unread = (result.items ?? []).filter((i) => i.unread).length;
+  if (result.truncated) return `本稿有 ${result.total ?? n} 条评论（本次读到 ${n} 条，含未读 ${unread}）`;
+  return `本稿有 ${n} 条评论（含未读 ${unread}）`;
 }
 
 /* ==========================================================================
@@ -5066,6 +5473,9 @@ export async function readBlocks(args = {}) {
   const artboard = tree.artboard ?? tree;
   const layers = flattenArtboard(artboard);
   let blocks = buildBlocks(layers);
+  // ⚠️ **全稿**块（region/kind/minWidth 过滤**之前**的那一份）—— 评论落点用它匹配：
+  //    评论是**整张稿**的标注，不该因为"你这次只看某个 region"就变成"未落在任何块上"。
+  const fullBlocks = blocks;
 
   if (args.region) {
     const nums = String(args.region).split(/[,:\s]+/).map(Number).filter((n) => Number.isFinite(n));
@@ -5106,9 +5516,38 @@ export async function readBlocks(args = {}) {
   // 无障碍对比度审计（§4.8）：与表格**同一套可见集**（noise 折叠口径一致），
   // 且与渲染进 `text` 的那段是**同一次计算** —— 这样"人读到的"和"机器读到的"不会各算一遍。
   const contrastAudit = auditTextContrast(visibleBlocks(blocks, { includeNoise: args.includeNoise }), layers);
+  // 评论 / 标注（§4.9）：**独立接口**（不在图层树里）→ 这是 **+1~N 次网络请求**。
+  //   · 默认**开**（人就写在评论里，读稿时不带回来等于没这个能力）；
+  //   · `comments:false` 跳过（不需要时别多花请求）；
+  //   · ⚠️ **失败绝不连累 read_blocks**：catch 住 → 降级成"评论读取失败"那段 + 机器可读的 `commentsError`。
+  //     为什么是"明说"而不是"静默跳过"：静默会让 AI 把"没读到"当成"设计师没留言"，
+  //     那正是本项目最忌讳的失败模式（"拿不准就明说"）。
+  let commentsResult = null;
+  let commentsError = null;
+  if (args.comments !== false) {
+    try {
+      const fetched = await fetchComments(target.projectId, target.imageId, {
+        cookie: args.cookie, account: acct, pageSize: args.commentPageSize, retries: args.commentRetries,
+      });
+      commentsResult = {
+        total: fetched.total,
+        unread: fetched.unread,
+        fetched: fetched.fetched,
+        pages: fetched.pages,
+        truncated: fetched.truncated,
+        items: mapCommentsToBlocks(fetched.items, fullBlocks, meta, { includeNoise: args.includeNoise, layers }),
+      };
+    } catch (e) {
+      commentsError = String(e?.message ?? e);
+      commentsResult = { error: commentsError, items: [] };
+    }
+  }
   let text = renderBlocks(blocks, meta, {
     limit: args.limit, includeNoise: args.includeNoise, dualUnits: Boolean(args.dualUnits), contrast: contrastAudit,
     sourceNote: sourceFormat === 'sketchPlugin' ? SKETCH_SOURCE_NOTE : null,
+    // 无评论 / 读取失败时 `commentNoteText` 给 null → 标题行**逐字节不变**
+    commentNote: commentNoteText(commentsResult),
+    comments: commentsResult,
   });
   if (acct) {
     text += `\n\n— 账号：**${acct}**${picked.by === 'explicit' ? '（显式指定）' : `（自动判定 · ${picked.by}）`}`;
@@ -5154,6 +5593,39 @@ export async function readBlocks(args = {}) {
     // 稿子的**来源格式**：`'sketchPlugin'` = Sketch 插件导出（图层在 `info[]` 里，已归一化后走同一条链）。
     // ⚠️ 同上：**只在非空时加键**，普通稿返回体逐字节不变。
     ...(sourceFormat ? { sourceFormat } : {}),
+    // 评论 / 标注（§4.9，人类留的需求）。**只在真有评论时加键**：
+    //   · 没有评论 → 不加（"无评论的稿返回体逐字节不变"这条硬约束）；
+    //   · `comments:false` 跳过 → 不加（调用方自己知道没请求）；
+    //   · 读取失败 → 加的是 `commentsError`（**明说**，别让调用方把"读不到"当成"没有评论"）。
+    ...(commentsResult && !commentsResult.error && (commentsResult.items ?? []).length > 0
+      ? {
+        comments: {
+          total: commentsResult.total ?? commentsResult.items.length,
+          unread: commentsResult.unread ?? 0,
+          fetched: commentsResult.fetched ?? commentsResult.items.length,
+          pages: commentsResult.pages ?? 1,
+          truncated: Boolean(commentsResult.truncated),
+          // 归一化坐标是**原样**留着的（别在返回里改成 px —— 那正是坐标系混掉的开始）：
+          // `position` = 接口给的 0~1，`point` = 换算后的稿上坐标，`anchor` = 匹配到的块。
+          items: commentsResult.items.map((c) => ({
+            id: c.id,
+            content: c.content,
+            user: c.user,
+            version: c.version,
+            unread: c.unread,
+            createdAt: c.createdAt,
+            updatedAt: c.updatedAt,
+            position: c.position,
+            point: c.point,
+            // 平铺一个 `blockLabel`（最常用的那个字段不该要调用方先下钻 anchor）
+            blockLabel: c.anchor?.block?.label ?? null,
+            anchor: c.anchor,
+            replies: c.replies,
+          })),
+        },
+      }
+      : {}),
+    ...(commentsError ? { commentsError } : {}),
     text,
     textBytes: Buffer.byteLength(text, 'utf8'),
   };
@@ -8212,6 +8684,8 @@ export async function verifyBlocks(args = {}) {
     url: args.url, projectId: args.projectId, imageId: args.imageId,
     kind: args.kind, includeNoise: args.includeNoise, cookie: args.cookie, account: args.account,
     limit: 1,   // 文本清单用不上，省点体积
+    // 验收只比"设计稿 vs 页面"的六项属性，评论段与它无关 → **不发那次请求**（也保证本工具行为不变）
+    comments: false,
   });
 
   const launch = await launchBrowser();
@@ -8579,12 +9053,18 @@ async function cmdBlocks({ args, cookie }) {
     dualUnits: Boolean(args['dual-units']),
     version: args.version,
     cookie, account: args.account,
+    // ⚠️ CLI 的默认**与工具相反**：不给 `--comments` 就不读评论（也**不多发那次请求**）——
+    //    为的是"既有 CLI 输出逐字节不变"（这个仓库的命令输出有黄金输出兜着）。
+    //    要评论就显式 `--comments`。
+    comments: Boolean(args.comments),
   });
   if (args.json) printJson(r);
   else {
     console.log(r.text);
     console.log('');
-    console.log(`— blocks 模式 | ${r.layerCount} 层 → ${r.blockCount} 块（碎片 ${r.noiseCount}） | 输出 ${kb(r.text)}`);
+    // 评论那行只在**真的要过评论**（`--comments`）时才出现 —— 默认路径的输出逐字节不变
+    const cm = r.comments ? ` | 评论 ${r.comments.total} 条（未读 ${r.comments.unread}）` : '';
+    console.log(`— blocks 模式 | ${r.layerCount} 层 → ${r.blockCount} 块（碎片 ${r.noiseCount}）${cm} | 输出 ${kb(r.text)}`);
   }
   return r;
 }
@@ -8895,6 +9375,9 @@ const USAGE = `dsh-lanhu —— 蓝湖设计稿读取
            （x/y 各自独立缩放，**非等比** —— 长宽比不同的两个坐标系也能对上）
   blocks   [--url "<蓝湖链接>" | --project <id> --image <id>] [--region y0,y1] [--kind card,pill] [--min-width N] [--all]
            块级清单：卡片/胶囊/文本/图片/分割线，每块六项属性（圆角·大小·文字色·字号·底色·边框）
+           --comments 额外读这张稿的**评论 / 标注**（人类留的需求，如「要个png的图片」，独立接口），
+           末尾多一段「评论」并把每条**映射回它落在哪个块**（归一化坐标 × 画板尺寸后匹配，命中不了就明说）。
+           ⚠️ CLI **默认不读**（不给 --comments 就不多发那次请求）；工具 lanhu_read_blocks 默认**读**。
   diff     [--url "<蓝湖链接>" | --project <id> --image <id>] --from <版本id> [--to <版本id>] [--all]
            **同一张稿的两个版本**对比（--to 省略 = 最新版 latest）：尺寸/圆角·颜色·布局·文字·边框·结构·新增·删除，
            每类只列**有变化的**、数值给「从→到」；零变化只给一句汇总，两版无差异时**明说"两版一致"**。

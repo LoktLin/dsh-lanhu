@@ -142,6 +142,13 @@ const {
   // —— 「示例与真值同源」（⑫）：色值示例唯一出口 ——
   rgbaString,
   bgText,
+  // —— 评论 / 标注（§4.9）——
+  fetchComments,
+  renderComments,
+  commentNoteText,
+  commentPoint,
+  mapCommentsToBlocks,
+  unixToIso,
 } = await import('../lanhu.mjs');
 const { TOOLS, validateJsonSchemaValue, ToolArgsError, toLossless, apply: applyHostPlugin } = await import('../lib/index.js');
 
@@ -1140,7 +1147,10 @@ group('⑥.15 read_blocks 端到端（mock fetch）');
   let r = null;
   let err = null;
   try {
-    r = await readBlocks({ projectId: 'p-mock', imageId: 'i-mock', account: 'mock', cookie: 'PASSPORT=x; user_token=y' });
+    // ⚠️ 这一组测的是**对比度审计**（"它零额外请求"），所以**显式关掉评论**：
+    //    评论是 §4.9 的事（默认开、+1 次请求），不关掉就会把"第 3 个请求"算进这条断言里 ——
+    //    那是把两件事混在一起测。评论的开/关与请求数在 ⑥.15d 单独钉。
+    r = await readBlocks({ projectId: 'p-mock', imageId: 'i-mock', account: 'mock', cookie: 'PASSPORT=x; user_token=y', comments: false });
   } catch (e) { err = e; } finally { globalThis.fetch = realFetch; }
 
   ok('read_blocks 能跑通（mock 两个请求：详情 + 图层树）', !!r && !err, err ? String(err.message) : `${seen.length} 个请求`);
@@ -1259,6 +1269,10 @@ group('⑥.15b Sketch 插件格式（type: sketchPlugin）');
         } });
       }
       if (u === 'https://mock.lanhu/sp.json') return mockRes(tree);
+      // 评论（§4.9）：`read_blocks` 现在**默认**会多发这一条请求 —— 这里按"这张稿没有评论"应答。
+      // 不接这一条会走"未预期请求"→ 网络重试 ×3（每组测试白等 ~1.8 秒，还掩盖了真实请求数）。
+      // 也算顺带钉住：空评论应答下 read_blocks 的输出与不读评论时**逐字节一致**（⑥.15d 有正面断言）。
+      if (u.includes('/api/project/comment')) return mockRes({ has_comment: false, has_next: false, total: 0, result: [] });
       if (u.includes('mock.lanhu/slice') || u.includes('mock.lanhu/group')) return mockPng();
       throw new Error('未预期的请求：' + u);
     };
@@ -1462,6 +1476,407 @@ group('⑥.15b Sketch 插件格式（type: sketchPlugin）');
     const d = await withSpMock(() => readDesign({ ...A }), { tree: plain });
     ok('★ read_design 同样不多键、不加来源段',
       !Object.prototype.hasOwnProperty.call(d, 'sourceFormat') && !d.text.includes('Sketch 插件导出'));
+  }
+}
+
+/* ═══════════════ ⑥.15d 评论 / 标注（§4.9） ═══════════════
+ *
+ * 评论是**独立接口**（不在图层树里），是"人话需求"的唯一来源（例：「要个png的图片」）。
+ * 这一组钉六件事，每一件都对应一类**会静默出错**的失败：
+ *   ① 接口解析（用**真机返回的结构**当 fixture：`read:false` / 昵称+账号名 / 版本 / 归一化坐标）；
+ *   ② **位置映射**：落在块内 → 命中该块；落在空白 → **如实说"未落在任何块上"**（绝不硬套）；
+ *   ③ **坐标系不混**：归一化 0~1 → 稿上 px 的换算（可手算的用例）；
+ *   ④ **标题行**：有评论才有那一行；无评论时**逐字节不变**；
+ *   ⑤ **降级**：评论接口挂了 → `read_blocks` 照样成功、其它段照常（明说失败，不静默）；
+ *   ⑥ **只读 + 请求数**：`comments:false` 少一次请求；所有请求都是 GET、没有 body。
+ */
+group('⑥.15d 评论 / 标注（§4.9）');
+{
+  /* —— ① 纯函数：时间戳 —— */
+  eq('评论时间戳按 Unix **秒**换算（真机值 1791587876 → 2026-10-09T23:17:56Z）',
+    unixToIso(1791587876), '2026-10-09T23:17:56.000Z');
+  eq('13 位毫秒也认（不把毫秒当秒算成 5 万年后）',
+    unixToIso(1791587876000), '2026-10-09T23:17:56.000Z');
+  eq('拿不到时间 → null（不编）', [unixToIso(0), unixToIso(null), unixToIso('x')], [null, null, null]);
+
+  /* —— ③ 纯函数：归一化坐标 → 稿上坐标（**可手算**：0.5×375=187.5、0.25×812=203） —— */
+  eq('归一化 → 画板坐标（0.5,0.25 @ 375×812）', commentPoint({ x: 0.5, y: 0.25 }, 375, 812), { x: 187.5, y: 203 });
+  eq('归一化 → 画板坐标（0.3217459008974022 × 375 = 120.65）',
+    commentPoint({ x: 0.3217459008974022, y: 0 }, 375, 812), { x: 120.65, y: 0 });
+  eq('蓝湖"没定位"的 (0,0) 哨兵 → null（照算会永远命中画板左上角那个块）',
+    commentPoint({ x: 0, y: 0 }, 375, 812), null);
+  eq('缺字段 / 画板尺寸不可用 / 越界 → 一律 null（不猜）',
+    [commentPoint({}, 375, 812), commentPoint({ x: 0.5, y: 0.5 }, 0, 812), commentPoint({ x: 1.4, y: 0.5 }, 375, 812), commentPoint({ x: 0.5, y: 0.5 }, undefined, 812)],
+    [null, null, null, null]);
+  eq('浮点毛刺 1.0005 当 1（不当越界丢掉）', commentPoint({ x: 1.0005, y: 1 }, 375, 812), { x: 375, y: 812 });
+
+  /* —— ②/③ 纯函数：落点 → 块 —— */
+  const mkC = (o = {}) => ({
+    id: 'c', content: 'x', user: { id: null, name: null, nickname: null, display: null },
+    version: { id: null, info: null }, unread: false, createdAt: null, updatedAt: null,
+    position: { x: 0.5, y: 0.5 }, replies: [], ...o,
+  });
+  const mkB = (o = {}) => ({
+    uid: 0, kind: 'card', name: '块', path: '画板/块', depth: 1, noise: false,
+    x: 0, y: 0, w: 100, h: 100, ...o,
+  });
+  {
+    const blocks = [
+      mkB({ uid: 0, kind: 'artboard', name: '画板', path: '画板', depth: 0, x: 0, y: 0, w: 375, h: 812 }),
+      mkB({ uid: 1, name: '大卡片', path: '画板/大卡片', depth: 1, x: 0, y: 0, w: 300, h: 300 }),
+      mkB({ uid: 2, kind: 'pill', name: '小按钮', path: '画板/大卡片/小按钮', depth: 2, x: 10, y: 10, w: 60, h: 30 }),
+    ];
+    const [m] = mapCommentsToBlocks([mkC({ position: { x: 0.05, y: 0.02 } })], blocks, { width: 375, height: 812 });
+    eq('点落在小按钮里 → 命中**最具体**的那个块（面积最小，不是最外层）', m.anchor.block?.name, '小按钮');
+    eq('命中时 hit=true、distance=0', [m.anchor.hit, m.anchor.distance], [true, 0]);
+    eq('块 label 走 blockLabel（名字优先）', m.anchor.block?.label, '小按钮');
+
+    const [m2] = mapCommentsToBlocks([mkC({ position: { x: 0.9, y: 0.99 } })], blocks, { width: 375, height: 812 });
+    eq('点落在空白且最近的块 > 阈值 → **不给任何块**（不硬套）', [m2.anchor.hit, m2.anchor.block, m2.anchor.reason], [false, null, 'blank']);
+    ok('落点坐标原样写出来（便于人工回查）', m2.anchor.x === 337.5 && m2.anchor.y === 803.88, `${m2.anchor.x},${m2.anchor.y}`);
+
+    const [m3] = mapCommentsToBlocks([mkC({ position: { x: 0.5, y: 0.4 } })], blocks, { width: 375, height: 812 });
+    eq('点离块很近（≤48px）→ 仍判**未命中**，只给"最近的块"当线索',
+      [m3.anchor.hit, m3.anchor.reason, m3.anchor.block?.name], [false, 'near', '大卡片']);
+    ok('线索带距离（0.4×812=324.8，卡片底 300 → 24.8px）', m3.anchor.distance === 24.8, String(m3.anchor.distance));
+
+    const [m4] = mapCommentsToBlocks([mkC({ position: { x: 0, y: 0 } })], blocks, { width: 375, height: 812 });
+    eq('(0,0) 没定位 → reason=no-position、**连最近都不给**', [m4.anchor.reason, m4.anchor.block, m4.anchor.x], ['no-position', null, null]);
+
+    // 画板（depth 0）**永远不当容器**：它的坐标是画布绝对坐标，拿它匹配会命中一切
+    const [m5] = mapCommentsToBlocks([mkC({ position: { x: 0.5, y: 0.5 } })], [blocks[0]], { width: 375, height: 812 });
+    eq('只有画板时：判"这张稿没有可见块"，而不是"命中画板"', [m5.anchor.hit, m5.anchor.reason, m5.anchor.block], [false, 'no-blocks', null]);
+
+    // 同框副本（卡片 vs 它的 :shadow）：面积几乎相同 → 取**层级更浅**的那个（元素本体）
+    const dup = [
+      mkB({ uid: 1, name: '弹窗卡片', path: '画板/弹窗卡片', depth: 1, x: 16, y: 176.96, w: 343, h: 458.09 }),
+      mkB({ uid: 2, name: '弹窗卡片:shadow', path: '画板/弹窗卡片/弹窗卡片:shadow', depth: 2, x: 16, y: 176.83, w: 343, h: 458 }),
+    ];
+    const [m6] = mapCommentsToBlocks([mkC({ position: { x: 0.3, y: 0.26 } })], dup, { width: 375, height: 812 });
+    eq('同框副本（面积差 0.02%）→ 取层级更浅的**本体**，不取 `:shadow`', m6.anchor.block?.name, '弹窗卡片');
+
+    // 最细层线索：名字是工具默认名的不认（否则会答出 `Vector`）
+    const layers = [
+      { depth: 0, name: '画板', parentPath: '', x: 0, y: 0, w: 375, h: 812, type: 'artboard' },
+      { depth: 1, name: '弹窗卡片', parentPath: '画板', x: 16, y: 176.96, w: 343, h: 458.09, type: 'shapeLayer' },
+      { depth: 2, name: '生成男士职业照 1', parentPath: '画板/弹窗卡片', x: 37.81, y: 192.96, w: 120, h: 152, type: 'shapeLayer' },
+      { depth: 3, name: 'Vector', parentPath: '画板/弹窗卡片/生成男士职业照 1', x: 105, y: 205, w: 20, h: 20, type: 'shapeLayer' },
+    ];
+    const [m7] = mapCommentsToBlocks([mkC({ position: { x: 0.3, y: 0.26 } })], dup, { width: 375, height: 812 }, { layers });
+    eq('最细层线索：跳过工具默认名 `Vector`，取真有名字的那层', m7.anchor.layer?.name, '生成男士职业照 1');
+    const [m8] = mapCommentsToBlocks([mkC({ position: { x: 0.3, y: 0.26 } })], dup, { width: 375, height: 812 });
+    eq('不传 layers → 没有线索（不编一个）', m8.anchor.layer, null);
+  }
+
+  /* —— 纯函数：渲染（无评论 → 空串；失败 → 明说） —— */
+  eq('无评论 → 段是空串（标题行/正文一个字都不加，靠的就是它）', renderComments({ items: [], total: 0, unread: 0 }), '');
+  eq('没传结果 → 空串', [renderComments(null), renderComments(undefined)], ['', '']);
+  eq('标题行提醒：无评论 / 失败 → null（**没有那一行**）',
+    [commentNoteText({ items: [], total: 0 }), commentNoteText({ error: 'x' }), commentNoteText(null)], [null, null, null]);
+  eq('标题行提醒：有评论 → 「本稿有 N 条评论（含未读 M）」',
+    commentNoteText({ items: [{ unread: true }, { unread: false }], total: 2 }), '本稿有 2 条评论（含未读 1）');
+  {
+    const seg = renderComments({ error: '接口返回错误 code=10007：Project not exist', items: [] }, { designWidth: 375, designHeight: 812 });
+    ok('降级：失败时**明说**读取失败 + 原因，且点明"不代表没有评论"',
+      seg.includes('读取失败') && seg.includes('10007') && seg.includes('不代表'), seg.split('\n').slice(0, 3).join(' / '));
+    ok('失败时不说"没有评论"（那是最坏的误导）', !/没有评论/.test(seg.replace(/\*\*/g, '')), seg.split('\n')[1]);
+  }
+  {
+    const long = '长'.repeat(LIMITS.commentsMaxContent + 5);
+    const seg = renderComments({
+      items: [{
+        content: long, user: { display: '甲', name: 'jia' }, version: { info: '版本2' }, unread: false, replies: [],
+        anchor: { hit: false, reason: 'no-position', x: null, y: null, block: null, distance: null, layer: null },
+      }], total: 1, unread: 0,
+    }, { designWidth: 375, designHeight: 812 });
+    ok(`超长评论截断并标出总字数（${[...long].length} 字）`, seg.includes(`（共 ${[...long].length} 字）`));
+    ok('昵称与账号名都打出来（重名时才分得清谁说的）', seg.includes('@甲（jia）'), seg.split('\n').find((l) => l.startsWith('- 评论'))?.slice(0, 40));
+  }
+
+  /* —— ①⑥ 纯函数：接口解析 / 分页 / 只读 —— */
+  {
+    // 这条评论**逐字取自真机返回**（2026-10，稿「人才弹窗」），字段名/类型都是真的：
+    //   归一化坐标、`read:false`、`nickname` + `name`、`version_info`、Unix 秒。
+    const REAL_COMMENT = {
+      id: 'dfd851cf-7693-4947-a654-74d2937211c0', content: '要个png的图片', content_rich_text: '要个png的图片',
+      create_time: 1791587876, update_time: 1791587879,
+      position_x: 0.3217459008974022, position_y: 0.2596585570581626,
+      dot_id: '', dot_x: 0, dot_y: 0, height: 0, width: 0, scale_x: 0, scale_y: 0, page_id: '', text: '1', read: false,
+      replies: [{ id: 'r1', content: '收到', create_time: 1791587900, user: { id: 'u2', name: 'dev01', nickname: '' } }],
+      user: { id: 'a1203a75', active: true, bind_mobile: 1, color: 'blue', name: 'qzdesign01', nickname: '管理', avatar: '', mobile: '133****4444' },
+      version: { version_id: '88e0aaa6-093f-46ec-bceb-f8ed5bd6f8ba', version_info: '版本2' },
+    };
+    const mockRes = (obj, status = 200) => ({
+      ok: status >= 200 && status < 300, status,
+      headers: { get: () => 'application/json; charset=utf-8' },
+      arrayBuffer: async () => Buffer.from(JSON.stringify(obj), 'utf8'),
+    });
+    const realFetch = globalThis.fetch;
+    const seen = [];
+    globalThis.fetch = async (url, init) => {
+      const u = String(url);
+      seen.push({ url: u, method: init?.method, body: init?.body });
+      if (u.includes('/api/project/comment')) {
+        const page = Number(/[?&]page=(\d+)/.exec(u)?.[1] ?? 1);
+        if (page === 1) return mockRes({ has_comment: true, has_next: true, total: 2, result: [REAL_COMMENT] });
+        return mockRes({ has_comment: true, has_next: false, total: 2, result: [{ ...REAL_COMMENT, id: 'c2', content: '第二条', read: true }] });
+      }
+      throw new Error('未预期的请求：' + u);
+    };
+    let cm = null;
+    let err = null;
+    try {
+      cm = await fetchComments('p-mock', 'i-mock', { account: 'mock', cookie: 'PASSPORT=x; user_token=y' });
+    } catch (e) { err = e; } finally { globalThis.fetch = realFetch; }
+    ok('fetchComments 能跑通（真机结构）', !!cm && !err, err ? String(err.message) : '');
+    if (cm) {
+      eq('分页：`has_next` → 翻到第 2 页，两页都收进来', [cm.pages, cm.fetched, cm.total, cm.truncated], [2, 2, 2, false]);
+      eq('只请求评论接口 2 次，URL 里带 **image_id**', seen.filter((s) => s.url.includes('/comment')).length, 2);
+      eq('URL 里**只给 image_id**（给 project_id 会 10007 Project not exist）',
+        seen.every((s) => s.url.includes('image_id=i-mock') && !/project_id=|pid=/.test(s.url)), true);
+      const c = cm.items[0];
+      eq('正文 / 未读（`read:false` → 未读）/ 昵称+账号名',
+        [c.content, c.unread, c.user.display, c.user.name, c.user.nickname], ['要个png的图片', true, '管理', 'qzdesign01', '管理']);
+      eq('版本挂在哪一版', [c.version.id, c.version.info], ['88e0aaa6-093f-46ec-bceb-f8ed5bd6f8ba', '版本2']);
+      eq('归一化坐标**原样**保留（换算不在这里做）',
+        [c.position.x, c.position.y], [0.3217459008974022, 0.2596585570581626]);
+      eq('时间戳 → ISO', c.createdAt, '2026-10-09T23:17:56.000Z');
+      eq('回复串也解析（`@dev01`）', [c.replies.length, c.replies[0].content, c.replies[0].user.display], [1, '收到', 'dev01']);
+      eq('接口的 user 不原样透传（20 个无关字段别进返回体）',
+        Object.keys(c.user).sort().join(','), 'display,id,name,nickname');
+      eq('未读计数', cm.unread, 1);
+      // ★ 只读：**只发 GET、没有 body**（本项目绝不改 / 删评论，也不标记已读）
+      ok('★ 只读：所有请求都是 GET、都没有 body',
+        seen.every((s) => (s.method === undefined || s.method === 'GET') && s.body === undefined),
+        JSON.stringify(seen.map((s) => [s.method, s.body === undefined])));
+      ok('★ 评论请求显式声明 GET（而不是靠 fetch 的默认值）',
+        seen.every((s) => !s.url.includes('/comment') || s.method === 'GET'));
+    }
+  }
+  {
+    // 分页硬上限：`has_next` 永远 true 也不许无限拉（LIMITS 是唯一出口）
+    const realFetch = globalThis.fetch;
+    const urls = [];
+    globalThis.fetch = async (url) => {
+      urls.push(String(url));
+      if (!String(url).includes('/api/project/comment')) throw new Error('未预期的请求');
+      return {
+        ok: true, status: 200, headers: { get: () => 'application/json' },
+        arrayBuffer: async () => Buffer.from(JSON.stringify({ has_comment: true, has_next: true, total: 9999, result: [{ id: `c${urls.length}`, content: 'x', read: true, user: {}, version: {}, replies: [] }] }), 'utf8'),
+      };
+    };
+    let cm = null;
+    try { cm = await fetchComments('p', 'i', { cookie: 'a=b' }); } finally { globalThis.fetch = realFetch; }
+    eq(`分页撞硬上限（${LIMITS.commentsMaxPages} 页 = ${LIMITS.commentsMaxPages} 次请求）`,
+      [urls.length, cm.pages, cm.fetched, cm.truncated], [LIMITS.commentsMaxPages, LIMITS.commentsMaxPages, LIMITS.commentsMaxPages, true]);
+    ok('每页条数走 LIMITS（不是逻辑里的裸数字）—— URL 里就是那个值',
+      urls.every((u) => u.includes(`pageSize=${LIMITS.commentsPageSize}`)), urls[0]);
+    ok('翻页参数真的在翻（page=1/2/3…）', urls.map((u) => Number(/page=(\d+)/.exec(u)[1])).join(',') === urls.map((_, i) => i + 1).join(','), urls.length + ' 页');
+  }
+  ok('fetchComments 缺 imageId → 明确报错（并点出 10007 这个坑）', await fetchComments('p-only', null, { cookie: 'a=b' })
+    .then(() => false, (e) => /imageId/.test(e.message) && /10007/.test(e.message)));
+  {
+    // 静态检查：这个函数区间里**不许出现任何写方法**（改 / 删 / 标已读）
+    const src = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'lanhu.mjs'), 'utf8');
+    const i = src.indexOf('export async function fetchComments');
+    const region = src.slice(i, src.indexOf('\nexport function commentPoint', i));
+    ok('★ 源码区间里没有任何写方法（POST/PUT/DELETE/PATCH）',
+      i > 0 && !/method:\s*['"](POST|PUT|DELETE|PATCH)/i.test(region) && /method: 'GET'/.test(region), `区间 ${region.length} 字符`);
+  }
+
+  /* —— ②④⑤⑥ 端到端：read_blocks 带评论 —— */
+  {
+    const VID2 = '0000000b-0000-4000-8000-00000000000b';
+    const AT2 = 'Tue, 22 Sep 2026 16:58:24 GMT';
+    const mockRes = (obj, status = 200) => ({
+      ok: status >= 200 && status < 300, status,
+      headers: { get: () => 'application/json; charset=utf-8' },
+      arrayBuffer: async () => Buffer.from(JSON.stringify(obj), 'utf8'),
+    });
+    const fillNode = (hex, alpha = 1) => {
+      const c = parseColor(hex);
+      return { type: 'color', isEnabled: true, color: { value: `rgba(${c.r}, ${c.g}, ${c.b}, ${alpha})` } };
+    };
+    /** 结构照真机稿「人才弹窗」搭：画板不在画布原点、卡片 + 同框 `:shadow` 副本 + 卡内不成块的图片层。 */
+    const cmTree = () => ({
+      meta: { device: 'iPhone 14' },
+      artboard: {
+        id: 'ab', type: 'artboard', name: '评论自检稿',
+        frame: { left: -12638, top: 500, width: 375, height: 812 },
+        style: { fills: [fillNode('#ffffff')] },
+        layers: [
+          {
+            id: 'CARD', type: 'shapeLayer', name: '弹窗卡片',
+            frame: { left: 16, top: 176.96, width: 343, height: 458.09 },
+            paths: [{ type: 'rect', radius: { topLeft: 16, topRight: 16, bottomRight: 16, bottomLeft: 16 } }],
+            style: { fills: [fillNode('#ffffff')] },
+            layers: [
+              // 同框副本：与卡片面积只差 0.02%（真机上就是这么一对）
+              {
+                id: 'SHADOW', type: 'shapeLayer', name: '弹窗卡片:shadow',
+                frame: { left: 16, top: 176.83, width: 343, height: 458 },
+                style: { fills: [fillNode('#000000', 0.1)] },
+              },
+              // **不成块**的真元素（无填充/无边框/无圆角/非切图 → OTHER）：只能靠"最细层"线索看见
+              {
+                id: 'PHOTO', type: 'shapeLayer', name: '生成男士职业照 1',
+                frame: { left: 37.81, top: 192.96, width: 120, height: 152 },
+                layers: [
+                  { id: 'VEC', type: 'shapeLayer', name: 'Vector', frame: { left: 105, top: 205, width: 20, height: 20 } },
+                ],
+              },
+              // 对比度不达标的灰字（证明评论段排在「对比度」之后）
+              {
+                id: 'TXT', type: 'textLayer', name: '灰字',
+                frame: { left: 20, top: 300, width: 100, height: 20 },
+                style: { fills: [fillNode('#999999')] },
+                text: { style: { content: '灰字', color: { value: 'rgba(153,153,153,1)' }, font: { name: 'Inter', size: 14, fontWeight: 400 } } },
+              },
+            ],
+          },
+        ],
+      },
+    });
+    const cmComment = (o = {}) => ({
+      id: 'c1', content: '要个png的图片', create_time: 1791587876, update_time: 1791587879,
+      position_x: 0.3, position_y: 0.26, read: false,
+      user: { id: 'u1', name: 'qzdesign01', nickname: '管理' },
+      version: { version_id: '88e0aaa6', version_info: '版本2' },
+      replies: [], ...o,
+    });
+    const FULL = [
+      cmComment(),                                                                   // 命中卡片
+      cmComment({ id: 'c2', content: '这里少了分割线', position_x: 0.02, position_y: 0.99, read: true }),   // 空白（远）
+      cmComment({ id: 'c3', content: '按钮再大一点', position_x: 0.5, position_y: 650 / 812, read: true }), // 空白（近）
+      cmComment({ id: 'c4', content: '整稿的备注', position_x: 0, position_y: 0, read: true }),             // 没定位
+    ];
+    /** comments: 'empty' 空稿 / 'full' 4 条 / 'fail' 接口报错 */
+    const withCmMock = async (fn, { comments = 'empty' } = {}) => {
+      const real = globalThis.fetch;
+      const seen = [];
+      globalThis.fetch = async (url, init) => {
+        const u = String(url);
+        seen.push({ url: u, method: init?.method, body: init?.body });
+        if (u.includes('/api/project/image?')) {
+          return mockRes({
+            code: '00000',
+            result: { id: 'i-mock', name: '评论自检稿', width: 375, height: 812, versions: [{ id: VID2, json_url: 'https://mock.lanhu/cm.json', create_time: AT2 }] },
+          });
+        }
+        if (u === 'https://mock.lanhu/cm.json') return mockRes(cmTree());
+        if (u.includes('/api/project/comment')) {
+          if (comments === 'fail') return mockRes({ code: '10007', msg: 'Project not exist' });
+          if (comments === 'empty') return mockRes({ has_comment: false, has_next: false, total: 0, result: [] });
+          return mockRes({ has_comment: true, has_next: false, total: FULL.length, result: FULL });
+        }
+        throw new Error('未预期的请求：' + u);
+      };
+      try { return { r: await fn(), seen }; } finally { globalThis.fetch = real; }
+    };
+    const A2 = { projectId: 'p-mock', imageId: 'i-mock', account: 'mock', cookie: 'PASSPORT=x; user_token=y' };
+
+    // ⓐ 空稿：**逐字节不变**（这是"绝大多数稿"的情形）
+    const { r: rOff, seen: seenOff } = await withCmMock(() => readBlocks({ ...A2, comments: false }), { comments: 'empty' });
+    const { r: rEmpty, seen: seenEmpty } = await withCmMock(() => readBlocks({ ...A2 }), { comments: 'empty' });
+    ok('★ 无评论稿：文本与 `comments:false` 那次**逐字节一致**', rEmpty.text === rOff.text, `长度 ${rEmpty.text?.length} vs ${rOff.text?.length}`);
+    ok('★ 无评论稿：整个返回体也逐字节一致（不多 `comments` / `commentsError` 键）',
+      JSON.stringify(rEmpty) === JSON.stringify(rOff), `键 ${Object.keys(rEmpty).join(',')}`);
+    ok('★ 无评论稿：标题行**一个字符都没变**', rEmpty.text.split('\n')[0] === rOff.text.split('\n')[0], rEmpty.text.split('\n')[0]);
+    ok('★ 无评论稿：正文里没有评论段（没有 `## 评论` / 没有「条评论」）',
+      !rEmpty.text.includes('## 评论') && !rEmpty.text.includes('条评论'), (rEmpty.text.match(/评论/g) ?? []).length + ' 处「评论」字样');
+    eq('★ `comments:false` → **少一次请求**（2 次；默认是 3 次）', [seenOff.length, seenOff.length], [2, 2]);
+    eq('无评论稿也**不**返回 comments 键', Object.prototype.hasOwnProperty.call(rEmpty, 'comments'), false);
+
+    // ⓑ 有 4 条：标题行 + 评论段 + 机器可读字段
+    const { r: rFull, seen: seenFull } = await withCmMock(() => readBlocks({ ...A2 }), { comments: 'full' });
+    ok('★ 默认**读评论**：请求数 2 → 3（详情 + 图层树 + 评论）', seenFull.length === 3, seenFull.map((s) => s.url.replace(/^https:\/\/lanhuapp\.com/, '')).join(' | '));
+    ok('★ 只读：3 个请求全是 GET、都没有 body',
+      seenFull.every((s) => (s.method === undefined || s.method === 'GET') && s.body === undefined));
+    ok('★ 标题行加了提醒：「本稿有 4 条评论（含未读 1）」',
+      rFull.text.split('\n')[0].includes('｜本稿有 4 条评论（含未读 1）'), rFull.text.split('\n')[0]);
+    const segTxt = rFull.text.split('## 评论')[1] ?? '';
+    ok('★ 评论段在「对比度」之后、尾注之前',
+      rFull.text.indexOf('## 对比度') > -1 && rFull.text.indexOf('## 对比度') < rFull.text.indexOf('## 评论')
+      && rFull.text.indexOf('## 评论') < rFull.text.indexOf('ℹ️'), `对比度@${rFull.text.indexOf('## 对比度')} 评论@${rFull.text.indexOf('## 评论')} 尾注@${rFull.text.indexOf('ℹ️')}`);
+    ok('评论段给：内容 + 谁说的 + 版本 + 未读 + 挂在哪个块',
+      segTxt.includes('「要个png的图片」') && segTxt.includes('@管理（qzdesign01）') && segTxt.includes('版本2')
+      && segTxt.includes('**未读**') && segTxt.includes('挂在 **弹窗卡片** 这块（卡片 · 343×458）'), segTxt.split('\n').find((l) => l.includes('挂在')));
+    ok('★ 落点最细层线索：卡内那张不成块的职业照（`Vector` 这种默认名被跳过）',
+      segTxt.includes('该块内最细的层：**生成男士职业照 1**'), segTxt.split('\n').find((l) => l.includes('最细')));
+    ok('★ 落在空白的评论**明说没落在任何块上**（不说"挂在某块"）',
+      (segTxt.match(/未落在任何块上/g) ?? []).length === 3, String((segTxt.match(/未落在任何块上/g) ?? []).length));
+    ok('★ 近处的那条给"最近的是…（约 15px 外）"并声明**只是线索不是命中**',
+      /最近的是 \*\*弹窗卡片\*\*.*约 15px 外.*只是线索，不是命中/.test(segTxt), segTxt.split('\n').find((l) => l.includes('最近的是')));
+    ok('★ (0,0) 那条点明"没带定位坐标"，**不硬套块**',
+      segTxt.includes('评论没带定位坐标'), segTxt.split('\n').find((l) => l.includes('没带定位')));
+    ok('段头交代坐标系（归一化 × 画板 375×812）与只读纪律',
+      segTxt.includes('归一化 0~1') && segTxt.includes('375×812') && segTxt.includes('只发 GET'));
+    // 机器可读字段
+    eq('返回：comments.total / unread / fetched',
+      [rFull.comments.total, rFull.comments.unread, rFull.comments.fetched], [4, 1, 4]);
+    eq('返回：items[0] 平铺了 blockLabel + user + version + unread + replies',
+      [rFull.comments.items[0].blockLabel, rFull.comments.items[0].user.display, rFull.comments.items[0].version.info, rFull.comments.items[0].unread, Array.isArray(rFull.comments.items[0].replies)],
+      ['弹窗卡片', '管理', '版本2', true, true]);
+    eq('返回：position 是**归一化**、point 是**稿上坐标**（两者都在，谁也别猜）',
+      [rFull.comments.items[0].position.x, rFull.comments.items[0].point.x, rFull.comments.items[0].point.y], [0.3, 112.5, 211.12]);
+    eq('返回：空白那条 hit=false 且 block=null（机器读的结论与文本一致）',
+      [rFull.comments.items[1].anchor.hit, rFull.comments.items[1].anchor.block, rFull.comments.items[1].blockLabel], [false, null, null]);
+    eq('返回：没定位那条 reason=no-position',
+      [rFull.comments.items[3].anchor.reason, rFull.comments.items[3].point], ['no-position', null]);
+    ok('★ 返回是 lossless（没有 undefined/NaN 混进去）',
+      findIllegal({ comments: rFull.comments }).length === 0, findIllegal({ comments: rFull.comments }).slice(0, 2).join(','));
+    eq('有评论时**不**带 commentsError 键', Object.prototype.hasOwnProperty.call(rFull, 'commentsError'), false);
+
+    // ⓒ 降级：评论接口挂了 → read_blocks **照样成功**，其它段一个字不少
+    //   ⚠️ 这里**自己兜住抛错**（而不是让整个自检崩掉）：一旦 read_blocks 把评论的失败抛出来，
+    //      下面那条断言要给出一个**计过数的 ❌**，而不是一个没有上下文的堆栈。
+    const { r: rFail } = await withCmMock(async () => {
+      try { return await readBlocks({ ...A2 }); } catch (e) { return { ok: false, throwMessage: String(e?.message ?? e), text: '', blocks: [] }; }
+    }, { comments: 'fail' });
+    eq('★ 评论接口挂了：read_blocks 仍然 ok（绝不连累主流程）', [rFail.ok, rFail.blockCount > 0], [true, true]);
+    ok('★ 评论接口挂了也**没有抛错**（抛错 = 主流程被评论拖死）', !rFail.throwMessage, rFail.throwMessage ?? '');
+    ok('★ 挂掉时**明说**「读取失败」+ 原因（不静默、不假装"没有评论"）',
+      rFail.text.includes('## 评论（**读取失败**）') && rFail.text.includes('10007'), rFail.text.split('## 评论')[1]?.split('\n')[0]);
+    ok('★ 挂掉时返回带机器可读的 `commentsError`（不用解析文本就能判断）',
+      typeof rFail.commentsError === 'string' && /10007/.test(rFail.commentsError), rFail.commentsError);
+    eq('挂掉时**不**带 comments 键（避免调用方把失败当"0 条"）', Object.prototype.hasOwnProperty.call(rFail, 'comments'), false);
+    // ★ 最强的一条：把「读取失败」那段整段摘掉，剩下的必须与"完全不读评论"的那份一致
+    //   —— 证明降级只影响评论段自己，块表 / 边框段 / 间距一览 / 对比度 / 尾注 / 标题行一字未动。
+    //   （尾注里的 `≈N KB` 是**本段文本自身体积**，多了评论段它当然会变 —— 那一处单独比。）
+    {
+      const cut = rFail.text.indexOf('## 评论（**读取失败**）');
+      const stripped = cut > 0 ? rFail.text.slice(0, cut) + rFail.text.slice(rFail.text.indexOf('— ≈', cut)) : rFail.text;
+      const bodyOf = (t) => t.slice(0, t.indexOf('— ≈'));
+      let k = 0;
+      while (k < stripped.length && k < rOff.text.length && stripped[k] === rOff.text[k]) k += 1;
+      ok('★ 挂掉时正文（标题行 → 对比度段）**逐字节照常**', bodyOf(stripped) === bodyOf(rOff.text),
+        bodyOf(stripped) === bodyOf(rOff.text) ? `${bodyOf(stripped).length} 字符一致`
+          : `首个不同在第 ${k} 字符：摘掉后 ${JSON.stringify(stripped.slice(Math.max(0, k - 40), k + 40))} / 原本 ${JSON.stringify(rOff.text.slice(Math.max(0, k - 40), k + 40))}`);
+      const footOf = (t) => t.slice(t.indexOf('— ≈')).replace(/≈[\d.]+KB/, '≈?KB');
+      ok('★ 挂掉时尾注除体积数字外一字不差（体积本来就该把评论段算进去）',
+        footOf(stripped) === footOf(rOff.text), footOf(stripped).split('\n')[0]);
+      ok('★ 挂掉时块表 / 对比度 / 尾注 都还在',
+        rFail.text.includes('| # | 类型 | 名称 | 位置 |') && rFail.text.includes('## 对比度') && rFail.text.includes('ℹ️'));
+    }
+    ok('★ 挂掉时标题行**不加**评论提醒（没读到就不编）',
+      !rFail.text.split('\n')[0].includes('条评论'), rFail.text.split('\n')[0]);
+    ok('★ 挂掉时块的解析结果与正常情况**完全一致**（评论不影响块模型）',
+      JSON.stringify(rFail.blocks) === JSON.stringify(rFull.blocks), `${rFail.blockCount} vs ${rFull.blockCount}`);
+  }
+
+  /* —— 工具层：新参数的注册期契约（schema 拦坏值 = 一个请求都不发；声明可序列化） —— */
+  {
+    const tool = TOOLS.find((t) => t.name === 'lanhu_read_blocks');
+    ok('read_blocks 的参数 schema 声明了 `comments`', tool?.parameters?.properties?.comments?.type === 'boolean',
+      JSON.stringify(tool?.parameters?.properties?.comments ?? null).slice(0, 80));
+    ok('read_blocks 的 output schema 声明了 `comments` / `commentsError`',
+      !!tool?.output?.schema?.properties?.comments && !!tool?.output?.schema?.properties?.commentsError);
+    const bad = await tool.execute({ comments: 'yes' });
+    ok('`comments` 传非布尔值 → 被 schema 拦在业务之前（不发任何请求）',
+      bad?.failed === true && /不符合 schema/.test(String(bad.text)), String(bad?.text).split('\n')[0]);
+    const def = JSON.stringify({ p: tool.parameters, o: tool.output.schema });
+    ok('改完的声明仍可 JSON 序列化（注册期不会因 undefined/函数炸掉整个 profile）',
+      typeof def === 'string' && def.length > 100, `${def.length} 字符`);
   }
 }
 

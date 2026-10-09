@@ -31,7 +31,7 @@ node lanhu.mjs auth
 node lanhu.mjs teams / projects --team <id> / designs --url "<链接>"|--project <id> / sectors --project <id>
 node lanhu.mjs search   --team <teamId> --keyword <kw>
 node lanhu.mjs read     --project <id> --image <id> [--format summary|full|tokens] [--region y0,y1] [--limit N] [--map-box … --to-box …]
-node lanhu.mjs blocks   --url "<蓝湖链接>" [--kind card,pill] [--min-width 60] [--all]
+node lanhu.mjs blocks   --url "<蓝湖链接>" [--kind card,pill] [--min-width 60] [--all] [--comments]   # --comments 额外读稿上人类留的评论/标注
 node lanhu.mjs diff     --url "<蓝湖链接>" --from <旧版本id> [--to <版本id>] [--all]   # 两个版本比「改了什么」
 node lanhu.mjs audit    --url "<链接>"|--project <id> [--limit N] [--all] [--allow-weak-naming]   # 跨稿一致性审计（设计系统漂移）
 node lanhu.mjs slices   --project <id> --image <id> [--out ./assets/lanhu]
@@ -69,12 +69,15 @@ node lanhu.mjs cookie --clipboard --dry-run  # 只看解析结果，不写入
 ## 本地自检
 
 ```bash
-node test/selfcheck.mjs          # 1324 项，纯离线、秒级
+node test/selfcheck.mjs          # 1408 项，纯离线、秒级
 node test/selfcheck.mjs --json   # 机器可读
 ```
 
 覆盖最**容易静默坏掉**的地方：链接解析（hash 路由）、工具参数校验、块级模型分类、工具定义形状、
 lossless JSON、CLI 入口守卫、图片元信息、字体族判定、坐标映射、输出完整性、
+**评论 / 标注**（真机结构 fixture 解析、分页与硬上限、归一化坐标 → 稿上坐标的换算、
+落点映射"取最具体的块 / 同框副本取本体 / 命中不了就明说不硬套"、有评论才加标题行那句、
+无评论时输出逐字节不变、接口挂了只降级不失败、`comments:false` 少一次请求、**只发 GET**）、
 设计变更 diff（匹配可靠度）、设计系统审计（组件识别判据、三类漂移、命名不可靠时拒绝出明细、成本上限）、
 **Sketch 插件格式（`type: sketchPlugin`）**（能解析的必须解析出块、取不出图层的必须明示而非静默）、
 **面板「体检」Tab**（用最小 React 替身把整棵面板树真渲染一遍：tab 真的挂上了、运行中按钮禁用且有进度、
