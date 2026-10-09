@@ -91,6 +91,51 @@ export const LIMITS = Object.freeze({
   gapDigestMaxRows: 24,     // 「间距一览」的间距行封顶（0.5.0 口径）
   flushMaxRows: 24,         // 「间距一览」的齐平行封顶
   urlTruncate: 800,         // 长 URL 截断长度
+  // —— 无障碍对比度（WCAG 2.x AA，§4.8）——
+  contrastNormal: 4.5,      // 正文（非大号）下限
+  contrastLarge: 3,         // 大号文字下限
+  largeTextPx: 24,          // 大号：字号 ≥ 24px
+  largeTextBoldPx: 18.66,   // 大号：或 ≥ 18.66px 且 bold
+  largeTextBoldWeight: 700, // 「bold」的字重门槛
+  contrastMaxRows: 24,      // 「对比度」段不达标行的封顶（与「间距一览」同口径）
+  contrastSearchSteps: 24,  // 建议色的二分搜索步数
+  // —— 设计变更 diff（§6.5）——
+  diffApproxMaxCenter: 24,      // 近似匹配：两块的**中心点**偏移上限（px）
+  diffApproxReachRatio: 0.25,   // 近似匹配的宽松兜底：偏移 ≤ 较大边的这个比例也算（大块天然挪得远）
+  diffApproxMaxSizeRatio: 1.25, // 近似匹配：宽/高各自的 max/min 上限（差 25% 以内才算同一块）
+  diffMinMatchedRatio: 0.5,     // 匹配率低于它 → 判「两版差异过大，逐块对比不可靠」
+  diffMaxApproxShare: 0.5,      // 近似匹配占已匹配的比超过它 → 同上（身份大面积对不上）
+  diffMinBlocksForRatio: 8,     // 块数少于此不按比例判（小样本比例没有意义）
+  diffMaxRowsPerCategory: 40,   // 每类最多列几行（超出的只给计数，不静默截断）
+  // —— 设计系统审计（§6.6，跨稿一致性）——
+  //    成本模型：**扫 N 张稿 = 2N 次请求**（1 次稿详情 + 1 次图层树）。实测 1437 张 ≈ 45 分钟，
+  //    所以默认值必须克制，而硬上限是"不许无限拉取"这条铁律的落点。
+  auditDefaultImages: 50,       // 默认扫多少张稿（显式传 limit 才能加）
+  auditMaxImages: 200,          // **硬上限**：limit 传再大也不超过它
+  auditConcurrency: 4,          // 同时在飞的最大请求数（提速，同时对接口礼貌）
+  auditMinImagesForAudit: 2,    // 成功读到图层的稿少于它 → 样本太少，整项判不可靠
+  auditMinNamedShare: 0.3,      // 可靠块名占比低于它 → **命名不可靠**，拒绝出明细
+  auditMinComponentImages: 2,   // 一个组件名至少跨这么多张稿，才算「同一组件」
+  auditMinComponentBlocks: 3,   // 一个组件名至少这么多块，才参与规格漂移判定
+  auditNameMinLength: 2,        // 归一化后短于它的层名不认（"底""线"这种太泛，指代不明）
+  auditMaxSpecValues: 8,        // 一个组件某维度最多列几个取值（超出的只给计数）
+  auditMaxFindings: 12,         // 每类最多列几条发现（超出的只给计数，不静默截断）
+  auditMaxExamples: 4,          // 每条发现最多举几张稿当例子
+  auditExampleNameMax: 18,      // 例子里的稿名截断长度
+  auditErrorMax: 80,            // 单张稿读取失败时，错误原文的截断长度
+  auditHealthyFontSizes: 8,     // 一个项目的健康字号台阶上限，超过就算「阶梯失控」
+  auditOneOffMaxCount: 1,       // 字号出现次数 ≤ 它 = 一次性野值
+  auditOneOffMinCount: 2,       // 一次性野值达到这么多个 → 报「字号阶梯失控」
+  auditLadderMinCount: 3,       // 算「常用档」的最低出现次数（收敛建议的锚点）
+  auditNearColorDistance: 12,   // 近重复色：RGB 欧氏距离 ≤ 它（≈ ΔE 5，肉眼看不出）
+  auditMaxColors: 600,          // 参与近重复比较的色值上限（超过只取出现次数最多的那批）
+  auditSpacingGrid: 4,          // 间距栅格（4px 制）
+  auditSpacingMaxDistance: 120, // 只统计 ≤ 它的相邻间距（几百 px 的"间距"是版面留白，不是尺度 token）
+  auditSpacingMaxBlocks: 500,   // 单张稿可见块超过它就不算间距（geometricGaps 是 O(N²) 的保护）
+  auditOffGridMinValues: 3,     // 不在栅格上的间距值达到这么多个 → 报「间距尺度失控」
+  auditRadiusScale: Object.freeze([0, 2, 4, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 64, 9999]),
+  auditOffScaleMinValues: 3,    // 不在刻度上的圆角值达到这么多个 → 报「圆角特例」（参考项）
+  auditEpsilon: 0.01,           // 浮点容差（判"落没落在栅格/刻度上"）
 });
 
 
@@ -1194,7 +1239,45 @@ export async function fetchDesignTree(projectId, imageId, opts = {}) {
       hint: '改用 lanhu_read_design / lanhu_read_blocks 读它。',
     });
   }
-  return { detail, tree, bytes: 0 };
+
+  // ⭐ Sketch 插件格式（`type: sketchPlugin`）：**归一化后走同一条解析链**。
+  //   以前这里不管它 → `tree.artboard ?? tree` 退化成"把整棵树当画板" →
+  //   `read_blocks` 静默输出「共 1 块：画板 1」+ 空表（看着像成功，其实什么都没解析）。
+  let out = tree;
+  let sourceFormat = null;
+  let unsupported = null;
+  if (expect === 'design') {
+    if (isSketchPluginTree(out)) {
+      const norm = normalizeSketchPluginTree(out);
+      sourceFormat = 'sketchPlugin';
+      out = norm.tree;
+      // 归一化出来了 **0 个**（画板之外的）子层 → 这份稿的 `info[]` 里没有可用图层。
+      //   **不许**再让下游拿到"只有画板"的树（那正是「共 1 块：画板 1」的来源），这里就标记清楚。
+      if (norm.layerCount === 0) {
+        unsupported = {
+          code: 'SKETCH_PLUGIN_NO_LAYERS',
+          format: 'sketchPlugin',
+          layerCount: 0,
+          rawItemCount: Array.isArray(tree?.info) ? tree.info.length : 0,
+          what: 'Sketch 插件导出（`type: sketchPlugin`）',
+          why: '本插件**认**这种格式（图层在 `info[]` 里），但这张稿的 `info[]` 里取不出任何子层 —— 数据不全或结构异常。',
+        };
+      }
+    } else if (!out?.artboard) {
+      // 既没有 `artboard`（设计稿）、也没有 `info[]`（Sketch 插件）、也没有 `pages/sitemap`（原型）
+      //   → 认不出的树。**不许静默**：以前会摊出 1 层（树自己）当成"1 块画板"。
+      unsupported = {
+        code: 'UNKNOWN_TREE_FORMAT',
+        format: 'unknown',
+        layerCount: 0,
+        rawItemCount: null,
+        what: '认不出的图层树格式',
+        why: '这棵树**既没有 `artboard`**（Figma / Sketch 稿）**也没有 `info[]`**（Sketch 插件导出）'
+          + '**也没有 `pages`/`sitemap`**（Axure 原型）—— 本插件没有能解析它的路径。',
+      };
+    }
+  }
+  return { detail, tree: out, bytes: 0, sourceFormat, unsupported };
 }
 
 /* ==========================================================================
@@ -3116,6 +3199,293 @@ function borderOf(node) {
   };
 }
 
+/* ==========================================================================
+ * 3c. 蓝湖 **Sketch 插件格式**（`type: sketchPlugin`）—— 归一化成与 Figma 稿同形的树
+ *
+ * 背景（2026-10 实测，项目「105福建省碳足迹公共服务平台」252 张稿）：**11/20 ≈ 55%** 的稿是
+ * `type: sketchPlugin`（Sketch 插件导出）。它们**没有 `artboard`**：图层平铺在 `info[]` 里，
+ * 层级靠每个元素的 `parentID` 串起来（`layers` 字段恒为 `[]`，实测 2348 层无例外）。
+ *
+ * 不处理会怎样（本次要修的缺陷）：既有的 `tree.artboard ?? tree` 会退化成"把整棵树当画板"，
+ * `flattenArtboard` 只能摊出 **1 层** → `lanhu_read_blocks` 输出「共 **1** 块：画板 1」+ 一张空表。
+ * **看着跑成功、其实一个块都没解析出来** —— 比直接报错危险得多：
+ * AI 会据此认定"这张稿是空的"，然后什么都不建（本仓库最忌讳的失败模式）。
+ *
+ * 所以这里把它**真的解析出来**：映射成与 Figma 稿**同形**的树，之后完全复用
+ * `flattenArtboard` / `buildBlocks` / 渲染 / 验收 —— **不为它另写一套块模型**（两套必然漂移）。
+ * 下面每个 `sketch*` 小函数的字段映射都有实测依据，见各自注释。
+ * ========================================================================== */
+
+/**
+ * Sketch 用 **postScriptName 的后缀**表达字重（`SourceHanSansCN-Bold`）。
+ * 实测 11 张稿 746 个文字层出现过的后缀：Regular / Normal / Medium / Bold / Heavy，
+ * 以及**没有后缀**的 HelveticaNeue / MicrosoftYaHei / YouSheBiaoTiHei（按 400 处理）。
+ * ⚠️ 这张表是**格式规则**（Sketch 的既定命名约定），不是"为了好看凑一个数值"。
+ */
+const SKETCH_WEIGHT_SUFFIX = Object.freeze({
+  Thin: 100, UltraLight: 200, ExtraLight: 200, Light: 300, Book: 400,
+  Regular: 400, Normal: 400, Medium: 500, SemiBold: 600, DemiBold: 600,
+  Bold: 700, Heavy: 900, Black: 900,
+});
+const SKETCH_WEIGHT_RE = /-(Thin|UltraLight|ExtraLight|Light|Book|Regular|Normal|Medium|SemiBold|DemiBold|Bold|Heavy|Black)$/i;
+
+/** 从 `SourceHanSansCN-Bold` 取字重；认不出后缀就是 400（不猜）。 */
+function sketchWeightOf(postScript) {
+  const m = SKETCH_WEIGHT_RE.exec(String(postScript ?? ''));
+  if (!m) return 400;
+  const key = Object.keys(SKETCH_WEIGHT_SUFFIX).find((k) => k.toLowerCase() === m[1].toLowerCase());
+  return key ? SKETCH_WEIGHT_SUFFIX[key] : 400;
+}
+
+/** 字体族名 = postScriptName **去掉字重后缀**（只做剥离，不改写、不加空格）。 */
+function sketchFamilyOf(postScript) {
+  const s = String(postScript ?? '').trim();
+  if (!s) return null;
+  return s.replace(SKETCH_WEIGHT_RE, '') || s;
+}
+
+/** `ddsType` → `paths[0].type`。Figma 稿实测只出现 `rect` / `ellipse`（775 / 25 个），
+ *  所以**只映射这两个**；`star` / `shape-group` / `artboard-group` 保持不认识（不编一个类型出来）。 */
+const SKETCH_SHAPE_BY_DDS = Object.freeze({ rectangle: 'rect', oval: 'ellipse' });
+
+/** Sketch 边框对齐方式 → Figma 稿的 `lineAlignment`。 */
+const SKETCH_BORDER_ALIGN = Object.freeze({ '内边框': 'inside', '中心边框': 'center', '外边框': 'outside' });
+
+/**
+ * Sketch 圆角 → Figma 稿的 `{topLeft,topRight,bottomRight,bottomLeft}`。
+ *
+ * 实测两种形态，且**与 `points[].cornerRadius` 逐值一致**（2348 层无例外）：
+ *   · `radius: [4]`        → 四角 4（points 给 `[4,4,4,4]`）
+ *   · `radius: [4,0,16,0]` → 依次 左上/右上/右下/左下（points 的 point 坐标顺序 0,0 → 1,0 → 1,1 → 0,1）
+ * 与 `radiusOf()` 期望的顺序（topLeft/topRight/bottomRight/bottomLeft）**一致**，可直接用。
+ */
+function sketchRadius(node) {
+  const arr = Array.isArray(node?.radius) ? node.radius : null;
+  const pts = (node?.points ?? []).map((p) => round2(p?.cornerRadius ?? 0));
+  let v = null;
+  if (arr && arr.length === 4) v = arr.map((x) => round2(x ?? 0));
+  else if (arr && arr.length === 1) { const a = round2(arr[0] ?? 0); v = [a, a, a, a]; }
+  else if (pts.length === 4) v = pts;
+  if (!v || v.every((x) => !x)) return null;   // 全 0 = 没圆角 → null（与 radiusOf 同口径）
+  return { topLeft: v[0], topRight: v[1], bottomRight: v[2], bottomLeft: v[3] };
+}
+
+/** `info[]` 顶层 `fills` → Figma 稿的 `style.fills`。 */
+function sketchFillsOf(node) {
+  const out = [];
+  for (const f of node?.fills ?? []) {
+    if (!f || f.isEnabled === false) continue;
+    if (f.type === 'color') {
+      out.push({ type: 'color', color: f.color ?? null, isEnabled: f.isEnabled !== false });
+    } else if (f.type === 'gradient') {
+      const g = f.gradient ?? {};
+      out.push({
+        type: 'gradient',
+        // ⚠️ **字段名必须迁移**：Sketch 插件给 `colorStops`，Figma 稿给 `stops`，
+        //    而 `layerColors()` 只认 `stops` —— 不迁移的话**渐变会被整条丢掉**，
+        //    而表格里"有颜色"看着不像缺信息（本项目 11 张稿里有 103 处渐变，实测踩过）。
+        gradient: { stops: g.colorStops ?? g.stops ?? [], from: g.from ?? null, to: g.to ?? null },
+        isEnabled: f.isEnabled !== false,
+      });
+    }
+  }
+  return out;
+}
+
+/**
+ * `info[]` 顶层 `borders` → Figma 稿的 `style.borders`。
+ * ⚠️ Sketch 的边框**没有每边宽度**（只有统一的 `thickness` + `position`）——
+ *    实测 231 处边框全是四边同宽，所以 `widths` 四边都填 `thickness`。
+ *    Sketch 里"分割线"通常是一条 1px 高的 shape，不靠边框表达，故这里不会产生假的单边边框。
+ */
+function sketchBordersOf(node) {
+  const out = [];
+  for (const b of node?.borders ?? []) {
+    if (!b || b.isEnabled === false) continue;
+    const w = round2(b.thickness ?? b.width ?? 0);
+    if (!(w > 0)) continue;
+    out.push({
+      color: b.color ?? null,
+      isEnabled: true,
+      width: w,
+      widths: { left: w, right: w, top: w, bottom: w },
+      style: 'solid',
+      lineAlignment: SKETCH_BORDER_ALIGN[b.position] ?? null,
+    });
+  }
+  return out;
+}
+
+/** `info[]` 的 `font` → Figma 稿的 `text.style`（文字内容、字体、行高、字距、文字色）。 */
+function sketchTextOf(node) {
+  const f = node?.font;
+  if (!f || typeof f !== 'object') return null;
+  const content = typeof f.content === 'string' && f.content !== ''
+    ? f.content
+    : (typeof f.styles?.[0]?.content === 'string' ? f.styles[0].content : null);
+  if (typeof content !== 'string') return null;
+  return {
+    style: {
+      content,
+      font: {
+        name: sketchFamilyOf(f.font),
+        // 原始 postScriptName 一并留着 —— 字体族名是从它剥离出来的，溯源要能看到原文
+        postScriptName: f.font ?? null,
+        displayName: f.displayName ?? null,
+        size: f.size == null ? null : round2(f.size),
+        fontWeight: sketchWeightOf(f.font),
+        align: f.align ?? null,
+        lineHeight: f.line == null ? null : { value: round2(f.line), unit: 'PIXELS' },
+        letterSpacing: { value: round2(f.kerning ?? 0), unit: 'pixels' },
+      },
+      color: f.color ?? f.styles?.[0]?.color ?? null,
+    },
+    value: content,
+  };
+}
+
+/** 单个 `info[]` 元素 → Figma 稿形状的图层节点（`children` 已建好）。 */
+function sketchLayerOf(node, children, isArtboard) {
+  const frame = {
+    // 画板：`left/top` 恒为 0（相对自己），**画布绝对坐标**在 `position_x/position_y` ——
+    //   与 Figma 稿的画板 frame（实测 left=2193/top=57604）同口径。
+    // 其余层：实测 `left/top` **就是画板绝对坐标**（44 个有父层的元素里 24 个的 left/top
+    //   超出父层局部框，父局部框根本装不下 —— 所以不可能是"相对父级"）。
+    //   而 `flattenArtboard` 的假设正是"子层 frame 相对画板原点"，**两边天然对齐**。
+    left: round2(isArtboard ? (node.position_x ?? node.left ?? 0) : (node.left ?? 0)),
+    top: round2(isArtboard ? (node.position_y ?? node.top ?? 0) : (node.top ?? 0)),
+    width: round2(node.width ?? 0),
+    height: round2(node.height ?? 0),
+  };
+  const radius = sketchRadius(node);
+  const shape = SKETCH_SHAPE_BY_DDS[node.ddsType] ?? null;
+  const ddsUrl = node.ddsImage?.imageUrl ?? null;
+  const exportUrl = node.image?.imageUrl ?? null;
+  return {
+    id: node.id,
+    name: node.name ?? '',
+    /** 保留 Sketch 的原 type（`shape`/`text`/`layer-group`/`bitmap`/`symbol`）——
+     *  这一层是**忠实透传**，也让人一眼看出这张稿是 Sketch 插件格式来的。 */
+    type: node.type ?? null,
+    ddsType: node.ddsType ?? null,
+    frame,
+    realFrame: isArtboard ? frame : (node.layerOriginFrame ? {
+      left: round2(node.layerOriginFrame.x ?? 0), top: round2(node.layerOriginFrame.y ?? 0),
+      width: round2(node.layerOriginFrame.width ?? 0), height: round2(node.layerOriginFrame.height ?? 0),
+    } : frame),
+    // 实测 Sketch 的 opacity 是 **0..100**（Figma 稿是 0..1），必须换算；不换算会把 80% 当 80 倍。
+    opacity: typeof node.opacity === 'number' ? clamp01(node.opacity / 100) : 1,
+    visible: node.isVisible !== false,
+    radius,
+    paths: shape ? [{ type: shape, frame, radius }] : null,
+    style: {
+      isEnabled: true,
+      opacity: 1,
+      blendMode: node.blendMode ?? 0,
+      fills: sketchFillsOf(node),
+      borders: sketchBordersOf(node),
+      shadows: Array.isArray(node.shadow) ? node.shadow : [],
+      blurs: node.blur ? [node.blur] : [],
+    },
+    /**
+     * ⚠️ 切图判据**只认 `type: 'bitmap'`（真位图层）+ 组被导出成一张图（`image.imageUrl`）**。
+     *    不能拿 `hasExportDDSImage` 当判据：Sketch 插件格式里 **890/2348 层**都带它
+     *    （连普通 `shape` 也有，蓝湖给每层都导了图），照抄会让七成形状都变成"图片块"。
+     *    Figma 稿的对照是 `hasExportImage`：1105 层里只有 87 层 —— 数量级与语义都对得上。
+     */
+    hasExportDDSImage: Boolean(node.type === 'bitmap' && ddsUrl),
+    hasExportImage: Boolean(exportUrl),
+    image: node.image ?? node.ddsImage ?? null,
+    text: sketchTextOf(node),
+    layers: children,
+  };
+}
+
+/** 只挑**元信息**（不把庞大的 `info[]` 带进归一化树 —— 那会让 full 落盘体积翻倍）。 */
+const SKETCH_META_KEYS = Object.freeze([
+  'device', 'ArtboardScale', 'sliceScale', 'exportScale', 'pageName',
+  'skVersion', 'skBuild', 'pluginVersion', 'sketchtool', 'ArtboardID', 'isMergeData',
+]);
+
+/**
+ * `type: sketchPlugin` 的树 → 与 Figma 稿**同形**的树（`{meta, sketch, assets, artboard}`）。
+ *
+ * @returns `{ tree, artboard, layerCount, sliceUrls }`
+ *   · `layerCount` = **除画板外**的图层数 —— 调用方用它判"到底解析出东西没有"（0 就是解析失败）。
+ *   · `sliceUrls`  = 从 `ddsImage`/`image` 收集到的切图 URL（`download_slices` 直接用）。
+ */
+export function normalizeSketchPluginTree(tree) {
+  const info = Array.isArray(tree?.info) ? tree.info.filter((it) => it && typeof it === 'object') : [];
+  const byId = new Map();
+  for (const it of info) if (it.id != null) byId.set(String(it.id), it);
+
+  // 画板 = `ArtboardID` 指的那一项（实测就是 info[0]，且是唯一没有 parentID 的项）。
+  const rootRaw = (tree?.ArtboardID != null && byId.get(String(tree.ArtboardID)))
+    || info.find((it) => !it.parentID) || null;
+
+  // 建父子关系。⚠️ `layers` 恒为空，**层级只能靠 parentID**。
+  const childrenOf = new Map();
+  const orphans = [];
+  for (const it of info) {
+    const pid = it.parentID == null || it.parentID === '' ? null : String(it.parentID);
+    if (!pid || pid === String(it.id)) { orphans.push(it); continue; }   // 无父 / 自指 → 当根，别丢
+    if (byId.has(pid)) {
+      if (!childrenOf.has(pid)) childrenOf.set(pid, []);
+      childrenOf.get(pid).push(it);
+    } else orphans.push(it);   // 父不在 info 里 → 当根，**不丢层**
+  }
+
+  let layerCount = 0;
+  const sliceUrls = new Set();
+  const seen = new Set();
+  const build = (node, isArtboard, depth) => {
+    const id = node.id == null ? null : String(node.id);
+    if (id) { if (seen.has(id)) return null; seen.add(id); }     // 防环（真实数据无环，防御）
+    if (depth > 64) return null;                                  // 防御异常深度
+    const kids = [];
+    for (const c of childrenOf.get(id) ?? []) {
+      const k = build(c, false, depth + 1);
+      if (k) kids.push(k);
+    }
+    if (!isArtboard) layerCount += 1;
+    // 切图 URL：与 `hasImage` 同判据（bitmap 的 ddsImage + 任意层的组导出图）
+    if (node.type === 'bitmap' && node.ddsImage?.imageUrl) sliceUrls.add(node.ddsImage.imageUrl);
+    if (node.image?.imageUrl) sliceUrls.add(node.image.imageUrl);
+    return sketchLayerOf(node, kids, isArtboard);
+  };
+
+  let artboard = rootRaw ? build(rootRaw, true, 0) : null;
+  if (!artboard) {
+    // 连画板都没有（`ArtboardID` 指向不存在的项）→ 造一个**只有 frame 的空画板**，
+    //   好让上层的"解析不出图层"守卫有统一的形状可判；这里不编任何内容。
+    artboard = sketchLayerOf({
+      id: tree?.ArtboardID ?? null, name: tree?.pageName ?? 'Sketch 画板',
+      width: 0, height: 0, position_x: 0, position_y: 0,
+    }, [], true);
+  }
+  // 画板之外的根（没有 parentID 或无父可挂的碎片）统一挂到画板下 —— **不丢层**。
+  for (const o of orphans) {
+    if (String(o.id) === String(artboard.id)) continue;
+    const node = build(o, false, 1);
+    if (node) artboard.layers.push(node);
+  }
+
+  const meta = {
+    device: tree?.device ?? null,
+    sliceScale: tree?.sliceScale ?? null,
+    id: tree?.ArtboardID ?? null,
+    host: { name: 'sketch', version: tree?.skVersion ?? null },
+    plugin: { name: 'lanhu-sketch-plugin', version: tree?.pluginVersion ?? null },
+  };
+  const sketch = {};
+  for (const k of SKETCH_META_KEYS) if (tree?.[k] !== undefined) sketch[k] = tree[k];
+
+  return {
+    tree: { meta, sketch, assets: [...sliceUrls], artboard },
+    artboard, layerCount, sliceUrls: [...sliceUrls],
+  };
+}
+
 /**
  * 把 artboard 递归摊平成图层数组。
  * 注：蓝湖给的子图层 frame 坐标是**相对画板原点**的（已验证：画板 left=-10279，子层 left=155.5）。
@@ -3397,6 +3767,32 @@ function classifyBlock(l) {
 }
 
 /**
+ * 本图层的 `fill` 其实是**文字色**而不是底色吗（Figma 语义：文字节点的 fills 就是文字色）。
+ * Axure 那条链用 `fillIsBackground: true` 标记"这个 fill 是真底色"，别抹。
+ *
+ * 抽成函数是因为它有**两个消费者**：`buildBlocks` 定底色，`layerBackgrounds`（§4.8 对比度）
+ * 找有效背景色。两处各写一遍 `typeof l.text === 'string' && !l.fillIsBackground`，
+ * 迟早会漂移成"表格说没底色、对比度却拿文字色当背景"。
+ */
+function fillIsTextColor(l) {
+  return Boolean(typeof l?.text === 'string' && l.text !== '' && !l.fillIsBackground);
+}
+
+/**
+ * 该图层会不会成为一个块（`buildBlocks` 的准入判据）。
+ * 抽出来是为了**别写第二份跳过逻辑** —— 审计要把"块"映射回源图层，用的必须是同一套判据。
+ * @returns {string|null} 块类型；`null` = 不成块
+ */
+function blockLayerKind(l) {
+  if (l.visible === false) return null;
+  // ⚠️ 判据要用**累乘后**的 effectiveOpacity：父组 `opacity=0` 时子层自身仍是 1，
+  //    只读自身会把「整组不可见」的层当成可见块输出（交接清单缺口 1）。
+  if ((l.effectiveOpacity ?? l.opacity ?? 1) === 0) return null;
+  const kind = classifyBlock(l);
+  return kind === KINDS.OTHER ? null : kind;
+}
+
+/**
  * 扁平图层 → 块级模型。
  * @param {Array} layers flattenArtboard 的输出
  */
@@ -3409,23 +3805,21 @@ export function buildBlocks(layers, opts = {}) {
   }
 
   const blocks = [];
-  for (const l of layers) {
-    if (l.visible === false) continue;
-    // ⚠️ 判据要用**累乘后**的 effectiveOpacity：父组 `opacity=0` 时子层自身仍是 1，
-    //    只读自身会把「整组不可见」的层当成可见块输出（交接清单缺口 1）。
-    if ((l.effectiveOpacity ?? l.opacity ?? 1) === 0) continue;
-    const kind = classifyBlock(l);
-    if (kind === 'other') continue;
+  layers.forEach((l, layerIndex) => {
+    const kind = blockLayerKind(l);
+    if (!kind) return;
 
     // ⚠️ 文本层的 `fills` 是**文字颜色**（Figma 里文字色就是 fill），不是底色。
     //    不排除它会把文字色当成背景色，报出"设计稿有底色、页面没有"这种假问题（实测踩过）。
     const isTextLayer = typeof l.text === 'string' && l.text !== '';
     // `l.fillIsBackground` 只有**原型**这条链会设（Axure 的 fill 与 foreGroundFill 是分开的字段）；
     // 设计稿那条链不设它 → 行为逐字不变。
-    const fill = (isTextLayer && !l.fillIsBackground) ? null : (l.colors ?? []).find((c) => c.role === COLOR_ROLES.FILL || c.role === COLOR_ROLES.GRADIENT);
+    const fill = fillIsTextColor(l)
+      ? null
+      : (l.colors ?? []).find((c) => c.role === COLOR_ROLES.FILL || c.role === COLOR_ROLES.GRADIENT);
     // 多段渐变：把**全部** stop 留一份（按设计稿顺序）。
     // ⚠️ 以前渲染只取第一个 stop —— 表格里"有颜色"，看着不像缺信息，比 opacity 更隐蔽（交接清单缺口 4）。
-    const gradientStops = (isTextLayer && !l.fillIsBackground) ? [] : (l.colors ?? []).filter((c) => c.role === COLOR_ROLES.GRADIENT);
+    const gradientStops = fillIsTextColor(l) ? [] : (l.colors ?? []).filter((c) => c.role === COLOR_ROLES.GRADIENT);
     const textColor = (l.colors ?? []).find((c) => c.role === COLOR_ROLES.TEXT) ?? (isTextLayer ? (l.colors ?? []).find((c) => c.role === COLOR_ROLES.FILL) : null);
     const h = l.h ?? 0;
     const thin = Math.min(l.w ?? 0, h);
@@ -3468,13 +3862,35 @@ export function buildBlocks(layers, opts = {}) {
       border: l.border ?? null,
       text: l.text ?? null,
       color: textColor ? rgbHex(textColor) : null,
+      /**
+       * 文字色的 alpha（只**新增**字段）。`color` 是 hex，**不带 alpha** ——
+       * 而半透明文字色的对比度必须**先与背景合成**再算（半透明黑在白底上就是 #808080，
+       * 拿 #000000 去算会得出 21:1 的假达标）。没有这个数就只能当不透明处理。
+       */
+      colorAlpha: textColor ? round2(textColor.a ?? 1) : null,
       font: l.font ?? null,
       hasImage: Boolean(l.hasImage),
       shape: l.shape,
       childCount: childCount.get(pathOf(l)) ?? 0,
+      /**
+       * **源图层下标**（只新增字段，不改动任何既有字段的语义）。
+       * 对比度审计（§4.8）要沿**祖先链**找有效背景色，而祖先不在块模型里 ——
+       * 有了它就能直接回到 `layers` 上往父层走，且**块被 region/kind 过滤掉之后仍然有效**
+       * （没有它就只能靠 name/坐标回查，过滤后必然对不上）。
+       */
+      layerIndex,
     });
-  }
+  });
   return blocks;
+}
+
+/**
+ * 表格里**列出来的块** = 折叠口径唯一的一份实现（渲染层与对比度审计共用）。
+ * 两处各写一遍 `opts.includeNoise ? blocks : blocks.filter(...)`，迟早会变成
+ * "表里没列的块却出现在对比度名单里"。
+ */
+export function visibleBlocks(blocks, opts = {}) {
+  return opts.includeNoise ? blocks : (blocks ?? []).filter((b) => !b.noise);
 }
 
 /** 块级清单 → 紧凑文本（CLI / 工具 / 面板兜底共用）。 */
@@ -3485,10 +3901,12 @@ export function renderBlocks(blocks, meta = {}, opts = {}) {
   for (const b of blocks) counts[b.kind] = (counts[b.kind] ?? 0) + 1;
 
   const noiseCount = blocks.filter((b) => b.noise).length;
-  const main = opts.includeNoise ? blocks : blocks.filter((b) => !b.noise);
+  const main = visibleBlocks(blocks, opts);
 
   L.push(`# 块级清单 — ${titleName(meta)}（${meta.width ?? '?'}×${meta.height ?? '?'}）${metaSuffix(meta)}`);
   L.push('');
+  // 来源格式交代（**只在新值存在时打** —— 普通稿不传 `opts.sourceNote`，输出逐字节不变）。
+  if (opts.sourceNote) { L.push(opts.sourceNote); L.push(''); }
   L.push(`共 **${blocks.length}** 块：` + (Object.entries(counts).map(([k, v]) => `${BLOCK_KINDS[k] ?? k} ${v}`).join(' / ') || '—'));
   if (noiseCount > 0) {
     const tail = opts.includeNoise ? '当前已展开' : '加 --all 或 includeNoise 展开';
@@ -3539,12 +3957,384 @@ export function renderBlocks(blocks, meta = {}, opts = {}) {
     L.push(digest);
   }
 
+  // 无障碍对比度（§4.8）：跟「间距一览」同一风格与位置逻辑 —— 都是**可直接照做**的结论段。
+  // ⚠️ 段内容由 `opts.contrast` 传入（readBlocks 那里算好），渲染层不自己去啃图层：
+  //    一个稿子的"文字色 vs 背景色"只算一次，人读的文本与机器读的字段天然一致。
+  //    拿不到审计结果（比如原型那条链）→ **一个字都不加**，输出逐字节不变。
+  if (opts.contrast) {
+    const seg = renderContrastDigest(opts.contrast, opts);
+    if (seg) {
+      L.push('');
+      L.push(seg);
+    }
+  }
+
   L.push('');
   L.push(resultFooter(L.join('\n'), {
     what: `本稿 ${blocks.length} 块`,
     shown: main.length > shown.length ? `本次列了 ${shown.length} 块` : null,
     next: '改完前端用 `lanhu_verify_blocks` 验收（覆盖面比 verify_spec 大，含可直接抄的建议改法）；缺区域用 `region=...`。',
   }));
+  return L.join('\n');
+}
+
+/* ==========================================================================
+ * 4.8 无障碍对比度（WCAG 2.x AA）—— 读稿时顺手算「文字色 vs 有效背景色」
+ *
+ * 为什么要有它：色值本来就在手里（**零额外网络请求**），但"这个文字在这个底色上看得清吗"
+ * 以前只能靠人肉判断。而最容易漏的两件事，恰好都能算：
+ *   ① **有效背景色**：文本层自己的 `底色` 通常是"无"（Figma 里文字节点的 fill 就是文字色）——
+ *      必须沿**祖先链**往上找最近的带 fill 的层，找不到再落**画板底色**；
+ *      两者都没有 → **明说算不出来**，绝不猜一个白底去算（本项目铁律：拿不准就明说）。
+ *   ② **公式必须按标准**：相对亮度要按 sRGB **线性化**。拿 sRGB 直算是本项目最容易犯的
+ *      一类错 —— 那样 #777 在白底上会算成 4.7（"达标"），而标准值是 **4.48**（**不达标**），
+ *      结论正好反过来，且不会有人发现（数字看着都挺合理）。
+ * ========================================================================== */
+
+/**
+ * WCAG 相对亮度（**sRGB 线性化**，公式照标准来）。
+ * @param {string|object} color hex / rgb() / {r,g,b}
+ * @returns {number|null} 解析不出来给 `null`（**不猜**）
+ */
+export function relativeLuminance(color) {
+  const c = parseColor(color);
+  if (!c) return null;
+  const lin = (v) => {
+    const s = clamp01(v / 255);
+    return s <= 0.03928 ? s / 12.92 : ((s + 0.055) / 1.055) ** 2.4;
+  };
+  return 0.2126 * lin(c.r) + 0.7152 * lin(c.g) + 0.0722 * lin(c.b);
+}
+
+/**
+ * WCAG 对比度：`(L1 + 0.05) / (L2 + 0.05)`，**亮的在上**（顺序无关）。
+ * 已知值（断言里写死，防公式被改动）：#000 on #fff = 21；#777777 on #fff ≈ 4.48；#767676 on #fff ≈ 4.54。
+ * @returns {number|null} 任一侧解析不出来给 `null`
+ */
+export function contrastRatio(a, b) {
+  const la = relativeLuminance(a);
+  const lb = relativeLuminance(b);
+  if (la === null || lb === null) return null;
+  return (Math.max(la, lb) + 0.05) / (Math.min(la, lb) + 0.05);
+}
+
+/**
+ * 源叠合成（source-over）：把半透明的 `fg` 叠在不透明的 `bg` 之上。
+ * 用于两处：半透明背景**逐层合成**、半透明文字色**与背景合成**（屏幕上看的就是合成后的字色）。
+ */
+export function compositeOver(fg, bg) {
+  const f = parseColor(fg);
+  const b = parseColor(bg);
+  if (!f || !b) return null;
+  const a = clamp01(typeof f.a === 'number' ? f.a : 1);
+  if (a >= 1) return { r: f.r, g: f.g, b: f.b, a: 1 };
+  return {
+    r: clamp255(f.r * a + b.r * (1 - a)),
+    g: clamp255(f.g * a + b.g * (1 - a)),
+    b: clamp255(f.b * a + b.b * (1 - a)),
+    a: 1,
+  };
+}
+
+/**
+ * 大号文字（WCAG 2.x）：**≥24px**，或 **≥18.66px 且 bold（≥700）**。
+ * 字号/字重稿里都有，直接用 —— 不要按"这是标题所以算大号"去猜。
+ * @returns {boolean|null} 字号缺失给 `null`（调用方按**正文 4.5** 判并注明，别猜成大号）
+ */
+export function isLargeText(size, weight) {
+  const s = Number(size);
+  if (!Number.isFinite(s) || s <= 0) return null;
+  if (s >= LIMITS.largeTextPx) return true;
+  const w = Number(weight);
+  return s >= LIMITS.largeTextBoldPx && Number.isFinite(w) && w >= LIMITS.largeTextBoldWeight;
+}
+
+/**
+ * 「父层是谁」—— 从扁平图层数组里还原祖先关系（flattenArtboard 是**先序 DFS**，所以父层必然在前）。
+ *
+ * ⚠️ 判据同时要求 **depth 差 1** 与 **parentPath 相等**：只按 depth 会在原型那条链上认错
+ *    （动态面板的状态层是分批 push 的）；只按 path 会撞同名兄弟。
+ * @returns {number} layers 里的下标；`-1` = 没找到（链断了，别再往上猜）
+ */
+export function parentIndexOf(layers, index) {
+  const list = Array.isArray(layers) ? layers : [];
+  const l = list[index];
+  if (!l || !Number.isFinite(l.depth) || l.depth === 0) return -1;
+  const want = String(l.parentPath ?? '');
+  for (let j = index - 1; j >= 0; j--) {
+    const p = list[j];
+    if (p.depth !== l.depth - 1) continue;
+    const path = p.parentPath ? `${p.parentPath}/${p.name}` : p.name;
+    if (path === want) return j;
+  }
+  return -1;
+}
+
+/**
+ * 该图层的**底色**候选（多段渐变给**全部** stop，每段都要单独判）。
+ *
+ * 判据与 `buildBlocks` 的 `bg` 是同一条（共享 `fillIsTextColor`）：
+ * 文字节点的 fill 是文字色不是底色；多段渐变要看每一段。
+ * 直接从**图层**上取而不是从块模型取，是因为对比度要看**被过滤掉的祖先** ——
+ * 用 `region` 取一块区域时，块清单里可能已经没有那个父容器了，但它仍然是背景。
+ */
+function layerBackgrounds(l) {
+  if (fillIsTextColor(l)) return [];
+  const grads = (l.colors ?? []).filter((c) => c.role === COLOR_ROLES.GRADIENT);
+  const picked = grads.length > 1
+    ? grads
+    : (l.colors ?? []).filter((c) => c.role === COLOR_ROLES.FILL || c.role === COLOR_ROLES.GRADIENT).slice(0, 1);
+  const op = clamp01(Number(l.opacity ?? 1));
+  return picked.map((c) => ({ hex: rgbHex(c), alpha: clamp01((c.a ?? 1) * op) }));
+}
+
+/**
+ * **有效背景色** —— 本模块最容易算错、也最不该猜的一处。
+ *
+ * 由近及远沿祖先链找**最近的带 fill 的层**，再落画板底色；半透明**逐层合成**到不透明底上。
+ *
+ * @param {Array} layers flattenArtboard 的扁平图层
+ * @param {number} index 文本层在 layers 里的下标
+ * @returns {{ok:true,backgrounds:Array<{hex:string,translucent:boolean}>,gradient:boolean,translucent:boolean,baseIsArtboard:boolean,baseName:string|null}
+ *          |{ok:false,reason:'no-fill'|'translucent-no-base'|'no-ancestor'|'no-layer'}}
+ *   · `ok:false` 一律**不判断**（明说算不出来），**绝不当成 #ffffff**
+ *   · `backgrounds` 长度 >1 = 多段渐变：每段一个候选（判的时候取最差，见 `auditTextContrast`）
+ */
+export function effectiveBackground(layers, index) {
+  const list = Array.isArray(layers) ? layers : [];
+  const self = list[index];
+  if (!self) return { ok: false, reason: 'no-layer' };
+  // 由近及远收集祖先（**排除自身** —— 文字层自己的 fill 是文字色，不是背景）
+  const chain = [];
+  for (let cur = index; ;) {
+    const p = parentIndexOf(list, cur);
+    if (p < 0) break;
+    chain.push(list[p]);
+    cur = p;
+  }
+  if (self.depth > 0 && chain.length === 0) return { ok: false, reason: 'no-ancestor' };
+
+  let top = null;        // 最近的带 fill 的层（多段渐变会有多项）
+  let base = null;       // 顶层之下的**不透明实色**底
+  let baseLayer = null;
+  const trans = [];      // 顶层与底之间的半透明层（由近及远）
+  for (const l of chain) {
+    const fills = layerBackgrounds(l);
+    if (fills.length === 0) continue;
+    if (!top) {
+      top = fills;
+      baseLayer = l;
+      if (fills.length === 1 && fills[0].alpha >= 1) break;  // 顶层自己就不透明 → 下面的都看不见
+      continue;                                              // 半透明/渐变 → 还得往下找底
+    }
+    if (fills.length > 1) {
+      // 半透明的上面那层，下面又是一条渐变 → "一个"背景值根本不存在（随位置变），明说算不出
+      return { ok: false, reason: 'translucent-no-base' };
+    }
+    if (fills[0].alpha >= 1) { base = fills[0]; baseLayer = l; break; }
+    trans.push(fills[0]);
+  }
+  const opaqueTop = top && top.length === 1 && top[0].alpha >= 1;
+  if (!top) return { ok: false, reason: 'no-fill' };
+  if (!opaqueTop && !base) return { ok: false, reason: 'translucent-no-base' };
+
+  const below = [...trans].reverse();   // 由远及近（合成顺序）
+  const backgrounds = (opaqueTop ? [top[0]] : top).map((stop) => {
+    let acc = opaqueTop ? parseColor(stop.hex) : parseColor(base.hex);
+    for (const f of below) acc = compositeOver({ ...parseColor(f.hex), a: f.alpha }, acc);
+    if (!opaqueTop) acc = compositeOver({ ...parseColor(stop.hex), a: stop.alpha }, acc);
+    return {
+      hex: rgbHex(acc),
+      // 「半透明」= 参与合成的层里有不是 100% 不透明的（那样的对比度只是**按下层合成后**的参考值）
+      translucent: !opaqueTop && (stop.alpha < 1 || trans.length > 0),
+    };
+  });
+  return {
+    ok: true,
+    backgrounds,
+    gradient: top.length > 1,
+    translucent: backgrounds.some((b) => b.translucent),
+    baseIsArtboard: (baseLayer?.depth ?? -1) === 0,
+    baseName: baseLayer?.name ?? null,
+  };
+}
+
+/**
+ * 把一个颜色朝黑/朝白挪到**刚好达标**为止，返回具体色值（建议改法要能直接抄）。
+ *
+ * 为什么要"取整后复核"：二分给的是**连续** t，取整成 hex 之后可能又掉回阈值下 ——
+ * 实测 `#777777` 在白底上就是这个坑：连续解 ≈118.7 → 取整 119 还是 4.48（不达标），
+ * 得再挪一档到 **118（#767676）** 才真的过 4.5。
+ *
+ * @param {string} from 要挪的那个色（文字色，或"要挪它来让文字达标"的底色）
+ * @param {string} fixed 另一边（不动）
+ * @param {number} required 目标对比度
+ * @param {'darken'|'lighten'} dir 往哪边挪
+ * @returns {{hex:string,t:number}|null} `null` = 这个方向到不了（纯黑/纯白是终点）
+ */
+export function shadeToReach(from, fixed, required, dir) {
+  const to = dir === 'darken' ? 0 : 255;
+  const mix = (t) => {
+    const c = parseColor(from);
+    const m = (v) => clamp255(v + (to - v) * t);
+    return { r: m(c.r), g: m(c.g), b: m(c.b), a: 1 };
+  };
+  if (contrastRatio(from, fixed) >= required) return { hex: rgbHex(parseColor(from)), t: 0 };
+  if (contrastRatio(mix(1), fixed) < required) return null;   // 这一端到不了，试另一端
+  let lo = 0;
+  let hi = 1;
+  for (let i = 0; i < LIMITS.contrastSearchSteps; i++) {
+    const mid = (lo + hi) / 2;
+    if (contrastRatio(mix(mid), fixed) >= required) hi = mid;
+    else lo = mid;
+  }
+  // 取整后复核（上面那条注释里的 #777 → #767676 就是这么来的）
+  for (let t = hi, i = 0; t <= 1 && i <= 255; i++, t += 1 / 255) {
+    const hex = rgbHex(mix(t));
+    if (contrastRatio(hex, fixed) >= required) return { hex, t };
+  }
+  return null;
+}
+
+/**
+ * 建议改法的一句话（直接给色值，别只说"对比度不足"）。
+ *
+ * 方向按"把文字**推离**底色"来定（文字比底色亮就继续提亮，反之压暗）——
+ * 只按"改动量最小"会给出怪建议：白字压在中紫按钮上时，把白字改成近黑**确实**达标（4.97），
+ * 但那不是设计意图；这时该给的是"把底色调深"，或至少把反向改动说清楚。
+ */
+function suggestionText(glyphHex, bgHex, required) {
+  const natural = relativeLuminance(glyphHex) >= relativeLuminance(bgHex) ? 'lighten' : 'darken';
+  const word = (d) => (d === 'darken' ? '压暗' : '提亮');
+  const s = shadeToReach(glyphHex, bgHex, required, natural);
+  if (s) return `文字色${word(natural)}到 **${s.hex}** 或更${natural === 'darken' ? '深' : '亮'}`;
+  // 自然方向已经到头（文字本来就是纯黑/纯白）→ 两条路都给出来，够选
+  const backDir = natural === 'darken' ? 'lighten' : 'darken';
+  const bgDir = natural === 'darken' ? 'lighten' : 'darken';
+  const back = shadeToReach(glyphHex, bgHex, required, backDir);
+  const bgFix = shadeToReach(bgHex, glyphHex, required, bgDir);
+  const parts = [];
+  if (bgFix) parts.push(`把这块底色${word(bgDir)}到 **${bgFix.hex}**（文字色不动）`);
+  if (back) parts.push(`${parts.length ? '或' : ''}把文字色${word(backDir)}到 **${back.hex}**（反向）`);
+  return parts.length ? parts.join('，') : `该底色上用黑白两端都到不了 ${required}:1 → 得换背景色`;
+}
+
+const CONTRAST_UNKNOWN_TEXT = Object.freeze({
+  'no-fill': '祖先链与画板**都没有底色** —— 稿里就没给，**不猜**一个色当背景',
+  'translucent-no-base': '背景是**半透明**、而它下面没有不透明底 —— 合成结果取决于稿外内容',
+  'no-ancestor': '图层树里找不到它的父层（链断了，不往上硬猜）',
+  'no-layer': '这个块找不到对应的源图层',
+  'no-color': '文字色**稿里没给**（不是没算，是没得算）',
+});
+
+/**
+ * 对比度审计：对每个文本块算「文字色 vs 有效背景色」的 WCAG 对比度。
+ * 只出**数据**（排版交给 `renderContrastDigest`），方便单测与后续 diff。
+ *
+ * ⚠️ 背景拿不准的块**不进 `fail`**（不能因为算不出背景就说人家不达标），而是进 `unknown`。
+ */
+export function auditTextContrast(blocks, layers) {
+  const list = Array.isArray(layers) ? layers : [];
+  const texts = (blocks ?? []).filter((b) => b && typeof b.text === 'string' && b.text !== '');
+  const out = { total: texts.length, checked: 0, fail: [], unknown: [], minRatio: null, gradientCount: 0 };
+  for (const b of texts) {
+    const spot = { name: b.name, path: b.path, depth: b.depth, x: b.x, y: b.y };
+    const fg = b.color ? parseColor(b.color) : null;
+    if (!fg) {
+      out.unknown.push({ ...spot, fg: null, reason: 'no-color' });
+      continue;
+    }
+    const idx = Number.isInteger(b.layerIndex) ? b.layerIndex : -1;
+    const bg = idx >= 0 ? effectiveBackground(list, idx) : { ok: false, reason: 'no-layer' };
+    if (!bg.ok) {
+      out.unknown.push({ ...spot, fg: b.color, reason: bg.reason });
+      continue;
+    }
+    const large = isLargeText(b.font?.size, b.font?.weight);
+    const required = large === true ? LIMITS.contrastLarge : LIMITS.contrastNormal;
+    // 半透明文字色：**与背景合成**后才是屏幕上看到的字色（合成后仍是这个色值的对比度问题）
+    const fgAlpha = clamp01(typeof b.colorAlpha === 'number' ? b.colorAlpha : 1);
+    let worst = null;
+    for (const cand of bg.backgrounds) {
+      const glyph = fgAlpha >= 1 ? { ...fg, a: 1 } : compositeOver({ ...fg, a: fgAlpha }, cand.hex);
+      const glyphHex = rgbHex(glyph);
+      const ratio = contrastRatio(glyphHex, cand.hex);
+      // 多段渐变：逐段判、取**最差**的那段（标题压在最亮那段上的时候最危险）
+      if (!worst || ratio < worst.ratio) {
+        worst = {
+          ...spot, ratio, required, large: large === true, glyphHex, bgHex: cand.hex,
+          bgTranslucent: cand.translucent, fgTranslucent: fgAlpha < 1,
+          // 字号稿里没给 → 只能按**正文 4.5** 判（保守方向），并在行里注明，别让人以为查过了
+          noSize: large === null,
+          gradient: bg.gradient, baseIsArtboard: bg.baseIsArtboard,
+        };
+      }
+    }
+    out.checked += 1;
+    out.minRatio = out.minRatio === null ? worst.ratio : Math.min(out.minRatio, worst.ratio);
+    if (bg.gradient) out.gradientCount += 1;
+    // 浮点比较留一点余量，免得 4.499999 被判成"不达标"来回抖动
+    if (worst.ratio + 1e-9 < required) {
+      worst.delta = round2(required - worst.ratio);
+      worst.suggestion = suggestionText(worst.glyphHex, worst.bgHex, required);
+      out.fail.push(worst);
+    }
+  }
+  out.fail.sort((a, b) => a.ratio - b.ratio);   // 最糟的排最前
+  return out;
+}
+
+/** 对比度数字显示（整数不补 `.00`：`21:1` 比 `21.00:1` 好读）。 */
+function fmtRatio(r) {
+  const v = round2(r);
+  return Number.isInteger(v) ? String(v) : v.toFixed(2);
+}
+
+/**
+ * 「对比度」段 —— **只列不达标**的（全列一遍会把块级清单淹掉）。
+ * 判据、阈值、背景取法全部写在表头（跟「间距一览」同一风格）。
+ */
+export function renderContrastDigest(audit, opts = {}) {
+  if (!audit || typeof audit !== 'object') return '';
+  const fail = audit.fail ?? [];
+  const unknown = audit.unknown ?? [];
+  if ((audit.checked ?? 0) === 0 && unknown.length === 0) return '';
+  const limit = Number.isFinite(opts.contrastMaxRows) ? Number(opts.contrastMaxRows) : LIMITS.contrastMaxRows;
+  const items = [...fail, ...unknown];
+  const lab = makeLabeler(items);
+
+  const L = [];
+  L.push('## 对比度（无障碍 —— 正文 ≥4.5:1，大号文字 ≥3:1）');
+  L.push('> 判据：WCAG 2.x 相对亮度（sRGB **线性化**）→ `(L1+0.05)/(L2+0.05)`；**大号文字 = 字号 ≥24px，或 ≥18.66px 且字重 ≥700**（字号/字重取自稿子）。');
+  L.push('> 背景取法：沿**祖先链**找最近的带 fill 的层 → 没有就落**画板底色**；半透明**已逐层合成**到不透明底（标 `合成`），**不是**当实色算的。');
+  L.push(`> **只列不达标**的；本次判了 **${audit.checked}** 个文本层${audit.gradientCount ? `（其中 ${audit.gradientCount} 个是渐变背景，按**最差** stop 判）` : ''}。`);
+  if (fail.length === 0) {
+    const min = audit.minRatio === null || audit.minRatio === undefined ? null : fmtRatio(audit.minRatio);
+    L.push(min
+      ? `- **全部达标**（${audit.checked} 个文本层，最低 **${min}:1**）`
+      : '- **没有可判的文本层**（背景/文字色都没取到，见下面那段）');
+  } else {
+    L.push('');
+    for (const [i, r] of fail.slice(0, limit).entries()) {
+      const note = [
+        r.gradient ? '渐变取最差 stop' : null,
+        r.bgTranslucent ? '半透明背景·已合成' : null,
+        r.fgTranslucent ? '半透明文字色·已合成' : null,
+        r.large ? '大号' : null,
+        r.noSize ? '字号未给·按正文 4.5 判' : null,
+      ].filter(Boolean).join('；');
+      L.push(`- ${lab.of(r, i)} ｜ \`${r.glyphHex}\` / \`${r.bgHex}\`${r.baseIsArtboard ? '（画板）' : ''} ｜ **${fmtRatio(r.ratio)}:1**（需 ${r.required}:1） ｜ 差 **${r.delta}** ｜ ${r.suggestion}${note ? ` ｜ _${note}_` : ''}`);
+    }
+    if (fail.length > limit) L.push(`- … 其余 ${fail.length - limit} 个不达标的略（用 region 收紧再看）`);
+  }
+  if (unknown.length > 0) {
+    L.push('');
+    L.push(`### 背景无法确定（${unknown.length} 个文本层，**未做对比度判断**）`);
+    for (const [i, r] of unknown.slice(0, limit).entries()) {
+      L.push(`- ${lab.of(r, fail.length + i)} ｜ 文字色 ${r.fg ? `\`${r.fg}\`` : '（未给）'} ｜ ${CONTRAST_UNKNOWN_TEXT[r.reason] ?? r.reason}`);
+    }
+    if (unknown.length > limit) L.push(`- … 其余 ${unknown.length - limit} 个略`);
+  }
   return L.join('\n');
 }
 
@@ -3701,6 +4491,26 @@ export function metaSuffix(meta = {}) {
 }
 
 /**
+ * 版本溯源的**结构化**形态（`read_design` 与 `read_blocks` 共用同一份形状）。
+ *
+ * ⚠️ `id` / `isLatest` / `latestAt` **只从 `meta` 取** —— 标题行的 `metaSuffix(meta)` 读的也是它。
+ *    同一条链上一个读 `meta`、一个读 `detail`，就会出现"标题说 A 版、字段说 B 版"，
+ *    而两处都不报错（"设计变更 diff"正是靠这个版本号当基准，指错了整份 diff 都是错的）。
+ */
+export function versionInfo(meta = {}, detail = {}) {
+  return {
+    id: meta.versionId ?? null,
+    requested: detail.versionRequested ?? 'latest',
+    isLatest: meta.versionIsLatest ?? null,
+    count: detail.versionCount ?? null,
+    latestId: detail.versionLatestId ?? null,
+    latestAt: meta.latestVersionAt ?? null,
+    fromUrl: detail.versionFromUrl ?? false,
+    urlVersionIgnored: detail.urlVersionIgnored ?? null,
+  };
+}
+
+/**
  * 行高 / 字距单元格 —— 与 `font.family` **完全同构**的病：
  * 数据层一直有（`font.lineHeight` / `letterSpacing`），但三张表以前全不打，还原只能靠猜。
  * 形如 `22/0.5`；只有一项时另一项给 `—`；都没有给 `—`（交接清单缺口 3）。
@@ -3743,11 +4553,13 @@ export function renderTokens(tokens, meta = {}) {
 }
 
 /** summary 模式：token + 文本层清单（默认紧凑，控制在 4KB 内）。 */
-export function renderSummary({ detail, layers, tokens, meta, maxTextLayers = 36, dualUnits: dualOn = false, filePath = null }) {
+export function renderSummary({ detail, layers, tokens, meta, maxTextLayers = 36, dualUnits: dualOn = false, filePath = null, sourceNote = null }) {
   const L = [];
   L.push(`# ${detail.name || titleName(meta) || '设计稿'}（${meta.width}×${meta.height}）${metaSuffix(meta)}`);
   L.push(`图层 ${layers.length} 个 | 文本层 ${layers.filter((l) => l.text).length} 个 | 导出图 ${layers.filter((l) => l.hasImage).length} 个`);
   L.push('');
+  // 来源格式交代（只在 Sketch 插件格式这条链上给 —— 普通稿不传，输出逐字节不变）
+  if (sourceNote) { L.push(sourceNote); L.push(''); }
 
   L.push('## 色板（Top 12）');
   L.push(tokens.colors.slice(0, 12).map((c) => `\`${c.hex}\`×${c.count}`).join('  '));
@@ -3903,6 +4715,132 @@ export function renderRegion(layers, opts = {}) {
   return { count: hit.length, text: L.join('\n') };
 }
 
+/**
+ * Sketch 插件格式的稿子**读成功了**时的来源交代（只对这类稿子渲染，普通稿输出逐字节不变）。
+ * 说清"哪些数值是从 `info[]` 映射来的"，免得把映射规则当成了蓝湖原始字段。
+ */
+const SKETCH_SOURCE_NOTE = '> 来源：**蓝湖 Sketch 插件导出**（`type: sketchPlugin`）—— 图层本来平铺在 `info[]` 里、'
+  + '没有 `artboard`，这里已按实测映射规则归一化后解析：坐标取画板绝对坐标（`left/top`）、'
+  + '`opacity` 从 0..100 换算到 0..1、圆角取 `radius[]`（与 `points[].cornerRadius` 逐值一致）、'
+  + '色值来自顶层 `fills`/`borders`、字体族名由 `postScriptName` 去掉字重后缀得到。';
+
+/* ==========================================================================
+ * 5c. 「解析不出图层」的**明示**（唯一一份实现）
+ *
+ * 为什么单独抽出来：本仓库最忌讳的失败模式不是抛错，而是**静默成功** ——
+ * 对着 Sketch 插件格式（`type: sketchPlugin`）的稿子，`read_blocks` 以前会输出
+ * 「共 **1** 块：画板 1」+ 一张空表：**看着跑成功、其实一个块都没解析出来**，
+ * AI 会据此认定"这张稿是空的"，然后什么都不建。
+ *
+ * 所以凡是"这次真的什么都没读出来"的路径，都必须走这里，并且：
+ *   ① 人读文本里**说清三件事**：这是什么格式 / 本次为空**不等于**稿子是空的 / 下一步做什么；
+ *   ② 返回对象带**机器可读标志**（`unsupported: true` + `format`），AI 不用解析文本就能判断。
+ * ========================================================================== */
+
+/** 明示文本的"下一步"建议 —— 按格式给，**不写做不到的事**。 */
+function unsupportedNextSteps(format) {
+  if (format === 'sketchPlugin') {
+    return [
+      '换一张**非** Sketch 插件格式的稿子：同一项目里通常有 Figma 导出的稿（`lanhu_list_designs` 列出来换一张读）——实测某项目 252 张里约一半是 Figma 格式，能正常读。',
+      '让设计师把这一页在蓝湖侧用 **Figma 插件**重新导出后上传 —— 那样图层树就是 `artboard` 结构（已完整支持），能立刻分清是"稿子数据不全"还是"格式没覆盖"。',
+      '只想拿这张稿的**图**（不要色值/圆角/间距）：用 `lanhu_download_slices` —— 它走的是切图 URL，不依赖图层树。',
+    ];
+  }
+  return [
+    '确认这条链接指向的是**设计稿**（`type=image`）：如果是原型/产品文档，改用 `lanhu_read_product_doc`。',
+    '换一个版本或稍后重试：该版本可能**还没生成图层数据**（`lanhu_read_design format=summary` 的版本信息能看到有几版）。',
+    '如果它应该是一张设计稿却一直读不出来，把 `lanhu_read_design format=full` 的落盘 JSON 提供出来 —— 那说明蓝湖上新出现了第三种树格式，需要补解析。',
+  ];
+}
+
+/**
+ * 渲染「读不出图层」的明示文本。
+ * @param {{code:string, format:string, why:string, what:string, rawItemCount?:number|null}} unsupported
+ * @param {{name?:string, projectId?:string, imageId?:string, width?:number|null, height?:number|null, account?:string|null}} meta
+ */
+export function renderDesignUnsupported(unsupported, meta = {}) {
+  const L = [];
+  const title = titleName(meta);
+  L.push(`# ⚠️ 这次**没读到任何图层** — ${title}`);
+  L.push('');
+  L.push(`**格式：${unsupported.what}。**`);
+  L.push('');
+  L.push('⚠️ 本次输出是空的 —— 但这**不代表这张稿是空的**。');
+  L.push('');
+  L.push('## 为什么是空的');
+  L.push(unsupported.why);
+  if (unsupported.rawItemCount != null) {
+    L.push(`该稿图层树里**确实有数据**：\`info[]\` 共 ${unsupported.rawItemCount} 项 —— 问题出在"取不出可用的子层"，不是"这张稿没画东西"。`);
+  }
+  L.push('以前这种情况会**静默**输出"只有画板本身、没有任何内容块"的空结果 + 一张空表'
+    + '（看着跑成功了，其实一个块都没解析出来）；现在改成**明说**。');
+  L.push('');
+  L.push('## 下一步');
+  for (const s of unsupportedNextSteps(unsupported.format)) L.push(`- ${s}`);
+  L.push('');
+  const bits = [];
+  bits.push(`projectId \`${meta.projectId ?? '?'}\``);
+  bits.push(`imageId \`${meta.imageId ?? '?'}\``);
+  if (meta.width != null || meta.height != null) bits.push(`画板 ${meta.width ?? '?'}×${meta.height ?? '?'}`);
+  if (meta.account) bits.push(`账号 ${meta.account}`);
+  L.push(`— ${bits.join(' ｜ ')}`);
+  L.push(`— 机器可读标志：\`unsupported: true\` ｜ \`format: "${unsupported.format}"\` ｜ \`code: "${unsupported.code}"\``);
+  return L.join('\n');
+}
+
+/** 「读不出图层」时 readDesign/readBlocks 的**统一返回体**（字段与正常返回对齐，调用方不必分支）。 */
+function unsupportedDesignResult(unsupported, { target, detail, acct, format, teamId, nameIsPath = false }) {
+  const meta = {
+    name: detail?.name ?? null,
+    nameIsPath,
+    // ⚠️ **不打画板尺寸**：详情接口给的是**缩略图尺寸**（实测 480×270，真实画板 1920×1080）。
+    //    读不出图层时我们手里没有可信的画板尺寸 —— 编一个出来就是假数据（本仓库铁律）。
+    width: null,
+    height: null,
+    versionId: detail?.versionId ?? null,
+    versionIsLatest: detail?.versionIsLatest ?? null,
+    latestVersionAt: detail?.latestVersionAt ?? null,
+    projectId: target?.projectId ?? null,
+    imageId: target?.imageId ?? null,
+    account: acct ?? null,
+  };
+  const text = renderDesignUnsupported(unsupported, meta);
+  return {
+    ok: false,
+    /** ⭐ 机器可读：这次**什么都没读到** —— 别把 `blockCount: 0` 当成"这张稿是空的"。 */
+    unsupported: true,
+    format,
+    /** 稿子的**来源格式**（不是输出格式）：`sketchPlugin` / `unknown`。 */
+    sourceFormat: unsupported.format,
+    code: unsupported.code,
+    reason: unsupported.why,
+    name: meta.name,
+    nameIsPath,
+    viewport: { width: meta.width, height: meta.height },
+    origin: { x: 0, y: 0 },
+    device: null,
+    layerCount: 0,
+    textLayerCount: 0,
+    blockCount: 0,
+    noiseCount: 0,
+    kindCounts: {},
+    blocks: [],
+    tokens: { colors: [], fontSizes: [], fontWeights: [], fontFamilies: [], radii: [] },
+    contrast: { totalTextLayers: 0, checked: 0, failCount: 0, unknownCount: 0, minRatio: null },
+    teamId: teamId ?? null,
+    projectId: meta.projectId,
+    imageId: meta.imageId,
+    sourceBytes: 0,
+    account: meta.account,
+    accountBy: null,
+    version: versionInfo(meta, detail ?? {}),
+    versionIsLatest: meta.versionIsLatest ?? null,
+    latestVersionAt: meta.latestVersionAt ?? null,
+    text,
+    textBytes: Buffer.byteLength(text, 'utf8'),
+  };
+}
+
 /* ==========================================================================
  * 6. 主入口：readDesign
  * ========================================================================== */
@@ -3919,12 +4857,20 @@ export async function readDesign(args = {}) {
   // 没显式指定账号时**自动判定**：别的 AI 只拿到一条链接，不该要求它知道这属于哪个账号。
   const picked = await pickAccount({ ...args, projectId: target.projectId, imageId: target.imageId, teamId: target.teamId });
   const acct = picked.alias;
-  const { detail, tree, bytes } = await fetchDesignTree(target.projectId, target.imageId, {
+  const { detail, tree, bytes, sourceFormat, unsupported } = await fetchDesignTree(target.projectId, target.imageId, {
     cookie, account: acct, version: args.version, urlVersionId: target.versionId, teamId: target.teamId, pageId: args.pageId,
   });
+  // ⭐ 「解析不出图层」→ **明说**，绝不返回一个"看着像成功"的空结果（见 renderDesignUnsupported）
+  if (unsupported) {
+    return unsupportedDesignResult(unsupported, {
+      target, detail, acct, format: 'summary', teamId: target.teamId, nameIsPath: Boolean(tree?.meta?.nameIsPath),
+    });
+  }
   const artboard = tree.artboard ?? tree;
   const layers = flattenArtboard(artboard);
   const tokens = collectTokens(layers);
+  /** 来源交代：只有 Sketch 插件格式这条链才给（普通稿为 null → 渲染层一个字都不加，输出逐字节不变）。 */
+  const sketchNote = sourceFormat === 'sketchPlugin' ? SKETCH_SOURCE_NOTE : null;
   const meta = {
     name: artboard.name ?? detail.name,
     width: round2(artboard.frame?.width ?? detail.width),
@@ -3973,6 +4919,10 @@ export async function readDesign(args = {}) {
         fromUrl: detail.versionFromUrl ?? false,
         urlVersionIgnored: detail.urlVersionIgnored ?? null,
     },
+    // 稿子的**来源格式**：`'sketchPlugin'` = Sketch 插件导出（图层在 `info[]` 里，已归一化）。
+    // ⚠️ **只在非空时加这个键** —— 普通稿（Figma/Sketch 常规稿）的返回体要做到**逐字节不变**，
+    //    多一个 `sourceFormat: null` 就破坏了那条硬约束（本仓库有断言钉住普通稿的输出）。
+    ...(sourceFormat ? { sourceFormat } : {}),
   };
 
   // A3 · DDS schema（**可选增强，默认关闭**）。
@@ -4067,11 +5017,11 @@ export async function readDesign(args = {}) {
       meta, tokens, layers, assets: tree.assets ?? [], fetchedAt: new Date().toISOString(),
     }, null, 2));
     // full 的正文就是 summary，但**落盘路径一并带上**（§4.6：让 AI 知道"全量在哪、别全文读"）。
-    const text = renderSummary({ detail, layers, tokens, meta, dualUnits: Boolean(args.dualUnits), filePath: file });
+    const text = renderSummary({ detail, layers, tokens, meta, dualUnits: Boolean(args.dualUnits), filePath: file, sourceNote: sketchNote });
     return { ...base, format: 'full', filePath: file, fileBytes: fs.statSync(file).size, text, textBytes: Buffer.byteLength(text, 'utf8') };
   }
 
-  const text = renderSummary({ detail, layers, tokens, meta, dualUnits: Boolean(args.dualUnits) });
+  const text = renderSummary({ detail, layers, tokens, meta, dualUnits: Boolean(args.dualUnits), sourceNote: sketchNote });
   return { ...base, format: 'summary', text, textBytes: Buffer.byteLength(text, 'utf8') };
 }
 
@@ -4092,9 +5042,16 @@ export async function readBlocks(args = {}) {
   // 同 readDesign：没指定账号就按链接自动判定
   const picked = await pickAccount({ ...args, projectId: target.projectId, imageId: target.imageId, teamId: target.teamId });
   const acct = picked.alias;
-  const { detail, tree, bytes } = await fetchDesignTree(target.projectId, target.imageId, {
+  const { detail, tree, bytes, sourceFormat, unsupported } = await fetchDesignTree(target.projectId, target.imageId, {
     cookie: args.cookie, account: acct, version: args.version, urlVersionId: target.versionId, teamId: target.teamId, pageId: args.pageId,
   });
+  // ⭐ 「解析不出图层」→ **明说**。这一条就是本次要修的缺陷：
+  //    以前这里会一路走到底、输出「共 1 块：画板 1」+ 空表 —— 看着跑成功、其实什么都没解析出来。
+  if (unsupported) {
+    return unsupportedDesignResult(unsupported, {
+      target, detail, acct, format: 'blocks', teamId, nameIsPath: false,
+    });
+  }
   const artboard = tree.artboard ?? tree;
   const layers = flattenArtboard(artboard);
   let blocks = buildBlocks(layers);
@@ -4135,7 +5092,13 @@ export async function readBlocks(args = {}) {
   };
   const kindCounts = {};
   for (const b of blocks) kindCounts[b.kind] = (kindCounts[b.kind] ?? 0) + 1;
-  let text = renderBlocks(blocks, meta, { limit: args.limit, includeNoise: args.includeNoise, dualUnits: Boolean(args.dualUnits) });
+  // 无障碍对比度审计（§4.8）：与表格**同一套可见集**（noise 折叠口径一致），
+  // 且与渲染进 `text` 的那段是**同一次计算** —— 这样"人读到的"和"机器读到的"不会各算一遍。
+  const contrastAudit = auditTextContrast(visibleBlocks(blocks, { includeNoise: args.includeNoise }), layers);
+  let text = renderBlocks(blocks, meta, {
+    limit: args.limit, includeNoise: args.includeNoise, dualUnits: Boolean(args.dualUnits), contrast: contrastAudit,
+    sourceNote: sourceFormat === 'sketchPlugin' ? SKETCH_SOURCE_NOTE : null,
+  });
   if (acct) {
     text += `\n\n— 账号：**${acct}**${picked.by === 'explicit' ? '（显式指定）' : `（自动判定 · ${picked.by}）`}`;
   }
@@ -4154,6 +5117,15 @@ export async function readBlocks(args = {}) {
     noiseCount: blocks.filter((b) => b.noise).length,
     kindCounts,
     blocks,
+    // 无障碍对比度审计（§4.8）：与渲染进 `text` 的那段**同一次计算**，
+    // 这样"人读到的"和"机器读到的"不会各算一遍（本仓库最容易漂移的就是这类两处实现）。
+    contrast: {
+      totalTextLayers: contrastAudit.total,
+      checked: contrastAudit.checked,
+      failCount: contrastAudit.fail.length,
+      unknownCount: contrastAudit.unknown.length,
+      minRatio: contrastAudit.minRatio === null ? null : round2(contrastAudit.minRatio),
+    },
     teamId,
     projectId: target.projectId,
     imageId: target.imageId,
@@ -4161,6 +5133,16 @@ export async function readBlocks(args = {}) {
     // 用了哪个账号、怎么定出来的（别的 AI 需要这层透明度：它并不知道链接属于谁）
     account: acct ?? null,
     accountBy: picked.by ?? null,
+    // 版本溯源（§4.7 / B1）：字段名与语义**与 `read_design` 的 `version` 完全对齐** ——
+    // 「设计变更 diff」要拿这一版号当基准，两个入口必须给同一个答案。
+    // 构造交给 `versionInfo`（与标题行共用同一份 `meta`，不会各算一遍而不一致，有断言钉住）。
+    version: versionInfo(meta, detail),
+    // 顺手给平铺字段：调用方不用先判断 `version` 在不在（拿不到就是 null，不编）
+    versionIsLatest: meta.versionIsLatest ?? null,
+    latestVersionAt: meta.latestVersionAt ?? null,
+    // 稿子的**来源格式**：`'sketchPlugin'` = Sketch 插件导出（图层在 `info[]` 里，已归一化后走同一条链）。
+    // ⚠️ 同上：**只在非空时加键**，普通稿返回体逐字节不变。
+    ...(sourceFormat ? { sourceFormat } : {}),
     text,
     textBytes: Buffer.byteLength(text, 'utf8'),
   };
@@ -4200,6 +5182,1456 @@ export function resolveTarget({ projectId, imageId, url }) {
 function uuidFrom(s, skip = 0) {
   const all = String(s).match(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/gi) ?? [];
   return all[skip] ?? null;
+}
+
+/* ==========================================================================
+ * 6.5 设计变更 diff —— 同一张稿的两个版本，回答「这次设计改了什么」
+ *
+ * 为什么值钱：设计一改，已经写好的页面就过期了，而**蓝湖自己不提供版本对比** ——
+ * "改了哪"以前只能人肉重读两版再肉眼对。这里把它变成一次调用。
+ *
+ * 三件事必须做对，缺一个这个工具就**比没有更糟**（AI 会照着错的结论去改代码）：
+ *   ① **配对要可解释**：优先按**稳定身份**（层的 `path`）配对；身份对不上才退到
+ *      「类型 + 文本 + 几何」的近似配对；剩下的老实报"新增/删除"。
+ *   ② **可靠度必须报出来**：精确 / 近似 / 无法匹配各多少。大面积对不上时**明说
+ *      「两版差异过大，逐块对比不可靠」并拒绝出明细表** —— 硬凑一张看起来精确的差异表
+ *      比不给更糟。
+ *   ③ **零变化要说"两版一致"**：静默空输出会让人以为工具坏了；而"设计没改、你的代码
+ *      可以不动"本身就是最有用的答案。
+ *
+ * ⚠️ 画板块（`kind=artboard`）的 x/y 是**画布绝对坐标**（见 `KIND_DESC`）：稿子在 Figma
+ *    画布上被挪一格它就会变（实测 `-9876,463 → -9879,487`），**那不是设计变更**。
+ *    所以它不参与布局比较，只在输出末尾用一行"注"如实交代 —— 不静默吞掉。
+ * ========================================================================== */
+
+/** 变化分类（**只列有变化的**；数组顺序就是渲染顺序）。 */
+export const DIFF_CATEGORIES = Object.freeze(['size', 'color', 'layout', 'text', 'border', 'structure']);
+
+/** 分类中文名（渲染与文档共用一份，别在渲染里裸写字符串）。 */
+export const DIFF_CATEGORY_LABEL = Object.freeze({
+  size: '尺寸/圆角',
+  color: '颜色',
+  layout: '布局',
+  text: '文字',
+  border: '边框',
+  structure: '结构',
+});
+
+/** 块的**稳定身份** = 层在树里的 path（`父/子/名`）。**只有改名才会变** —— 挪动/改色都不变。 */
+function blockIdentity(b) { return String(b?.path ?? ''); }
+
+function diffKindLabel(kind) { return BLOCK_KINDS[kind] ?? String(kind ?? '?'); }
+
+/** 变化值的显示形态：数字 round2，null/undefined 一律「无」（**不编**）。 */
+function diffVal(v) {
+  if (v === null || v === undefined) return '无';
+  if (typeof v === 'number') return String(round2(v));
+  return String(v);
+}
+
+/** 底色/渐变的可比指纹（`#hex@alpha` 序列）—— 与 `bgText` 同口径，只是不含 rgba 后缀。 */
+function bgKey(bg) {
+  if (!bg) return '无';
+  if (bg.stops?.length > 1) return bg.stops.map((s) => `${s.hex}@${s.alpha}`).join('→');
+  return `${bg.hex}@${bg.alpha}`;
+}
+
+/** 文字色的可比指纹 —— 必须带上 alpha（半透明文字色与不透明的是两回事）。 */
+function textColorKey(b) {
+  const a = b.colorAlpha ?? 1;
+  return b.color ? `${b.color}@${a}` : '无';
+}
+
+/** 文字色的显示形态：与 `bgText` 同一套 `#hex@xx% (rgba(…))` 写法（半透明才带后缀）。 */
+function textColorText(b) {
+  if (!b.color) return '无';
+  const a = b.colorAlpha ?? 1;
+  if (a >= 1) return b.color;
+  return `${b.color}@${Math.round(a * 100)}%${rgbaSuffix({ ...parseColor(b.color), a })}`;
+}
+
+function borderKey(b) {
+  const bd = b.border;
+  if (!bd) return '无';
+  // ⚠️ **颜色不在这里**：描边色变化归「颜色」类（那是色值问题），这里只管"有没有 / 多粗 / 哪几边"。
+  //    两边都算会让一次改色同时出现在「颜色」和「边框」两处，看着像两处改动。
+  return JSON.stringify([bd.width ?? null, bd.single ?? null, bd.style ?? null]);
+}
+
+/** 边框的显示形态（沿用块表里的写法：`1px #E2E8F0`）。 */
+function borderText(b) {
+  const bd = b.border;
+  if (!bd) return '无';
+  const w = bd.width === null || bd.width === undefined ? '' : `${round2(bd.width)}px`;
+  return `${w}${bd.color ? ` ${bd.color}` : ''}${bd.single ? '（单边）' : ''}`.trim() || '有';
+}
+
+/**
+ * 两个块的**逐字段差异** → `[{cat, field, label, from, to}]`。
+ *
+ * 字段清单是**穷举**的（块的每一个会影响还原的属性都在这里），免得"改了一个没比的字段
+ * 就静默漏报"。分类与用户的说法对齐：尺寸/圆角、颜色、布局、文字、边框、结构。
+ */
+export function diffBlockItems(a, b) {
+  const items = [];
+  const put = (cat, field, from, to, label) => items.push({ cat, field, from, to, label });
+
+  // —— 尺寸/圆角 ——
+  const ra = a.radius?.max ?? null;
+  const rb = b.radius?.max ?? null;
+  if (ra !== rb) put('size', 'radius', ra, rb, `圆角 ${diffVal(ra)}→${diffVal(rb)}`);
+  const wa = a.w; const ha = a.h; const wb = b.w; const hb = b.h;
+  if (wa !== wb && ha !== hb) put('size', 'size', `${wa}×${ha}`, `${wb}×${hb}`, `尺寸 ${diffVal(wa)}×${diffVal(ha)}→${diffVal(wb)}×${diffVal(hb)}`);
+  else if (wa !== wb) put('size', 'width', wa, wb, `宽度 ${diffVal(wa)}→${diffVal(wb)}`);
+  else if (ha !== hb) put('size', 'height', ha, hb, `高度 ${diffVal(ha)}→${diffVal(hb)}`);
+
+  // —— 颜色（底色 / 文字色 / 图层不透明 / 描边色）——
+  if (bgKey(a.bg) !== bgKey(b.bg)) put('color', 'bg', bgKey(a.bg), bgKey(b.bg), `底色 ${bgText(a.bg)}→${bgText(b.bg)}`);
+  if (textColorKey(a) !== textColorKey(b)) put('color', 'color', textColorKey(a), textColorKey(b), `文字色 ${textColorText(a)}→${textColorText(b)}`);
+  const oa = a.opacity ?? 1;
+  const ob = b.opacity ?? 1;
+  if (oa !== ob) put('color', 'opacity', oa, ob, `不透明度 ${diffVal(oa)}→${diffVal(ob)}`);
+  const bca = a.border?.color ?? null;
+  const bcb = b.border?.color ?? null;
+  if (bca !== bcb) put('color', 'borderColor', bca, bcb, `描边色 ${diffVal(bca)}→${diffVal(bcb)}`);
+
+  // —— 布局 ——
+  // ⚠️ 画板块的坐标是**画布绝对坐标**（稿子在画布上被挪动就会变），不是设计变更 —— 跳过，
+  //    由 diffDesign 在末尾用一行"注"交代，别混进"布局变化"里制造假差异。
+  if (a.kind !== KINDS.ARTBOARD && (a.x !== b.x || a.y !== b.y)) {
+    const dx = round2((b.x ?? 0) - (a.x ?? 0));
+    const dy = round2((b.y ?? 0) - (a.y ?? 0));
+    let what;
+    if (dx === 0) what = dy > 0 ? `下移 ${dy}px` : `上移 ${-dy}px`;
+    else if (dy === 0) what = dx > 0 ? `右移 ${dx}px` : `左移 ${-dx}px`;
+    else what = `移动 (${diffVal(dx)}, ${diffVal(dy)})px`;
+    put('layout', 'position', `(${diffVal(a.x)}, ${diffVal(a.y)})`, `(${diffVal(b.x)}, ${diffVal(b.y)})`,
+      `${what}（x,y ${diffVal(a.x)},${diffVal(a.y)}→${diffVal(b.x)},${diffVal(b.y)}）`);
+  }
+
+  // —— 文字（文案 + 字号/字重/字体族/行高/字距/对齐）——
+  if ((a.text ?? null) !== (b.text ?? null)) {
+    put('text', 'content', a.text ?? null, b.text ?? null, `文案 ${JSON.stringify(a.text ?? '')}→${JSON.stringify(b.text ?? '')}`);
+  }
+  const fa = a.font ?? {};
+  const fb = b.font ?? {};
+  if ((fa.size ?? null) !== (fb.size ?? null)) put('text', 'fontSize', fa.size ?? null, fb.size ?? null, `字号 ${diffVal(fa.size)}→${diffVal(fb.size)}`);
+  if ((fa.weight ?? null) !== (fb.weight ?? null)) put('text', 'fontWeight', fa.weight ?? null, fb.weight ?? null, `字重 ${diffVal(fa.weight)}→${diffVal(fb.weight)}`);
+  if ((fa.family ?? null) !== (fb.family ?? null)) put('text', 'fontFamily', fa.family ?? null, fb.family ?? null, `字体 ${diffVal(fa.family)}→${diffVal(fb.family)}`);
+  if ((fa.lineHeight ?? null) !== (fb.lineHeight ?? null)) put('text', 'lineHeight', fa.lineHeight ?? null, fb.lineHeight ?? null, `行高 ${diffVal(fa.lineHeight)}→${diffVal(fb.lineHeight)}`);
+  if ((fa.letterSpacing ?? null) !== (fb.letterSpacing ?? null)) put('text', 'letterSpacing', fa.letterSpacing ?? null, fb.letterSpacing ?? null, `字距 ${diffVal(fa.letterSpacing)}→${diffVal(fb.letterSpacing)}`);
+  if ((fa.align ?? null) !== (fb.align ?? null)) put('text', 'align', fa.align ?? null, fb.align ?? null, `对齐 ${diffVal(fa.align)}→${diffVal(fb.align)}`);
+
+  // —— 边框（宽度/有无/单边；颜色归「颜色」类）——
+  if (borderKey(a) !== borderKey(b)) put('border', 'border', borderKey(a), borderKey(b), `边框 ${borderText(a)}→${borderText(b)}`);
+
+  // —— 结构（类型/切图/形状/子层数）——
+  if (a.kind !== b.kind) put('structure', 'kind', a.kind, b.kind, `类型 ${diffKindLabel(a.kind)}→${diffKindLabel(b.kind)}`);
+  if (Boolean(a.hasImage) !== Boolean(b.hasImage)) put('structure', 'hasImage', Boolean(a.hasImage), Boolean(b.hasImage), `切图 ${a.hasImage ? '有' : '无'}→${b.hasImage ? '有' : '无'}`);
+  if ((a.shape ?? null) !== (b.shape ?? null)) put('structure', 'shape', a.shape ?? null, b.shape ?? null, `形状 ${diffVal(a.shape)}→${diffVal(b.shape)}`);
+  if ((a.childCount ?? 0) !== (b.childCount ?? 0)) put('structure', 'childCount', a.childCount ?? 0, b.childCount ?? 0, `子层数 ${diffVal(a.childCount ?? 0)}→${diffVal(b.childCount ?? 0)}`);
+
+  return items;
+}
+
+/** 盒子的 L1 距离 —— **只用来在同一个 path 组内挑"是哪一个"**，不参与成败判定。 */
+function boxL1(a, b) {
+  return Math.abs((a.x ?? 0) - (b.x ?? 0)) + Math.abs((a.y ?? 0) - (b.y ?? 0))
+    + Math.abs((a.w ?? 0) - (b.w ?? 0)) + Math.abs((a.h ?? 0) - (b.h ?? 0));
+}
+
+function boxCenter(b) { return [(b.x ?? 0) + (b.w ?? 0) / 2, (b.y ?? 0) + (b.h ?? 0) / 2]; }
+
+function sizeRatio(x, y) {
+  const hi = Math.max(Math.abs(x ?? 0), Math.abs(y ?? 0));
+  const lo = Math.min(Math.abs(x ?? 0), Math.abs(y ?? 0));
+  return hi / Math.max(1, lo);
+}
+
+/**
+ * 近似配对（**只在身份对不上的残余里做**）。
+ *
+ * 判据保守到"宁可报新增/删除，也不硬认"：**类型必须相同**、**文本必须相同**
+ * （文案都改了就不该猜它是同一块）、中心点够近、宽高差在 25% 以内。
+ * 三条全过才配对，并按"中心距 + 尺寸差"贪心取最优。
+ */
+export function matchApproxBlocks(from, to, opts = {}) {
+  const maxCenter = opts.maxCenter ?? LIMITS.diffApproxMaxCenter;
+  const reachRatio = opts.reachRatio ?? LIMITS.diffApproxReachRatio;
+  const maxSizeRatio = opts.maxSizeRatio ?? LIMITS.diffApproxMaxSizeRatio;
+  const norm = (s) => String(s ?? '').trim().replace(/\s+/g, ' ');
+  const cands = [];
+  for (const a of from) {
+    const [acx, acy] = boxCenter(a);
+    for (const b of to) {
+      if (a.kind !== b.kind) continue;
+      if (norm(a.text) !== norm(b.text)) continue;
+      const [bcx, bcy] = boxCenter(b);
+      const cd = Math.hypot(acx - bcx, acy - bcy);
+      const reach = Math.max(maxCenter, reachRatio * Math.max(a.w ?? 0, a.h ?? 0, b.w ?? 0, b.h ?? 0));
+      if (cd > reach) continue;
+      const rw = sizeRatio(a.w, b.w);
+      const rh = sizeRatio(a.h, b.h);
+      if (rw > maxSizeRatio || rh > maxSizeRatio) continue;
+      cands.push({ a, b, score: cd + (rw - 1) * 100 + (rh - 1) * 100 });
+    }
+  }
+  cands.sort((p, q) => p.score - q.score || p.a.uid - q.a.uid || p.b.uid - q.b.uid);
+  const out = [];
+  const ua = new Set();
+  const ub = new Set();
+  for (const c of cands) {
+    if (ua.has(c.a.uid) || ub.has(c.b.uid)) continue;
+    ua.add(c.a.uid);
+    ub.add(c.b.uid);
+    out.push({ a: c.a, b: c.b, how: 'approx' });
+  }
+  return out;
+}
+
+/**
+ * 两版的块配对。三级，每级都可解释：
+ *   ① **身份（path）**：同 path 的块组内按几何最近邻配对，标 `exact`。
+ *      几何只用于"同 path 有多个块时选哪个" —— **挪动了 8px 仍是同一块**（那是"布局变化"，
+ *      不是"匹配失败"）。
+ *   ② **近似**：残余里按类型 + 文本 + 几何配，标 `approx`。
+ *   ③ 剩下的 → `onlyFrom`（删除）/ `onlyTo`（新增）。
+ */
+export function matchVersionBlocks(fromBlocks, toBlocks, opts = {}) {
+  const from = Array.isArray(fromBlocks) ? fromBlocks : [];
+  const to = Array.isArray(toBlocks) ? toBlocks : [];
+  const pairs = [];
+  const usedTo = new Set();
+  const byPath = new Map();
+  for (const b of to) {
+    const k = blockIdentity(b);
+    if (!byPath.has(k)) byPath.set(k, []);
+    byPath.get(k).push(b);
+  }
+
+  const restFrom = [];
+  for (const a of from) {
+    const cands = (byPath.get(blockIdentity(a)) ?? []).filter((b) => !usedTo.has(b.uid));
+    if (cands.length === 0) { restFrom.push(a); continue; }
+    let best = cands[0];
+    let bd = boxL1(a, best);
+    for (const b of cands.slice(1)) {
+      const d = boxL1(a, b);
+      if (d < bd) { bd = d; best = b; }
+    }
+    usedTo.add(best.uid);
+    pairs.push({ a, b: best, how: 'exact' });
+  }
+
+  const restTo = to.filter((b) => !usedTo.has(b.uid));
+  const approx = matchApproxBlocks(restFrom, restTo, opts);
+  for (const p of approx) { usedTo.add(p.b.uid); }
+  const approxA = new Set(approx.map((p) => p.a.uid));
+  const onlyFrom = restFrom.filter((a) => !approxA.has(a.uid));
+  const onlyTo = restTo.filter((b) => !usedTo.has(b.uid));
+  return { pairs: pairs.concat(approx), onlyFrom, onlyTo };
+}
+
+/**
+ * 匹配可靠度：**能不能信这张差异表**。
+ *
+ * 两条判据（都写进 `LIMITS`，不在逻辑里裸写数字）：
+ *   · 匹配率 `< diffMinMatchedRatio` → 大面积对不上（整版重画/重排/换了命名体系）
+ *   · 近似匹配占已匹配 `> diffMaxApproxShare` → 身份大面积对不上，全靠几何猜
+ * 块数少于 `diffMinBlocksForRatio` 时不按比例判（小样本比例没意义），但"**全部**靠猜"仍降级。
+ */
+export function diffReliability({ matched, exact, approx, onlyFrom, onlyTo, fromCount, toCount }) {
+  // total 用**两边块数的较大值**，不是"已匹配 + 未匹配之和"（那样会把未匹配算两遍，
+  // 匹配率被人为拉低 —— 实测：100/159 会算成 100/218）。
+  const total = Math.max(fromCount, toCount);
+  const unmatched = onlyFrom + onlyTo;
+  const matchedRatio = total > 0 ? matched / total : 1;
+  const approxShare = matched > 0 ? approx / matched : 0;
+  const small = total < LIMITS.diffMinBlocksForRatio;
+  let reliable = true;
+  let reason = null;
+  if (small) {
+    if (matched > 0 && approx === matched) {
+      reliable = false;
+      reason = `块数很少（${total} 块）且**全部**只能靠近似配对 —— 身份一个都没对上，逐块对比不可靠。`;
+    }
+  } else if (matchedRatio < LIMITS.diffMinMatchedRatio) {
+    reliable = false;
+    reason = `只有 ${matched}/${total} 块能配上（匹配率 ${Math.round(matchedRatio * 100)}%），`
+      + `${unmatched} 块对不上 —— 这通常意味着设计**整版重画/重排**或换了一套图层命名。`;
+  } else if (approxShare > LIMITS.diffMaxApproxShare) {
+    reliable = false;
+    reason = `已配上的 ${matched} 块里有 ${approx} 块只能靠**几何近似**猜（层名大面积变过），`
+      + '逐块配对的结果不可信。';
+  }
+  return {
+    exact, approx, unmatched, matched, total,
+    matchedRatio: round2(matchedRatio), approxShare: round2(approxShare),
+    smallSample: small, reliable, reason,
+  };
+}
+
+/* ---------------------------------------------------------------- 渲染 ---- */
+
+/** 变化摘要行：`块名 变化短语`；同名块不止一个时补上 path（否则定位不到）。 */
+function diffRow(entry, dupLabels) {
+  const where = entry.where + (dupLabels.has(entry.where) ? `（${entry.path}）` : '');
+  return `${where} ${entry.label}`;
+}
+
+/**
+ * 差异 → 人读文本。**只列有变化的**；未变的一律只给一句汇总。
+ *
+ * `reliable === false` 时**不出明细表** —— 那是本功能最重要的一条纪律：
+ * 硬凑出来的"精确差异表"会被 AI 当成事实去改代码。
+ */
+export function renderDiff(d) {
+  const L = [];
+  const f = d.from ?? {};
+  const t = d.to ?? {};
+  const short = (id) => (id ? String(id).slice(0, 8) : '?');
+  const when = (v) => (v ? String(v).replace(/^(\w+), /, '').replace(/ UTC$/, ' UTC') : '时间未知');
+  const gap = d.gapSeconds === null || d.gapSeconds === undefined
+    ? '' : `（相隔 ${d.gapDays >= 1 ? `${Number.isInteger(d.gapDays) ? d.gapDays : d.gapDays.toFixed(1)} 天` : d.gapSeconds < 60 ? '不到 1 分钟' : `${Math.round(d.gapSeconds / 60)} 分钟`}）`;
+  const head = `设计变更：v${short(f.id)} → v${short(t.id)}${gap}`;
+  L.push(head);
+  const where = (v) => {
+    const i = v?.index === null || v?.index === undefined ? null : `第 ${v.index + 1}/${d.versionCount} 版`;
+    const parts = [i, when(v?.createTime), v?.isLatest ? '最新版' : '**不是**最新版'].filter(Boolean);
+    return parts.join(' ');
+  };
+  L.push(`· 稿：${d.name ?? '(未命名)'} ${d.viewport?.width ?? '?'}×${d.viewport?.height ?? '?'} · 块数 ${d.counts.fromBlocks} → ${d.counts.toBlocks}`);
+  L.push(`· from：${where(f)} / to：${where(t)}`);
+  if (d.sameVersion) {
+    L.push('');
+    L.push(`**两版一致**：from 与 to 是**同一个版本**（${short(t.id)}）—— ${d.counts.fromBlocks} 块逐项比过，没有任何差异。`);
+    L.push('→ 设计没改，前端代码可以不动。');
+    for (const n of d.notes ?? []) L.push(`注：${n}`);
+    return L.join('\n');
+  }
+  const r = d.reliability ?? {};
+  L.push(`· 匹配可靠度：✅ ${r.exact} 块按 path 精确匹配 · ⚠️ ${r.approx} 块只能靠近似匹配 · `
+    + `❌ ${r.unmatched} 块无法匹配（匹配率 ${Math.round((r.matchedRatio ?? 0) * 100)}%）`);
+
+  if (!d.reliable) {
+    L.push('');
+    L.push('⚠️ **这两版差异过大，逐块对比不可靠 —— 不出明细表。**');
+    L.push(`· ${r.reason ?? ''}`);
+    L.push(`· 已匹配 ${r.matched}/${r.total}（精确 ${r.exact} · 近似 ${r.approx}）；`
+      + `另有 ${d.counts.removed} 块只在 from 里、${d.counts.added} 块只在 to 里。`);
+    L.push('· ⚠️ 上面这两个数**不等于"删除/新增"** —— 它们只是"没配上对"的块；谁是谁已无从判断，所以不给清单。');
+    L.push('· 建议：先确认 from/to 是不是同一张稿的两个版本；要逐块看请分别对两版调 `lanhu_read_blocks` 人工比对。');
+    for (const n of d.notes ?? []) L.push(`注：${n}`);
+    return L.join('\n');
+  }
+
+  if (d.identical) {
+    L.push('');
+    L.push(`**两版一致**：${d.counts.matched} 块逐项比过（尺寸/圆角·颜色·布局·文字·边框·结构），**没有任何差异**。`);
+    if (r.approx > 0) {
+      L.push(`（其中 ${r.approx} 块是靠近似配对上的：层名变过、外观一致 —— 不影响"没改"的结论。）`);
+    }
+    L.push('→ 设计没改，前端代码可以不动。');
+    for (const n of d.notes ?? []) L.push(`注：${n}`);
+    return L.join('\n');
+  }
+
+  // 明细：分类只列有变化的
+  // 同名后缀的判据是「这个块名对应**多个不同 path**」—— 同一块出现多行（比如又改类型又改切图）
+  // 不该被当成歧义加后缀（那样每行都拖一条尾巴，反而难读）。
+  const dupLabels = new Set();
+  {
+    const byLabel = new Map();
+    for (const cat of DIFF_CATEGORIES) {
+      for (const e of d.changes[cat] ?? []) {
+        if (!byLabel.has(e.where)) byLabel.set(e.where, new Set());
+        byLabel.get(e.where).add(e.path);
+      }
+    }
+    for (const [k, paths] of byLabel) if (paths.size > 1) dupLabels.add(k);
+  }
+  L.push('');
+  for (const cat of DIFF_CATEGORIES) {
+    const rows = d.changes[cat] ?? [];
+    if (rows.length === 0) continue;
+    const shown = rows.slice(0, LIMITS.diffMaxRowsPerCategory);
+    L.push(`· ${DIFF_CATEGORY_LABEL[cat]}：`);
+    for (const e of shown) L.push(`  - ${diffRow(e, dupLabels)}`);
+    if (rows.length > shown.length) L.push(`  - …还有 ${rows.length - shown.length} 处（同类，已截断）`);
+  }
+  if (d.counts.added > 0 || d.counts.removed > 0) {
+    L.push(`· ${d.counts.added > 0 ? `新增 ${d.counts.added} 块` : ''}${d.counts.added > 0 && d.counts.removed > 0 ? '；' : ''}${d.counts.removed > 0 ? `删除 ${d.counts.removed} 块` : ''}：`);
+    for (const e of (d.added ?? []).slice(0, LIMITS.diffMaxRowsPerCategory)) L.push(`  - ＋ ${e.where}（${diffKindLabel(e.kind)} ${diffVal(e.w)}×${diffVal(e.h)}）`);
+    for (const e of (d.removed ?? []).slice(0, LIMITS.diffMaxRowsPerCategory)) L.push(`  - － ${e.where}（${diffKindLabel(e.kind)} ${diffVal(e.w)}×${diffVal(e.h)}）`);
+  }
+  L.push(`· 未变：其余 ${d.counts.unchanged} 块`);
+  for (const n of d.notes ?? []) L.push(`注：${n}`);
+  return L.join('\n');
+}
+
+/* ------------------------------------------------------------ 主入口 ---- */
+
+/** 版本在列表里的位置（0 = 最新）。 */
+function versionIndexOf(list, id) {
+  const i = (list?.versions ?? []).findIndex((v) => String(v.id) === String(id));
+  return i < 0 ? null : i;
+}
+
+/**
+ * 解析要对比的其中一个版本。**严格**：给了具体 id 就必须命中，绝不静默回退 latest。
+ * 命中判断与报错文案复用 `pickVersion`（版本语义只有一份实现）。
+ */
+function resolveDiffVersion(list, want, which) {
+  const raw = list?.versions ?? [];
+  const shim = raw.map((v) => ({ id: v.id, json_url: v.jsonUrl }));
+  if ((want === null || want === undefined || want === '') && which === 'from') {
+    throw new LanhuError('需要 `from`（对比的**起点**版本 id）—— 不传就无法回答"改了什么"。', {
+      code: 'DIFF_FROM_REQUIRED',
+      hint: `该稿共 ${raw.length} 个版本。先调 \`lanhu_read_blocks\`（不传 version 即最新版）拿到 version.id，`
+        + '或从面板/CLI 的版本列表里取一个旧版本 id 再喂给 `from`。',
+    });
+  }
+  let chosen;
+  try {
+    chosen = pickVersion(shim, want === null || want === undefined || want === '' ? 'latest' : want);
+  } catch (e) {
+    if (e?.code === 'VERSION_NOT_FOUND') {
+      throw new LanhuError(e.message, {
+        code: 'VERSION_NOT_FOUND',
+        hint: `${which} 给了一个不存在的版本 id —— 这里**不会**静默回退到最新版（那会让你以为比的是那一版）。${e.hint ?? ''}`,
+      });
+    }
+    throw e;
+  }
+  const hit = raw.find((v) => String(v.id) === String(chosen.id)) ?? null;
+  return hit;
+}
+
+/**
+ * **同一张稿的两个版本对比** —— 回答"这次设计改了什么"。
+ *
+ * 网络请求**恰好三次**：一次版本列表 + **两次图层树**（每版一次）。不做逐版本探测。
+ */
+export async function diffDesign(args = {}) {
+  const target = resolveTarget({ projectId: args.projectId, imageId: args.imageId, url: args.url });
+  const picked = await pickAccount({ ...args, projectId: target.projectId, imageId: target.imageId, teamId: target.teamId });
+  const acct = picked.alias;
+  const opts = { cookie: args.cookie, account: acct };
+
+  // ① 版本列表（一次请求就够 —— 它同时给出每版的 json_url，不用再逐版拉详情）
+  const list = await imageVersions(target.projectId, target.imageId, opts);
+  if ((list.versions ?? []).length === 0) {
+    if (!isReadableDetail({ name: list.name, jsonUrl: null })) {
+      throw new LanhuError(`当前账号读不到这张稿（${target.imageId}），或它没有任何版本。`, {
+        code: 'EMPTY_DETAIL',
+        hint: '蓝湖对不属于当前账号的稿子会**静默返回空壳**、不报错。多账号场景先用 `lanhu_who` 或 `lanhu_accounts` 确认这张稿该用哪个账号，再指定 account 重试。',
+      });
+    }
+    throw new LanhuError(`稿 ${target.imageId} 没有任何可读版本。`, { code: 'VERSION_UNAVAILABLE' });
+  }
+  const fromV = resolveDiffVersion(list, args.from, 'from');
+  const toV = resolveDiffVersion(list, args.to, 'to');
+
+  // ② 两次树请求（这一版与那一版）
+  const trees = [];
+  let diffSourceFormat = null;
+  for (const v of [fromV, toV]) {
+    let tree = await fetchJsonUrl(v.jsonUrl, opts);
+    // ⭐ Sketch 插件格式：与 read_design / read_blocks **走同一条归一化**（不为 diff 另写一份解析）。
+    //    以前这里只认 `artboard`，于是半个项目的稿子 diff 直接报"不是设计稿图层树"——
+    //    归错因（它们是设计稿，只是另一套结构）。现在能真的 diff。
+    if (isSketchPluginTree(tree)) {
+      const norm = normalizeSketchPluginTree(tree);
+      if (norm.layerCount === 0) {
+        throw new LanhuError(`版本 ${String(v.id).slice(0, 8)} 是**蓝湖 Sketch 插件导出**（\`type: sketchPlugin\`），`
+          + '但它的 `info[]` 里取不出任何子层 —— **本次 diff 无数据，不代表这一版是空的**。', {
+          code: 'SKETCH_PLUGIN_NO_LAYERS',
+          hint: '换一版（`lanhu_read_design` 的版本信息能看到有几版）；或按"支持与不支持的稿件格式"（docs/读稿.md）换一张非 Sketch 插件格式的稿子。',
+        });
+      }
+      tree = norm.tree;
+      diffSourceFormat = 'sketchPlugin';
+    } else if (!tree?.artboard) {
+      throw new LanhuError(`版本 ${String(v.id).slice(0, 8)} 拉到的不是设计稿图层树（没有 \`artboard\`）。`, {
+        code: 'NOT_DESIGN_TREE',
+        hint: '这张 imageId 可能指向**原型/产品文档**（那要用 `lanhu_read_product_doc`），或该版本还没生成图层数据。',
+      });
+    }
+    trees.push(tree);
+  }
+  const [ta, tb] = trees;
+  const blocksOf = (tree) => buildBlocks(flattenArtboard(tree.artboard ?? tree));
+  // 与块表**同一套披露口径**（`visibleBlocks` 是唯一一份实现）：默认只比表里列出来的那些块，
+  // 系统 UI / 图形碎片（noise）默认不参与 —— 否则状态栏图元的小抖动会淹没真变化。
+  const includeNoise = Boolean(args.includeNoise);
+  const allA = blocksOf(ta);
+  const allB = blocksOf(tb);
+  const A = visibleBlocks(allA, { includeNoise });
+  const B = visibleBlocks(allB, { includeNoise });
+
+  // ③ 配对 + 可靠度
+  const { pairs, onlyFrom, onlyTo } = matchVersionBlocks(A, B, {});
+  const exact = pairs.filter((p) => p.how === 'exact').length;
+  const approx = pairs.length - exact;
+  const reliability = diffReliability({
+    matched: pairs.length, exact, approx,
+    onlyFrom: onlyFrom.length, onlyTo: onlyTo.length,
+    fromCount: A.length, toCount: B.length,
+  });
+  const reliable = reliability.reliable;
+
+  // ④ 逐字段差异（**只在可信时才算** —— 不可信时刻意不算，免得有人把 changes 当事实用）
+  const changes = {};
+  for (const c of DIFF_CATEGORIES) changes[c] = [];
+  const changedCounts = {};
+  for (const c of DIFF_CATEGORIES) changedCounts[c] = 0;
+  let unchanged = 0;
+  let changedBlocks = 0;
+  if (reliable) {
+    const ordered = pairs.slice().sort((p, q) => (p.b.uid ?? 0) - (q.b.uid ?? 0));
+    for (const p of ordered) {
+      const items = diffBlockItems(p.a, p.b);
+      if (items.length === 0) { unchanged += 1; continue; }
+      changedBlocks += 1;
+      const where = blockLabel(p.b);
+      const cats = new Set();
+      for (const it of items) {
+        changes[it.cat].push({
+          path: p.b.path ?? null, name: p.b.name ?? null, kind: p.b.kind ?? null,
+          kindFrom: p.a.kind ?? null, how: p.how,
+          field: it.field, label: it.label, from: it.from, to: it.to, where,
+        });
+        cats.add(it.cat);
+      }
+      for (const c of cats) changedCounts[c] += 1;
+    }
+  }
+
+  // 「对不上」的块：不可信时**也照实给**（它们是真实存在的块，只是配不上对）——
+  // 但那时渲染层只报计数、不出清单，并明说"这不等于是新增/删除"。
+  const mkEntry = (b) => ({
+    path: b.path ?? null, name: b.name ?? null, kind: b.kind ?? null,
+    w: b.w ?? null, h: b.h ?? null, where: blockLabel(b),
+  });
+  const added = onlyTo.map(mkEntry);
+  const removed = onlyFrom.map(mkEntry);
+
+  // ⑤ 画板块的"画布坐标"交代 —— 不算设计变更，但**不静默吞掉**
+  const notes = [];
+  {
+    const aa = A.find((b) => b.kind === KINDS.ARTBOARD);
+    const ba = B.find((b) => b.kind === KINDS.ARTBOARD);
+    if (aa && ba && (aa.x !== ba.x || aa.y !== ba.y)) {
+      notes.push(`画板的画布坐标 ${diffVal(aa.x)},${diffVal(aa.y)}→${diffVal(ba.x)},${diffVal(ba.y)} 变了，`
+        + '那是稿子在 Figma 画布上的摆放位置，**不是设计变更**（块坐标本来就相对画板），已从「布局」里排除。');
+    }
+    const noiseSkipped = (allA.filter((b) => b.noise).length) + (allB.filter((b) => b.noise).length);
+    if (!includeNoise && noiseSkipped > 0) {
+      notes.push(`系统 UI / 图形碎片共 ${noiseSkipped} 块未参与比对（与块级清单同一个折叠口径）；要一起比传 includeNoise:true。`);
+    }
+  }
+
+  const gapSeconds = (() => {
+    const a = Date.parse(parseRfc2822(fromV.createTime) ?? '');
+    const b = Date.parse(parseRfc2822(toV.createTime) ?? '');
+    if (Number.isNaN(a) || Number.isNaN(b)) return null;
+    return Math.round(Math.abs(b - a) / 1000);
+  })();
+  const gapDays = gapSeconds === null ? null : Math.round(gapSeconds / 86400 * 10) / 10;
+
+  const identical = reliable && changedBlocks === 0 && added.length === 0 && removed.length === 0;
+  const d = {
+    ok: true,
+    format: 'diff',
+    // 稿子的**来源格式**：`'sketchPlugin'` = Sketch 插件导出（已归一化后 diff）。只在非空时加键（普通稿逐字节不变）。
+    ...(diffSourceFormat ? { sourceFormat: diffSourceFormat } : {}),
+    name: tb.artboard?.name ?? list.name ?? null,
+    viewport: {
+      width: round2(tb.artboard?.frame?.width ?? list.width),
+      height: round2(tb.artboard?.frame?.height ?? list.height),
+    },
+    from: { id: fromV.id ?? null, createTime: fromV.createTime ?? null, index: versionIndexOf(list, fromV.id), isLatest: String(fromV.id) === String(list.versions[0]?.id) },
+    to: { id: toV.id ?? null, createTime: toV.createTime ?? null, index: versionIndexOf(list, toV.id), isLatest: String(toV.id) === String(list.versions[0]?.id) },
+    versionCount: list.versions.length,
+    versionLatestId: list.versions[0]?.id ?? null,
+    sameVersion: String(fromV.id) === String(toV.id),
+    gapSeconds,
+    gapDays,
+    identical,
+    reliable,
+    reliability,
+    counts: {
+      fromBlocks: A.length,
+      toBlocks: B.length,
+      noiseFrom: allA.filter((b) => b.noise).length,
+      noiseTo: allB.filter((b) => b.noise).length,
+      matched: pairs.length,
+      unchanged,
+      changed: { ...changedCounts, blocks: changedBlocks },
+      added: added.length,
+      removed: removed.length,
+    },
+    changes,
+    added,
+    removed,
+    notes,
+    account: acct ?? null,
+    accountBy: picked.by ?? null,
+  };
+  d.text = renderDiff(d);
+  d.textBytes = Buffer.byteLength(d.text, 'utf8');
+  return d;
+}
+
+/* ==========================================================================
+ * 6.6 设计系统审计（跨稿一致性）—— 「这个项目的设计系统漂了吗」
+ *
+ * 蓝湖**完全不提供**这个：它按稿组织，不按"组件"组织。所以"同一颗主按钮在 12 张稿里
+ * 长出 5 种圆角"这件事，在蓝湖里没有任何一屏看得出来 —— 而这个插件已经有全量读取能力，
+ * 这件事该由我们回答。
+ *
+ * 三条纪律（与 §6.5 的 diff 是同一套）：
+ *   ① **判据必须可解释，而且写进输出**：同一组件 = **层名归一化后相同**。
+ *      判据、覆盖率、"多少块因为名字不可靠没参与"全部报出来 —— 读者才知道该信几分。
+ *   ② **成本必须受控**：扫 N 张 = **2N 次请求**（1 次稿详情 + 1 次图层树；实测 1437 张 ≈ 45 分钟）。
+ *      所以默认只扫 `auditDefaultImages` 张，显式传 limit 才能加，且**绝不超过** `auditMaxImages`；
+ *      输出里必须写明 scanned / total / truncated（本仓库铁律：不做全量拉取）。
+ *   ③ **不可靠时拒绝出明细**：块名大多是 `Rectangle 12` 这种工具默认名时，按层名归组会得到
+ *      "5 种圆角"这种**看着精确、其实认错组件**的结论 —— 比不给更糟。那时判 `reliable:false`。
+ * ========================================================================== */
+
+/** 审计发现类别（受控词表；数组顺序就是渲染顺序）。 */
+export const AUDIT_CATEGORIES = Object.freeze(['componentSpec', 'fontScale', 'colorDrift', 'spacingScale', 'radiusFamily']);
+
+/** 类别中文名（渲染与文档共用一份，别在渲染里裸写字符串）。 */
+export const AUDIT_CATEGORY_LABEL = Object.freeze({
+  componentSpec: '同一组件、多种规格',
+  fontScale: '字号阶梯',
+  colorDrift: '色值漂移（近重复色）',
+  spacingScale: '间距尺度',
+  radiusFamily: '圆角家族',
+});
+
+/** 哪些类别的结论**依赖层名** —— 命名不可靠时它们必须被压住（见 `auditReliability`）。 */
+export const AUDIT_NAME_DEPENDENT = Object.freeze(['componentSpec']);
+
+/** 序号圆圈（渲染用；下标 = AUDIT_CATEGORIES 的下标）。 */
+const AUDIT_NUMERALS = Object.freeze(['①', '②', '③', '④', '⑤']);
+
+/**
+ * 工具默认层名（Figma / Sketch / Axure / 蓝湖自绘都这么起名）。
+ * 命中即"名字不可靠"：`Rectangle 12` 只说明"这里有个矩形"，**不说明"这是主按钮"**。
+ * 判据是**整个名字**（首尾都锚定），所以 `MainFrame` / `CardGroup` / `icon-arrow` 这类真名不会被误伤。
+ */
+const AUTO_NAME_WORDS = Object.freeze([
+  'rectangle', 'rect', 'ellipse', 'oval', 'circle', 'vector', 'path', 'line', 'polygon', 'star',
+  'shape', 'group', 'frame', 'component', 'instance', 'mask', 'union', 'subtract', 'intersect',
+  'exclude', 'slice', 'bitmap', 'image', 'layer', 'artboard', 'symbol', 'text', 'icon', 'placeholder',
+  'fill', 'stroke', 'clip', 'shadow', 'background', 'border', 'arrow',
+  '矩形', '矩形框', '圆角矩形', '椭圆', '椭圆形', '圆形', '路径', '直线', '线条', '多边形', '星形', '形状',
+  '编组', '分组', '组', '框架', '组件', '实例', '蒙版', '遮罩', '图片', '位图', '图层', '画板',
+  '文本', '占位', '占位符', '占位图', '图标', '箭头',
+]);
+
+/** 「复制出来的那份」的中缀（`矩形备份 6` / `Rectangle 3 Copy 37`）—— 仍是工具默认名。 */
+const AUTO_NAME_COPY_WORDS = 'copy|副本|备份|拷贝';
+
+export const AUTO_LAYER_NAME_RE = new RegExp(
+  '^(?:' + AUTO_NAME_WORDS.join('|') + ')'
+  + '(?:[\\s_-]*\\d+)*'
+  + '(?:[\\s_-]*(?:' + AUTO_NAME_COPY_WORDS + ')(?:[\\s_-]*\\d+)*)*'
+  + '(?:\\s*[×xX*]\\s*\\d+)?$'
+  + '|^(?:' + AUTO_NAME_COPY_WORDS + ')(?:\\s*\\d+)*$'
+  + '|^[a-z]{1,3}\\d+$'
+  + '|^\\d+(?:\\.\\d+)?$'
+  + '|^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+  + '|^[0-9a-f]{16,}$'
+  + '|^[\\s\\-_.·…]+$',
+  'i',
+);
+
+/**
+ * 层名归一化 —— **全项目只有这一把尺子**（跨稿比对与自动名判定共用）。
+ * NFKC（全角→半角）+ 折叠连续空白 + 去首尾 + 转小写。
+ * 为什么不剥尾号：`主按钮 2` 与 `主按钮` 是两个层，硬并会让"多规格"变成误报。
+ */
+export function auditNameKey(name) {
+  return String(name ?? '').normalize('NFKC').replace(/\s+/g, ' ').trim().toLowerCase();
+}
+
+/**
+ * 这个名字**可不可靠**（能不能拿它当"同一组件"的判据）。
+ * @returns {{auto: boolean, why: 'empty'|'template'|'tooShort'|null}}
+ */
+export function isAutoLayerName(name) {
+  const key = auditNameKey(name);
+  if (!key) return { auto: true, why: 'empty' };
+  if (AUTO_LAYER_NAME_RE.test(key)) return { auto: true, why: 'template' };
+  if ([...key].length < LIMITS.auditNameMinLength) return { auto: true, why: 'tooShort' };
+  return { auto: false, why: null };
+}
+
+/** 例子里的稿名截断（一行塞 4 个长名会把整段挤爆）。 */
+function shortImageName(name) {
+  const s = String(name ?? '').trim() || '(未命名)';
+  const chars = [...s];
+  return chars.length > LIMITS.auditExampleNameMax ? `${chars.slice(0, LIMITS.auditExampleNameMax).join('')}…` : s;
+}
+
+/** 一个取值条目 → 输出形态（**示例稿名只带 `auditMaxExamples` 个**，免得把结果撑爆）。 */
+function spreadRow(e) {
+  return {
+    value: e.value,
+    count: e.count,
+    imageCount: e.images.size,
+    examples: [...e.images.values()].slice(0, LIMITS.auditMaxExamples).map(shortImageName),
+  };
+}
+
+/** 取值分布 → 计数 + 多数派（**"建议以哪个为准"的判据就是它**：并列时明说无法判定，不硬挑一个）。 */
+function auditValueSpread(map) {
+  const list = [...map.values()].sort((a, b) => b.count - a.count || a.value - b.value);
+  const total = list.reduce((n, e) => n + e.count, 0);
+  if (list.length === 0) return { distinct: 0, total: 0, values: [], truncatedValues: 0, majority: null, majorityCount: null, tie: false };
+  const top = list[0];
+  const tie = list.length > 1 && list[1].count === top.count;
+  return {
+    distinct: list.length,
+    total,
+    values: list.slice(0, LIMITS.auditMaxSpecValues).map(spreadRow),
+    truncatedValues: Math.max(0, list.length - LIMITS.auditMaxSpecValues),
+    majority: tie ? null : top.value,
+    majorityCount: tie ? null : top.count,
+    tie,
+  };
+}
+
+/**
+ * 多张稿的块 → 「组件名 → 组内块」。判据**只有一条**：`auditNameKey` 相同。
+ * 名字不可靠的块**不参与**，但**要计数** —— 覆盖率本身就是结论的一部分（见 `auditReliability`）。
+ */
+export function collectAuditComponents(scans, opts = {}) {
+  const minImages = opts.minImages ?? LIMITS.auditMinComponentImages;
+  const minBlocks = opts.minBlocks ?? LIMITS.auditMinComponentBlocks;
+  const groups = new Map();
+  const naming = { total: 0, named: 0, auto: 0, empty: 0 };
+  const imagesWithLayers = new Set();
+
+  for (const s of scans ?? []) {
+    if (!s || !Array.isArray(s.blocks)) continue;
+    imagesWithLayers.add(s.imageId);
+    for (const b of s.blocks) {
+      if (b.kind === KINDS.ARTBOARD) continue;            // 画板名 = 稿名，不是组件名
+      naming.total += 1;
+      const nm = isAutoLayerName(b.name);
+      if (nm.auto) { if (nm.why === 'empty') naming.empty += 1; else naming.auto += 1; continue; }
+      naming.named += 1;
+      const key = auditNameKey(b.name);
+      let g = groups.get(key);
+      if (!g) { g = { key, name: String(b.name).trim(), blocks: [], images: new Map(), kinds: new Set() }; groups.set(key, g); }
+      g.blocks.push({ ...b, imageId: s.imageId, imageName: s.imageName ?? null });
+      g.images.set(s.imageId, (g.images.get(s.imageId) ?? 0) + 1);
+      g.kinds.add(b.kind);
+    }
+  }
+
+  const participated = [];
+  const thin = [];
+  for (const g of groups.values()) {
+    if (g.images.size >= minImages && g.blocks.length >= minBlocks) participated.push(g);
+    else thin.push(g);
+  }
+  const countBlocks = (list) => list.reduce((n, g) => n + g.blocks.length, 0);
+  const namedShare = naming.total > 0 ? round2(naming.named / naming.total) : 0;
+  return {
+    groups,
+    participated,
+    thin,
+    // ⚠️ `namedShare` **放进 naming 里**（而不是只做兄弟字段）：它是判"命名可不可靠"的输入，
+    //    与 total/named/auto/empty 是一件事，分开放会有人只传 naming 而漏掉它（实测踩过）。
+    naming: { ...naming, namedShare },
+    participatedBlocks: countBlocks(participated),
+    thinBlocks: countBlocks(thin),
+    imagesWithLayers: imagesWithLayers.size,
+  };
+}
+
+/**
+ * 组件比哪几个维度（**单一出口**：加一个维度只改这里）。
+ * ⚠️ 「高度」**不看文本层**：文本层的高度由文案长短与换行决定（实测 `关键字：` 的 100 个块里
+ *    高度 18 与 20 混着出现），那是内容差异、不是规格漂移 —— 文本的规格看**字号**（② 字号阶梯）。
+ */
+const AUDIT_SPEC_DIMS = Object.freeze([
+  { key: 'radius', label: '圆角', of: (b) => (b.radius && Number.isFinite(b.radius.max) ? round2(b.radius.max) : null) },
+  { key: 'height', label: '高度', of: (b) => (b.kind === KINDS.TEXT ? null : (Number.isFinite(b.h) ? round2(b.h) : null)) },
+]);
+
+/**
+ * ① 同一个组件、多种规格 —— 本功能最有价值的一项。
+ * 只对**参与进来**（`collectAuditComponents` 的 `participated`）的组件名算；某维度只有 ≤1 个取值
+ * 就不算发现（"只有一种" 不是漂移）。
+ */
+export function auditComponentSpecs(components) {
+  const findings = [];
+  let converged = 0;
+  for (const g of components ?? []) {
+    const dims = [];
+    for (const d of AUDIT_SPEC_DIMS) {
+      const map = new Map();
+      for (const b of g.blocks) {
+        const v = d.of(b);
+        if (v === null) continue;
+        const k = String(v);
+        let e = map.get(k);
+        if (!e) { e = { value: v, count: 0, images: new Map() }; map.set(k, e); }
+        e.count += 1;
+        e.images.set(b.imageId, b.imageName ?? null);
+      }
+      if (map.size < 2) continue;
+      dims.push({ dim: d.key, label: d.label, ...auditValueSpread(map) });
+    }
+    if (dims.length === 0) { converged += 1; continue; }
+    findings.push({ name: g.name, blocks: g.blocks.length, images: g.images.size, kinds: [...g.kinds].sort(), dims });
+  }
+  const spread = (f) => Math.max(...f.dims.map((d) => d.distinct));
+  findings.sort((a, b) => spread(b) - spread(a) || b.blocks - a.blocks);
+  return { findings, converged };
+}
+
+/**
+ * ② 字号阶梯 —— 只看块里的 `font.size`（**不看层名**，所以命名不可靠时它仍然可用）。
+ * 报两件事：整条阶梯，以及"只出现一次"的野值（它们是最该收敛掉的）。
+ */
+export function auditFontScale(scans) {
+  const map = new Map();
+  for (const s of scans ?? []) {
+    for (const b of s.blocks ?? []) {
+      const size = b?.font?.size;
+      if (!Number.isFinite(size)) continue;
+      const v = round2(size);
+      const k = String(v);
+      let e = map.get(k);
+      if (!e) { e = { value: v, count: 0, images: new Map() }; map.set(k, e); }
+      e.count += 1;
+      e.images.set(s.imageId, s.imageName ?? null);
+    }
+  }
+  const asc = [...map.values()].sort((a, b) => a.value - b.value);
+  const spread = auditValueSpread(map);
+  const ladder = asc.filter((e) => e.count >= LIMITS.auditLadderMinCount).map((e) => e.value);
+  const oneOffs = asc.filter((e) => e.count <= LIMITS.auditOneOffMaxCount).map((e) => ({
+    value: e.value,
+    count: e.count,
+    examples: [...e.images.values()].slice(0, LIMITS.auditMaxExamples).map(shortImageName),
+    // 收敛建议的锚点：最近的"常用档"（出现 ≥ auditLadderMinCount 次）。没有常用档就不编。
+    nearest: ladder.length
+      ? ladder.reduce((best, v) => (Math.abs(v - e.value) < Math.abs(best - e.value) ? v : best), ladder[0])
+      : null,
+  }));
+  const drift = oneOffs.length >= LIMITS.auditOneOffMinCount || asc.length > LIMITS.auditHealthyFontSizes;
+  return {
+    distinct: asc.length,
+    total: spread.total,
+    sizes: spread.values,
+    truncatedValues: spread.truncatedValues,
+    ladder,
+    oneOffs,
+    oneOffCount: oneOffs.length,
+    drift,
+  };
+}
+
+/** 收集参与审计的色值（底色 / 渐变 stop / 文字色 / 描边色）。 */
+export function collectAuditColors(scans) {
+  const map = new Map();
+  const add = (hex, alpha, role, s) => {
+    if (!hex) return;
+    const a = Number.isFinite(alpha) ? round2(alpha) : 1;
+    if (a <= 0) return;                                  // 全透明看不见，不是色值
+    const key = a < 1 ? `${hex}@${Math.round(a * 100)}%` : String(hex);
+    let e = map.get(key);
+    if (!e) {
+      e = { key, hex: String(hex).toLowerCase(), alpha: a, count: 0, roles: new Set(), images: new Map(), rgb: parseColor(hex) };
+      map.set(key, e);
+    }
+    e.count += 1;
+    e.roles.add(role);
+    e.images.set(s.imageId, s.imageName ?? null);
+  };
+  for (const s of scans ?? []) {
+    for (const b of s.blocks ?? []) {
+      if (b.bg) {
+        add(b.bg.hex, b.bg.alpha, 'bg', s);
+        for (const st of b.bg.stops ?? []) add(st.hex, st.alpha, 'gradient', s);
+      }
+      if (b.color) add(b.color, b.colorAlpha ?? 1, 'text', s);
+      if (b.border?.color) add(b.border.color, b.border.alpha ?? 1, 'border', s);
+    }
+  }
+  return map;
+}
+
+/** 两个 RGB 的欧氏距离（0 ~ 441）。阈值是 `LIMITS.auditNearColorDistance`，**不在逻辑里裸写**。 */
+export function rgbDistance(a, b) {
+  if (!a || !b) return Infinity;
+  return Math.sqrt((a.r - b.r) ** 2 + (a.g - b.g) ** 2 + (a.b - b.b) ** 2);
+}
+
+/**
+ * ③ 色值漂移 —— 把 **RGB 距离 ≤ 阈值** 的色值聚成一簇。
+ *
+ * 判据是距离阈值本身（写进 `LIMITS` 也写进输出）：`#574af4` 与 `#574bf5` 的距离是 1.41，
+ * 而 12 以内肉眼分不出 —— 那正是"设计漂了、代码里却写了两套色"的来源。
+ *
+ * ⚠️ 三条刻意的边界（都踩过）：
+ *   · **完全链接**（不是并查集的连通分量）：新成员必须与簇内**每一个**成员都 ≤ 阈值，否则另起一簇。
+ *     用连通分量会连成链（`#ffffff ≈ #f9f9f9 ≈ #f2f2f2 ≈ …`），最后一簇的最大距离冲到 32.89 ——
+ *     那时"肉眼分不出"就是**假话**（实测踩过）。
+ *   · **只比同透明度的**：`#4693ff` 与 `#4693ff@60%` 的 RGB 距离是 0，但它们不是"同一色的两种写法"
+ *     （一个是实色、一个是 60% 描边）—— 聚成一簇并建议"统一"是**假发现**（实测踩过）。
+ *   · 贪心按**出现次数从多到少**放：这样"多数派"天然是簇里第一个，建议值稳定且可解释。
+ */
+export function nearColorClusters(entries, threshold = LIMITS.auditNearColorDistance) {
+  const list = (entries ?? []).slice().sort((a, b) => b.count - a.count || String(a.key).localeCompare(String(b.key)));
+  const sameAlpha = (a, b) => Math.abs((a.alpha ?? 1) - (b.alpha ?? 1)) <= LIMITS.auditEpsilon;
+  const clusters = [];
+  for (const e of list) {
+    // 放进**第一个**能容下它的簇（与簇内每一个都 ≤ 阈值），否则另起一簇
+    const hit = clusters.find((c) => sameAlpha(c[0], e)
+      && c.every((m) => rgbDistance(m.rgb, e.rgb) <= threshold));
+    if (hit) hit.push(e);
+    else clusters.push([e]);
+  }
+  return clusters
+    .filter((c) => c.length >= 2)
+    .map((members) => {
+      let maxDistance = 0;
+      for (let i = 0; i < members.length; i += 1) {
+        for (let j = i + 1; j < members.length; j += 1) {
+          maxDistance = Math.max(maxDistance, rgbDistance(members[i].rgb, members[j].rgb));
+        }
+      }
+      const tie = members.length > 1 && members[1].count === members[0].count;
+      return {
+        members: members.map((e) => ({ key: e.key, count: e.count, imageCount: e.images.size, roles: [...e.roles].sort(), examples: [...e.images.values()].slice(0, LIMITS.auditMaxExamples).map(shortImageName) })),
+        maxDistance: round2(maxDistance),
+        majority: tie ? null : members[0].key,
+        tie,
+      };
+    })
+    .sort((a, b) => b.members.length - a.members.length || b.members[0].count - a.members[0].count);
+}
+
+/** ④ 间距尺度 —— 拿 `geometricGaps` 收集**所有**几何间距，看有没有跑出 4px 栅格的野值。 */
+export function auditSpacing(scans) {
+  const map = new Map();
+  let skippedImages = 0;
+  for (const s of scans ?? []) {
+    const items = (s.blocks ?? []).filter((b) => b.kind !== KINDS.ARTBOARD
+      && Number.isFinite(b.x) && Number.isFinite(b.y) && Number.isFinite(b.w) && Number.isFinite(b.h));
+    if (items.length > LIMITS.auditSpacingMaxBlocks) { skippedImages += 1; continue; }
+    const gaps = geometricGaps(items.map((b) => ({ id: b.path ?? null, name: b.name ?? null, x: b.x, y: b.y, w: b.w, h: b.h })), {
+      maxDistance: LIMITS.auditSpacingMaxDistance,
+    });
+    for (const g of gaps) {
+      const v = round2(g.distance);
+      if (!(v > 0)) continue;                            // "间距 0" 是重复图层，不是尺度
+      const k = String(v);
+      let e = map.get(k);
+      if (!e) { e = { value: v, count: 0, images: new Map() }; map.set(k, e); }
+      e.count += 1;
+      e.images.set(s.imageId, s.imageName ?? null);
+    }
+  }
+  const all = [...map.values()].sort((a, b) => b.count - a.count || a.value - b.value);
+  const onGrid = (v) => Math.abs(v / LIMITS.auditSpacingGrid - Math.round(v / LIMITS.auditSpacingGrid)) <= LIMITS.auditEpsilon;
+  const offGrid = all.filter((e) => !onGrid(e.value));
+  return {
+    distinct: all.length,
+    total: all.reduce((n, e) => n + e.count, 0),
+    grid: LIMITS.auditSpacingGrid,
+    maxDistance: LIMITS.auditSpacingMaxDistance,
+    top: all.slice(0, LIMITS.auditMaxSpecValues).map(spreadRow),
+    offGrid: offGrid.slice(0, LIMITS.auditMaxSpecValues).map(spreadRow),
+    offGridCount: offGrid.length,
+    skippedImages,
+    drift: offGrid.length >= LIMITS.auditOffGridMinValues,
+  };
+}
+
+/** ⑤ 圆角家族（**参考项**）—— 值分布 + 不在常见刻度上的特例。 */
+export function auditRadiusFamily(scans) {
+  const map = new Map();
+  for (const s of scans ?? []) {
+    for (const b of s.blocks ?? []) {
+      if (b.kind === KINDS.ARTBOARD) continue;
+      if (!b.radius || !Number.isFinite(b.radius.max)) continue;
+      const v = round2(b.radius.max);
+      const k = String(v);
+      let e = map.get(k);
+      if (!e) { e = { value: v, count: 0, images: new Map() }; map.set(k, e); }
+      e.count += 1;
+      e.images.set(s.imageId, s.imageName ?? null);
+    }
+  }
+  const all = [...map.values()].sort((a, b) => b.count - a.count || a.value - b.value);
+  const onScale = (v) => LIMITS.auditRadiusScale.some((x) => Math.abs(x - v) <= LIMITS.auditEpsilon);
+  const offScale = all.filter((e) => !onScale(e.value));
+  return {
+    distinct: all.length,
+    total: all.reduce((n, e) => n + e.count, 0),
+    scale: [...LIMITS.auditRadiusScale],
+    top: all.slice(0, LIMITS.auditMaxSpecValues).map(spreadRow),
+    offScale: offScale.slice(0, LIMITS.auditMaxSpecValues).map(spreadRow),
+    offScaleCount: offScale.length,
+    drift: offScale.length >= LIMITS.auditOffScaleMinValues,
+  };
+}
+
+/**
+ * 这次审计**能不能信** —— 与 §6.5 diff 的 `diffReliability` 同一套纪律。
+ * 判据（阈值都在 `LIMITS`，不裸写）：
+ *   · 成功读到图层的稿 < `auditMinImagesForAudit` → 样本太少；
+ *   · 一个块都没读到 → 无从谈起；
+ *   · 可靠块名占比 < `auditMinNamedShare` → **命名不可靠**（`Rectangle 12` 这类工具默认名占多数）。
+ */
+export function auditReliability({ imagesWithLayers, totalBlocks, naming }) {
+  const reasons = [];
+  if (imagesWithLayers < LIMITS.auditMinImagesForAudit) {
+    reasons.push(`成功读到图层的稿只有 ${imagesWithLayers} 张（少于 ${LIMITS.auditMinImagesForAudit} 张）—— 样本太少，跨稿结论没有意义。`);
+  }
+  if (totalBlocks === 0) {
+    reasons.push('一张稿里都没读到可参与审计的块（这些稿可能只有图片、没有图层数据）。');
+  } else if (naming.namedShare < LIMITS.auditMinNamedShare) {
+    reasons.push(`**命名不可靠**：可靠块名只覆盖 ${naming.named}/${naming.total} 块`
+      + `（${Math.round(naming.namedShare * 100)}%，低于 ${Math.round(LIMITS.auditMinNamedShare * 100)}%）`
+      + '—— 其余是 `Rectangle 12` 这类工具默认名或空名。');
+  }
+  return { reliable: reasons.length === 0, reasons };
+}
+
+/** 小并发池 —— 结果按**输入下标**回填，所以并发不影响输出的确定性（自检据此断言）。 */
+async function mapPool(items, concurrency, fn) {
+  const list = items ?? [];
+  const out = new Array(list.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.max(1, Math.min(concurrency, list.length)) }, async () => {
+    for (;;) {
+      const i = next;
+      next += 1;
+      if (i >= list.length) return;
+      out[i] = await fn(list[i], i);
+    }
+  });
+  await Promise.all(workers);
+  return out;
+}
+
+/** 跳过的原因 → 人话（**受控词表**：新增原因要在这里登记一行，别裸写字符串）。 */
+const AUDIT_SKIP_LABEL = Object.freeze({
+  empty: '账号读不到或没有版本（空壳）',
+  'no-layers': '没有图层数据',
+  'not-design': '不是设计稿图层树',
+  'sketch-format': 'Sketch 插件格式但取不出图层（已按同一套规则试过归一化）',
+  error: '读取失败',
+});
+
+/**
+ * 读取失败 → **受控的**跳过原因（能判准就判准，判不准才归 `error`）。
+ * 为什么要有它：蓝湖对"图片型条目"（只有一张 jpg、没有图层）**不报错**，而是在选版本时抛
+ * `SOURCE_UNAVAILABLE`（"版本 … 没有 json_url"）。不把它翻成人话，"跳过 40 张（读取失败 40）"
+ * 会看着像插件坏了，而不是"这个项目本来就有 40 张图，不是设计稿"。
+ */
+export function auditSkipReason(e) {
+  const code = String(e?.code ?? '');
+  const msg = String(e?.message ?? e ?? '');
+  if (code === 'SOURCE_UNAVAILABLE' || /没有 json_url/.test(msg)) return 'no-layers';
+  if (code === 'EMPTY_DETAIL' || /读不到这张稿/.test(msg)) return 'empty';
+  if (code === 'PROTOTYPE_NOT_DESIGN' || /原型/.test(msg)) return 'not-design';
+  return 'error';
+}
+
+/**
+ * 这棵树是不是**蓝湖 Sketch 插件格式**（`type: sketchPlugin`，图层在 `info[]` 里、没有 `artboard`）。
+ * ⚠️ 实测：这类稿子占某真实项目的一半以上（11/20）。**2026-10 起已真正解析**（见
+ *    `normalizeSketchPluginTree`）：`read_design` / `read_blocks` / `design_diff` / `audit` / `download_slices`
+ *    都走同一条归一化，输出与 Figma 稿同形。
+ *    唯一仍然读不出来的是"归一化后取不出子层"的那种：那种情况下各入口**明说**读不出（不再静默返回
+ *    "共 1 块：画板"），审计把它单列一类并在抬头里指明这是**已知空缺**，不是"这些稿不是设计稿"。
+ */
+function isSketchPluginTree(tree) {
+  return Boolean(tree) && (tree.type === 'sketchPlugin' || (!tree.artboard && Array.isArray(tree.info)));
+}
+
+/**
+ * **跨稿一致性审计** —— 扫一个项目的多张稿，报"设计系统漂移"。
+ *
+ * 成本：`scanned × 2` 次请求。`scanned = min(limit ?? auditDefaultImages, auditMaxImages)`，
+ * 且 `limit` 传再大也不会越过硬上限（本仓库铁律：不做全量拉取）。
+ */
+export async function auditProject(args = {}) {
+  const parsed = args.url ? parseProjectTarget(args.url) : null;
+  const projectId = args.projectId ?? parsed?.projectId ?? null;
+  if (!projectId) {
+    throw new LanhuError('需要 projectId，或一条蓝湖链接 url（两个都不给，无法定位项目）。', {
+      hint: '贴整条蓝湖链接最省事（里面的 tid/pid 自动解析）；也可以给 projectId（从 `lanhu_list_projects` 取）。',
+    });
+  }
+  const picked = await pickAccount({ account: args.account, projectId, teamId: args.teamId ?? parsed?.teamId ?? null });
+  const acct = picked.alias;
+  const opts = { cookie: args.cookie, account: acct };
+
+  // ① 列稿（1 次请求）—— 它同时给出 total，所以"被上限截断"这件事说得清楚
+  const listing = await listImages(projectId, opts);
+  const all = listing.images ?? [];
+  const total = all.length;
+  const rawLimit = Number(args.limit);
+  const requested = Number.isFinite(rawLimit) && rawLimit > 0 ? Math.floor(rawLimit) : LIMITS.auditDefaultImages;
+  const applied = Math.min(requested, LIMITS.auditMaxImages);
+  const selected = all.slice(0, applied);
+
+  // ② 逐稿读图层（每张 2 次请求；单张失败只记录，不炸整次审计）
+  const includeNoise = Boolean(args.includeNoise);
+  const results = await mapPool(selected, LIMITS.auditConcurrency, async (img) => {
+    try {
+      const detail = await imageDetail(projectId, img.imageId, opts);
+      if (!isReadableDetail(detail)) return { skipped: { imageId: img.imageId, name: img.name, reason: 'empty' } };
+      if (!detail.jsonUrl) return { skipped: { imageId: img.imageId, name: img.name, reason: 'no-layers' } };
+      const rawTree = await fetchJsonUrl(detail.jsonUrl, opts);
+      // ⭐ Sketch 插件格式：与 read_design / read_blocks / diff **同一条归一化** —— 既然别处能读，
+      //    审计就不能还把它整类跳过（那会自相矛盾：`read_blocks` 出 100 块，审计却说"读不了"）。
+      //    只有**归一化后仍然取不出子层**的，才落到 `sketch-format` 这一跳过类（原归类保持不变）。
+      let tree = rawTree;
+      if (isSketchPluginTree(rawTree)) {
+        const norm = normalizeSketchPluginTree(rawTree);
+        if (norm.layerCount === 0) return { skipped: { imageId: img.imageId, name: img.name, reason: 'sketch-format' } };
+        tree = norm.tree;
+      }
+      if (!tree?.artboard) return { skipped: { imageId: img.imageId, name: img.name, reason: 'not-design' } };
+      const layers = flattenArtboard(tree.artboard ?? tree);
+      const blocks = visibleBlocks(buildBlocks(layers), { includeNoise });
+      return {
+        scan: {
+          imageId: img.imageId,
+          imageName: detail.name ?? img.name ?? null,
+          width: round2(tree.artboard?.frame?.width ?? detail.width),
+          height: round2(tree.artboard?.frame?.height ?? detail.height),
+          blocks,
+        },
+      };
+    } catch (e) {
+      return {
+        skipped: {
+          imageId: img.imageId, name: img.name, reason: auditSkipReason(e),
+          error: String(e?.message ?? e).slice(0, LIMITS.auditErrorMax),
+        },
+      };
+    }
+  });
+  const scans = results.filter((r) => r?.scan).map((r) => r.scan);
+  const skipped = results.filter((r) => r?.skipped).map((r) => r.skipped);
+
+  // ③ 命名基础 + 可靠度（**这一步决定后面出不出明细**）
+  const comp = collectAuditComponents(scans);
+  const naming = comp.naming;
+  const totalBlocks = scans.reduce((n, s) => n + s.blocks.length, 0);
+  const reliability = auditReliability({ imagesWithLayers: comp.imagesWithLayers, totalBlocks, naming });
+  const reliable = reliability.reliable;
+  // 不可靠**分两种**，下一步完全不同（"去把层名规范一下"和"这些稿本来就没有图层"是两件事）：
+  //   · sample   —— 读到图层的稿太少 / 一个块都没有（多半是整页 jpg 图片型条目）；
+  //   · naming   —— 有块，但块名大多是工具默认名。
+  const primaryReason = reliable ? null
+    : (comp.imagesWithLayers < LIMITS.auditMinImagesForAudit || totalBlocks === 0 ? 'sample' : 'naming');
+  const allowWeak = Boolean(args.allowWeakNaming) && primaryReason === 'naming';
+  // 不可靠时**默认一项都不出**；只有"命名不可靠"才能靠 allowWeakNaming 放开不看层名的那几项
+  // （样本本身是空的时候放开也没有数据可出 —— 那只会印出一堆 0）。
+  const suppressed = reliable ? [] : (allowWeak ? [...AUDIT_NAME_DEPENDENT] : [...AUDIT_CATEGORIES]);
+  const show = (cat) => !suppressed.includes(cat);
+  const suppressedPayload = () => ({ suppressed: true, drift: false, reason: reliability.reasons.join(' ') });
+
+  const { findings: specFindings, converged } = show('componentSpec')
+    ? auditComponentSpecs(comp.participated) : { findings: [], converged: null };
+  const font = show('fontScale') ? auditFontScale(scans) : null;
+  const colorMap = show('colorDrift') ? collectAuditColors(scans) : new Map();
+  const colorEntries = [...colorMap.values()].sort((a, b) => b.count - a.count);
+  const colorKept = colorEntries.slice(0, LIMITS.auditMaxColors);
+  const clusters = show('colorDrift') ? nearColorClusters(colorKept) : [];
+  const spacing = show('spacingScale') ? auditSpacing(scans) : null;
+  const radius = show('radiusFamily') ? auditRadiusFamily(scans) : null;
+
+  const findings = {
+    componentSpec: show('componentSpec') ? {
+      suppressed: false,
+      drift: specFindings.length > 0,
+      // **判据写进结果**：读者不必猜"你说的同一个组件是什么意思"
+      basis: '层名归一化后相同（NFKC + 折叠空白 + 转小写）',
+      basisExcludes: '工具默认名（Rectangle 12 / 矩形 3 / Path 3×8）、空名、归一化后 < 2 字的层名',
+      findings: specFindings.slice(0, LIMITS.auditMaxFindings),
+      findingCount: specFindings.length,
+      truncatedFindings: Math.max(0, specFindings.length - LIMITS.auditMaxFindings),
+      converged,
+      participatedNames: comp.participated.length,
+      participatedBlocks: comp.participatedBlocks,
+      notParticipating: { autoName: naming.auto, emptyName: naming.empty, thin: comp.thinBlocks },
+    } : { ...suppressedPayload(), findings: [], findingCount: 0, converged: null },
+    fontScale: font ? { suppressed: false, ...font } : suppressedPayload(),
+    colorDrift: show('colorDrift') ? {
+      suppressed: false,
+      drift: clusters.length > 0,
+      threshold: LIMITS.auditNearColorDistance,
+      metric: 'RGB 欧氏距离',
+      scope: '只在**同一透明度**之间比较（实色与半透明不是同一个色值）',
+      linkage: '完全链接：簇内**任意两个**都 ≤ 阈值（不是连通分量 —— 那会连成链，把"肉眼分不出"变成假话）',
+      distinct: colorEntries.length,
+      compared: colorKept.length,
+      truncatedColors: Math.max(0, colorEntries.length - colorKept.length),
+      clusters: clusters.slice(0, LIMITS.auditMaxFindings),
+      clusterCount: clusters.length,
+    } : suppressedPayload(),
+    spacingScale: spacing ? { suppressed: false, ...spacing } : suppressedPayload(),
+    radiusFamily: radius ? { suppressed: false, ...radius, note: '参考项：圆角刻度不是规范，只是"常见 4px 栅格圆角"的一份清单' } : suppressedPayload(),
+  };
+
+  const anyDrift = AUDIT_CATEGORIES.some((c) => show(c) && findings[c]?.drift === true);
+
+  // 「未发现漂移」时要说**凭什么** —— 一句话给全每一类的收敛依据
+  const noDriftBrief = [];
+  if (show('componentSpec')) noDriftBrief.push(`${comp.participated.length} 个跨稿组件的圆角/高度各自收敛`);
+  if (font) noDriftBrief.push(`${font.distinct} 种字号都在常用档上`);
+  if (show('colorDrift')) noDriftBrief.push(`${colorEntries.length} 个色值两两 RGB 距离都 > ${LIMITS.auditNearColorDistance}`);
+  if (spacing) noDriftBrief.push(`间距都在 ${spacing.grid} 的倍数上`);
+  if (radius) noDriftBrief.push('圆角都在常见刻度上');
+
+  // 跳过原因汇总（人读一行说清"哪些没扫成、为什么"）
+  const skipBuckets = {};
+  for (const s of skipped) skipBuckets[s.reason] = (skipBuckets[s.reason] ?? 0) + 1;
+  const skippedBrief = Object.entries(skipBuckets)
+    .map(([k, v]) => `${AUDIT_SKIP_LABEL[k] ?? k} ${v}`).join(' · ');
+
+  const a = {
+    ok: true,
+    format: 'audit',
+    projectId,
+    projectName: listing.projectName ?? null,
+    // 成本必须受控且**说得明白**：扫了多少 / 共多少 / 有没有被截断 / 上限是多少
+    scanned: scans.length,
+    attempted: selected.length,
+    total,
+    truncated: total > applied,
+    limitRequested: requested,
+    limitApplied: applied,
+    limitClamped: requested > LIMITS.auditMaxImages,
+    limitDefault: LIMITS.auditDefaultImages,
+    limitHard: LIMITS.auditMaxImages,
+    imagesWithLayers: comp.imagesWithLayers,
+    blocks: totalBlocks,
+    naming,
+    reliable,
+    reasons: reliability.reasons,
+    primaryReason,
+    weakMode: !reliable && allowWeak,
+    suppressed,
+    nameDependent: [...AUDIT_NAME_DEPENDENT],
+    basis: {
+      component: '层名归一化后相同（NFKC + 折叠空白 + 转小写）',
+      minComponentImages: LIMITS.auditMinComponentImages,
+      minComponentBlocks: LIMITS.auditMinComponentBlocks,
+      minNamedShare: LIMITS.auditMinNamedShare,
+    },
+    findings,
+    drift: Object.fromEntries(AUDIT_CATEGORIES.map((c) => [c, findings[c]?.drift === true])),
+    driftedCategories: AUDIT_CATEGORIES.filter((c) => show(c) && findings[c]?.drift === true),
+    anyDrift,
+    noDriftBrief,
+    skipped,
+    skippedBrief,
+    skipBuckets,
+    account: acct ?? null,
+    accountBy: picked.by ?? null,
+  };
+  const text = renderAudit(a);
+  a.text = acct ? `${text}\n\n— 账号：**${acct}**${picked.by === 'explicit' ? '（显式指定）' : `（自动判定 · ${picked.by}）`}` : text;
+  a.textBytes = Buffer.byteLength(a.text, 'utf8');
+  return a;
+}
+
+/* ---------------------------------------------------------------- 渲染 ---- */
+
+/** 计数分布 → `8px（7 张）· 12px（3 张）`（值带单位、括号里是**张数**，不是块数）。 */
+function spreadText(values, unit = 'px') {
+  return (values ?? []).map((v) => `${v.value}${unit}（${v.imageCount} 张）`).join(' · ');
+}
+
+function spreadTextPlain(values, unit = '') {
+  return (values ?? []).map((v) => `${v.value}${unit}（${v.count}）`).join(' · ');
+}
+
+/** 审计报告的抬头（扫描范围 / 命名基础 / 判据）。 */
+function auditHeader(a) {
+  const L = [];
+  const n = a.naming ?? {};
+  L.push(`# 设计系统审计 — ${a.projectName ?? a.projectId}`);
+  L.push('');
+  L.push(`· 扫描：**${a.scanned} / ${a.attempted} 张**已尝试、项目共 **${a.total}** 张`
+    + (a.truncated
+      ? ` → **已被上限截断**（本次上限 ${a.limitApplied}；默认 ${a.limitDefault}、硬上限 ${a.limitHard}）`
+      : '（未截断）')
+    + (a.limitClamped ? ` ⚠️ limit 传的 ${a.limitRequested} **被硬上限 ${a.limitHard} 压回**` : ''));
+  L.push(`· 读到图层：${a.imagesWithLayers} 张 · 块 ${a.blocks} 个`
+    + (a.skipped?.length ? ` · 跳过 ${a.skipped.length} 张（${a.skippedBrief}）` : ''));
+  L.push(`· 命名基础：可靠块名 **${n.named}/${n.total}** 块（${Math.round((n.namedShare ?? 0) * 100)}%）· 工具默认名 ${n.auto} · 空名 ${n.empty}`);
+  if (a.skipBuckets?.['no-layers']) {
+    L.push(`> 注：其中 ${a.skipBuckets['no-layers']} 张**没有图层数据**（蓝湖里常见的"整页 jpg 图片型条目"）——`
+      + '它们不进统计，也不等于这些稿没被扫到。');
+  }
+  if (a.skipBuckets?.['sketch-format']) {
+    L.push(`> ⚠️ 另有 ${a.skipBuckets['sketch-format']} 张是**蓝湖 Sketch 插件格式**（\`type: sketchPlugin\`，图层在 \`info[]\` 里）`
+      + '**且归一化后仍取不出可用子层** —— 已按与 `lanhu_read_blocks` **同一套**映射规则试图解析，仍为空，故单列一类、**没有被统计**。'
+      + '（\`lanhu_read_blocks\` 对它们会**明说**"没读到任何图层"、不再静默给一个"只有画板"的空结果 —— 这是**已知空缺**，不是"这些不是设计稿"。）');
+  }
+  L.push(`· 判据：同一组件 = **${a.basis?.component}**；工具默认名（\`Rectangle 12\` / \`矩形 3\`）与空名**一律不认**（不硬凑）。`);
+  return L;
+}
+
+/** 一个类别的正文（**不可靠时这里只出一行"已跳过"**）。 */
+export function auditSectionLines(a, cat) {
+  const f = a.findings?.[cat] ?? {};
+  const idx = AUDIT_CATEGORIES.indexOf(cat);
+  const L = [`## ${AUDIT_NUMERALS[idx] ?? idx + 1} ${AUDIT_CATEGORY_LABEL[cat]}`];
+  if (f.suppressed) {
+    L.push(`· 已跳过（${f.reason || '本次审计不可靠'}）`);
+    L.push('');
+    return L;
+  }
+  if (cat === 'componentSpec') {
+    for (const e of f.findings ?? []) {
+      for (const d of e.dims) {
+        L.push(`· **${e.name}** ${d.label}：${spreadText(d.values)}${d.truncatedValues > 0 ? ` · …还有 ${d.truncatedValues} 种` : ''}`);
+        L.push(d.tie
+          ? `  → 各取值出现次数并列，**无法判定多数派** —— 需人工确认（共 ${d.total} 块）`
+          : `  → 建议以 **${d.majority}px** 为准（多数派 ${d.majorityCount}/${d.total} 块）`);
+        for (const v of d.values.slice(0, LIMITS.auditMaxExamples)) {
+          L.push(`  · 例：${v.value}px → ${(v.examples ?? []).join('、')}${v.imageCount > (v.examples ?? []).length ? `（等 ${v.imageCount} 张）` : ''}`);
+        }
+      }
+    }
+    if ((f.findings ?? []).length === 0) L.push(`· **未发现漂移**：${f.participatedNames ?? 0} 个参与组件名的圆角与高度各自收敛。`);
+    if (f.truncatedFindings > 0) L.push(`· …还有 ${f.truncatedFindings} 条同类发现（已达每条上限，只给计数）`);
+    L.push(`· 参与：${f.participatedNames ?? 0} 个组件名 / ${f.participatedBlocks ?? 0} 块；`
+      + `未参与：工具默认名 ${f.notParticipating?.autoName ?? 0} 块 · 空名 ${f.notParticipating?.emptyName ?? 0} 块 · 单张稿或样本太少 ${f.notParticipating?.thin ?? 0} 块`);
+    return L;
+  }
+  if (cat === 'fontScale') {
+    if (!f.drift) {
+      L.push(`· **未发现漂移**：${f.distinct} 种字号（共 ${f.total} 处）都在常用档上`
+        + `（阈值：种类 > ${LIMITS.auditHealthyFontSizes} 或 一次性野值 ≥ ${LIMITS.auditOneOffMinCount} 个）`);
+      L.push(`· 阶梯：${spreadTextPlain(f.sizes, 'px')}`);
+      return L;
+    }
+    L.push(`· 全项目 **${f.distinct}** 种字号（共 ${f.total} 处）：${spreadTextPlain(f.sizes, 'px')}${f.truncatedValues > 0 ? ` · …还有 ${f.truncatedValues} 种` : ''}`);
+    if (f.oneOffCount > 0) {
+      L.push(`· 只出现 ${LIMITS.auditOneOffMaxCount} 次的 **${f.oneOffCount}** 种：${f.oneOffs.map((o) => o.value).join(' / ')}`);
+      const sug = f.oneOffs.filter((o) => o.nearest !== null);
+      if (sug.length) L.push(`  → 建议收敛：${sug.map((o) => `${o.value}→${o.nearest}`).join('、')}（"常用档" = 出现 ≥ ${LIMITS.auditLadderMinCount} 次的字号）`);
+      for (const o of f.oneOffs.slice(0, LIMITS.auditMaxExamples)) {
+        L.push(`  · 例：${o.value}px → ${(o.examples ?? []).join('、')}`);
+      }
+    } else {
+      L.push(`· 没有只出现 ${LIMITS.auditOneOffMaxCount} 次的野值；但**种类数 ${f.distinct} 超过常见台阶上限 ${LIMITS.auditHealthyFontSizes}** —— 阶梯偏长，可考虑合并相邻档。`);
+    }
+    L.push(`· 常用档（出现 ≥ ${LIMITS.auditLadderMinCount} 次）：${f.ladder.join(' / ') || '（无）'}`);
+    return L;
+  }
+  if (cat === 'colorDrift') {
+    L.push(`> 口径：${f.metric} ≤ ${f.threshold} 视为"肉眼分不出"；${f.scope}。`);
+    L.push(`> 聚类：${f.linkage}。`);
+    if (!f.drift) {
+      L.push(`· **未发现漂移**：${f.distinct} 个色值两两 ${f.metric} 都 > ${f.threshold}（肉眼可分辨）`);
+      return L;
+    }
+    for (const c of f.clusters) {
+      L.push(`· ${c.members.map((m) => `${m.key}（${m.count} 块 / ${m.imageCount} 张${m.roles.length ? ` · ${m.roles.join('/')}` : ''}）`).join(' ≈ ')}`
+        + ` · 组内**任意两个**都 ≤ ${c.maxDistance}（阈值 ${f.threshold}，肉眼分不出）`);
+      L.push(c.majority
+        ? `  → 建议统一为 **${c.majority}**（多数派；共 ${c.members.reduce((n, m) => n + m.count, 0)} 处）`
+        : '  → 各值出现次数并列，**无法判定多数派** —— 需人工确认');
+      const minor = c.members.filter((m) => m.key !== c.majority).slice(0, LIMITS.auditMaxExamples);
+      for (const m of minor) L.push(`  · 例：${m.key} → ${(m.examples ?? []).join('、')}`);
+    }
+    if (f.clusterCount > f.clusters.length) L.push(`· …还有 ${f.clusterCount - f.clusters.length} 簇（已达上限，只给计数）`);
+    L.push(`· 色板：${f.distinct} 个色值${f.truncatedColors > 0 ? `（只比了出现最多的 ${f.compared} 个）` : ''}`);
+    return L;
+  }
+  if (cat === 'spacingScale') {
+    L.push(`> 口径：几何相邻间距（另一轴有重叠），且只统计 ≤ ${f.maxDistance}px 的 —— 几百 px 的"间距"是版面留白，不是尺度。`);
+    L.push(`> **参考项**：${f.grid}px 栅格是常见约定、不是硬规范（大屏 / 自由排版项目常常不在栅格上）—— 本项只报"有哪些值、哪些不在栅格上"，不下判决。`);
+    if (!f.drift) {
+      L.push(`· **未发现漂移**：${f.distinct} 个间距值（共 ${f.total} 条）都在 ${f.grid} 的倍数上`);
+      if (f.top?.length) L.push(`· 主要尺度：${spreadTextPlain(f.top)}`);
+      if (f.skippedImages) L.push(`· 有 ${f.skippedImages} 张稿块数过多（> ${LIMITS.auditSpacingMaxBlocks}）未参与间距统计`);
+      return L;
+    }
+    L.push(`· 出现 ${f.distinct} 个间距值（共 ${f.total} 条）；不在 ${f.grid} 的倍数上的 **${f.offGridCount}** 个：${spreadTextPlain(f.offGrid)}`);
+    for (const v of f.offGrid.slice(0, LIMITS.auditMaxExamples)) L.push(`  · 例：${v.value}px → ${(v.examples ?? []).join('、')}`);
+    L.push(`· 主要尺度：${spreadTextPlain(f.top)}`);
+    if (f.skippedImages) L.push(`· 有 ${f.skippedImages} 张稿块数过多（> ${LIMITS.auditSpacingMaxBlocks}）未参与间距统计`);
+    return L;
+  }
+  // radiusFamily
+  L.push(`· 出现 ${f.distinct} 个圆角值（共 ${f.total} 处）：${spreadTextPlain(f.top)}`);
+  if (!f.drift) L.push(`· **未发现特例**：都在常见刻度上（${f.scale.join('/')}）`);
+  else {
+    L.push(`· 不在常见刻度上的 **${f.offScaleCount}** 个（**参考项，不是错误**）：${spreadTextPlain(f.offScale)}`);
+    for (const v of f.offScale.slice(0, LIMITS.auditMaxExamples)) L.push(`  · 例：${v.value}px → ${(v.examples ?? []).join('、')}`);
+  }
+  return L;
+}
+
+/**
+ * 审计报告 → 人读文本。
+ *
+ * ⚠️ `reliable === false` 时**默认不出任何明细** —— 那是本功能最重要的一条纪律：
+ * 按不可靠的层名归组得到的"5 种圆角"，会被 AI 当成事实去改代码。
+ */
+export function renderAudit(a) {
+  const L = auditHeader(a);
+  const active = AUDIT_CATEGORIES.filter((c) => !(a.suppressed ?? []).includes(c));
+  if (!a.reliable && active.length === 0) {
+    L.push('');
+    L.push('⚠️ **本项审计不可靠 —— 不出明细。**');
+    for (const r of a.reasons ?? []) L.push(`· ${r}`);
+    if (a.primaryReason === 'naming') {
+      L.push('· 为什么不出明细：跨稿"同一组件"的判据是**层名**；名字大多是工具默认名时，'
+        + '按它归组会得到"5 种圆角"这种**看着精确、其实认错组件**的结论 —— 比不给更糟。');
+      L.push('· 下一步：① 让设计师把关键组件（主按钮 / 卡片 / 标签…）的层名规范化后重跑；'
+        + '② 只想看**不依赖层名**的那几项（字号阶梯 / 近重复色 / 间距 / 圆角）→ 传 `allowWeakNaming: true`，'
+        + '那时只会出这几项，并明确标注「组件规格一项已跳过」。');
+    } else {
+      L.push('· 为什么不出明细：这项审计要**能读到图层**的稿当样本。'
+        + '图层的圆角 / 字号 / 色值 / 间距在一张位图里根本不存在 —— 那里没有"设计系统"可谈，'
+        + '硬报出来的数字只能是编的。');
+      L.push('· 下一步：① 换一个**有图层数据**的项目，或让设计师把这些页面导出成设计稿（Figma / Sketch 源）后重跑；'
+        + '② 这些条目在蓝湖里就是整页图片 —— `lanhu_read_blocks` / `lanhu_download_slices` 同样拿不到图层数据，'
+        + '要还原得从设计源文件入手。');
+    }
+    return L.join('\n');
+  }
+  if (!a.reliable) {
+    L.push('');
+    L.push(`⚠️ **本次审计不可靠（${(a.reasons ?? []).join(' ')}）**`);
+    L.push(`· 依赖层名的「${AUDIT_CATEGORY_LABEL.componentSpec}」**已跳过**；`
+      + `下面只有 ${active.map((c) => AUDIT_CATEGORY_LABEL[c]).join(' / ')} —— 它们只看块的属性，不看层名。`);
+  } else if (!a.anyDrift) {
+    L.push('');
+    L.push(`**未发现漂移**：${(a.noDriftBrief ?? []).join(' · ')}。`);
+  }
+  L.push('');
+  for (const cat of AUDIT_CATEGORIES) {
+    L.push(...auditSectionLines(a, cat));
+    L.push('');
+  }
+  while (L.length && L[L.length - 1] === '') L.pop();
+  return L.join('\n');
 }
 
 /* ==========================================================================
@@ -4437,13 +6869,34 @@ export async function downloadSlices(args = {}) {
   const target = resolveTarget({ projectId, imageId, url });
   const picked = await pickAccount({ ...args, projectId: target.projectId, imageId: target.imageId, teamId: target.teamId });
   const acct = picked.alias;
-  const { detail, tree } = await fetchDesignTree(target.projectId, target.imageId, {
+  const { detail, tree, sourceFormat, unsupported } = await fetchDesignTree(target.projectId, target.imageId, {
     cookie, account: acct, version: args.version, urlVersionId: target.versionId, teamId: target.teamId, pageId: args.pageId,
   });
+  // ⭐ 「解析不出图层」→ **明说**，不许返回"下载了 0 张、一切正常"这种看着像成功的结果：
+  //    对着认不出的树，`tree.assets` 必然是空的，`ok:true, downloaded:0` 只会让人以为"这张稿没有切图"。
+  if (unsupported) {
+    const meta = { name: detail?.name ?? null, projectId: target.projectId, imageId: target.imageId, width: detail?.width ?? null, height: detail?.height ?? null, account: acct ?? null };
+    const text = renderDesignUnsupported(unsupported, meta);
+    return {
+      ok: false, unsupported: true, sourceFormat: unsupported.format, code: unsupported.code,
+      downloaded: 0, skipped: 0, dir: null, files: [], backgroundColor: null, warnings: [], translucent: [],
+      projectId: target.projectId, imageId: target.imageId, account: acct ?? null,
+      note: `这张稿**没能解析出图层**（${unsupported.what}），所以拿不到切图清单 —— `
+        + '**这不等于"这张稿没有切图"**。详见下方 text。',
+      text,
+    };
+  }
   const urls = [...new Set((tree.assets ?? []).filter((u) => typeof u === 'string'))];
 
   if (urls.length === 0) {
-    return { ok: true, downloaded: 0, skipped: 0, dir: null, files: [], backgroundColor: null, warnings: [], translucent: [], note: '该稿没有可导出的切图（assets 为空）。' };
+    return {
+      ok: true, downloaded: 0, skipped: 0, dir: null, files: [], backgroundColor: null, warnings: [], translucent: [],
+      ...(sourceFormat ? { sourceFormat } : {}),
+      note: sourceFormat === 'sketchPlugin'
+        // 能解析、但确实没有可导出图 —— 与"解析不出来"是**两回事**，这里说清是哪一种。
+        ? '这是**蓝湖 Sketch 插件导出**的稿子，已正常解析出图层，但它没有标记为切图的图层（`bitmap` / 带 `image.imageUrl` 的组都没有），所以资产清单为空。'
+        : '该稿没有可导出的切图（assets 为空）。',
+    };
   }
 
   const dir = outDir ?? path.join(process.cwd(), 'assets', 'lanhu');
@@ -4564,6 +7017,8 @@ export async function downloadSlices(args = {}) {
     ok: true,
     dir,
     mappingPath,
+    // 稿子的来源格式（只在非空时加键：普通稿的返回体逐字节不变）
+    ...(sourceFormat ? { sourceFormat } : {}),
     account: acct ?? null,
     accountBy: picked.by ?? null,
     downloaded: seenHash.size,
@@ -5823,6 +8278,148 @@ export async function verifyBlocks(args = {}) {
 }
 
 /* ==========================================================================
+ * 版本自述（面板标题栏：当前版本 + 「有更新」提示）
+ *
+ * 三个约束，缺一个就会出事故：
+ *   ① 当前版本**只从 package.json 读**（相对本模块解析）—— 硬编码的版本号会悄悄过期，
+ *      而且没有任何东西会报错。自检用「临时 package.json」把这条钉住。
+ *   ② npm 查询**必须缓存**（绝不允许每次渲染都去打 registry），且**绝不抛**：
+ *      它是 /lanhu/status 的附加项，登录态才是主职责，附加项失败不能拖挂主职责。
+ *   ③ 版本比较**按语义**（0.5.10 > 0.5.9）；遇到预发布（-rc.1）或解析不了的版本
+ *      **不给判断**（updateAvailable: null）—— 宁可不提示，也不误报。
+ * ========================================================================== */
+
+/** 插件自己的 package.json：相对**本模块**解析，源码直跑与装进 profile 都成立。 */
+export function pluginPackagePath() {
+  return fileURLToPath(new URL('./package.json', import.meta.url));
+}
+
+/** 当前版本。读不到给 null（调用方降级），**不抛**。 */
+export function readPluginVersion(opts = {}) {
+  const file = opts.packagePath ?? pluginPackagePath();
+  try {
+    const json = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const v = json && typeof json.version === 'string' ? json.version.trim() : '';
+    return v || null;
+  } catch {
+    return null;
+  }
+}
+
+/** MAJOR.MINOR.PATCH[-prerelease][+build]；解析不了返回 null。 */
+const SEMVER_RE = /^v?(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/;
+
+export function parseSemver(value) {
+  if (typeof value !== 'string') return null;
+  const m = SEMVER_RE.exec(value.trim());
+  if (!m) return null;
+  return {
+    major: Number(m[1]), minor: Number(m[2]), patch: Number(m[3]),
+    pre: m[4] ? m[4].split('.') : [],
+  };
+}
+
+/** 预发布标识符比较（semver §11）：数字 < 字母数字；数字按数值比。 */
+function comparePreIdent(a, b) {
+  const an = /^\d+$/.test(a);
+  const bn = /^\d+$/.test(b);
+  if (an && bn) return Number(a) === Number(b) ? 0 : (Number(a) < Number(b) ? -1 : 1);
+  if (an) return -1;
+  if (bn) return 1;
+  return a === b ? 0 : (a < b ? -1 : 1);
+}
+
+/**
+ * 语义化比较：a<b → -1，a==b → 0，a>b → 1。
+ * **任一侧解析不了就返回 null**（不瞎判），调用方据此放弃「有没有更新」这个结论。
+ */
+export function compareSemver(a, b) {
+  const x = parseSemver(a);
+  const y = parseSemver(b);
+  if (!x || !y) return null;
+  for (const k of ['major', 'minor', 'patch']) {
+    if (x[k] !== y[k]) return x[k] < y[k] ? -1 : 1;
+  }
+  if (x.pre.length === 0 && y.pre.length === 0) return 0;
+  if (x.pre.length === 0) return 1;      // 有预发布 < 无预发布（1.0.0-rc.1 < 1.0.0）
+  if (y.pre.length === 0) return -1;
+  const n = Math.min(x.pre.length, y.pre.length);
+  for (let i = 0; i < n; i += 1) {
+    const c = comparePreIdent(x.pre[i], y.pre[i]);
+    if (c !== 0) return c;
+  }
+  return x.pre.length === y.pre.length ? 0 : (x.pre.length < y.pre.length ? -1 : 1);
+}
+
+/** 稳定版（无预发布标识）才参与「有没有更新」的判断。 */
+export function isStableVersion(value) {
+  const p = parseSemver(value);
+  return !!p && p.pre.length === 0;
+}
+
+/**
+ * 有没有更新。**拿不准就 null**（预发布 / 解析不了）：
+ * 「不提示」是可接受的降级，「误报有更新」不是。
+ */
+export function computeUpdateAvailable(current, latest) {
+  if (!isStableVersion(current) || !isStableVersion(latest)) return null;
+  const c = compareSemver(current, latest);
+  return c === null ? null : c < 0;
+}
+
+export const NPM_PACKAGE = 'dsh-lanhu';
+export const NPM_LATEST_URL = `https://registry.npmjs.org/${NPM_PACKAGE}/latest`;
+/** 命中缓存 8 小时（版本不会分钟级变化）；失败只缓存 5 分钟（别让一次网络抖动把提示锁死一天）。 */
+export const VERSION_CACHE_TTL = 8 * 60 * 60 * 1000;
+export const VERSION_FAIL_TTL = 5 * 60 * 1000;
+/** registry 拿不到就放弃 —— 这是附加项，不值得让面板等。 */
+export const VERSION_FETCH_TIMEOUT = 3000;
+
+let npmVersionCache = null;   // { at, latest, ok }
+
+/** 只给自检用：清掉进程内缓存，好让「缓存真的生效」可被断言。 */
+export function resetNpmVersionCache() {
+  npmVersionCache = null;
+}
+
+/**
+ * npm 上的 latest 版本。**只返回版本串或 null，绝不抛**；结果进进程内缓存。
+ * opts 里的 now / fetchImpl / ttlMs / failTtlMs / cache 都是给自检做依赖注入用的。
+ */
+export async function npmLatestVersion(opts = {}) {
+  const now = typeof opts.now === 'number' ? opts.now : Date.now();
+  const useCache = opts.cache !== false;
+  if (useCache && npmVersionCache) {
+    const ttl = npmVersionCache.ok ? (opts.ttlMs ?? VERSION_CACHE_TTL) : (opts.failTtlMs ?? VERSION_FAIL_TTL);
+    if (now - npmVersionCache.at < ttl) return npmVersionCache.latest;
+  }
+  const fetchImpl = opts.fetchImpl ?? fetch;
+  let latest = null;
+  try {
+    const res = await fetchImpl(NPM_LATEST_URL, {
+      headers: { accept: 'application/json' },
+      signal: AbortSignal.timeout(opts.timeout ?? VERSION_FETCH_TIMEOUT),
+    });
+    if (res && res.ok !== false) {
+      const j = typeof res.json === 'function' ? await res.json() : null;
+      const v = j && typeof j.version === 'string' ? j.version.trim() : '';
+      if (v) latest = v;
+    }
+  } catch {
+    latest = null;   // 网络/超时/非 JSON：一律降级，绝不外抛
+  }
+  if (useCache) npmVersionCache = { at: now, latest, ok: latest !== null };
+  return latest;
+}
+
+/** 面板标题栏要的三件事。**任何一步失败都不抛**（npm 挂了只会让 latest/updateAvailable 变 null）。 */
+export async function pluginVersionInfo(opts = {}) {
+  const version = readPluginVersion(opts);
+  const latest = await npmLatestVersion(opts);
+  return { version, latest, updateAvailable: computeUpdateAvailable(version, latest) };
+}
+
+/* ==========================================================================
  * 9. CLI
  * ========================================================================== */
 
@@ -5977,6 +8574,45 @@ async function cmdBlocks({ args, cookie }) {
     console.log(r.text);
     console.log('');
     console.log(`— blocks 模式 | ${r.layerCount} 层 → ${r.blockCount} 块（碎片 ${r.noiseCount}） | 输出 ${kb(r.text)}`);
+  }
+  return r;
+}
+
+/** `diff` 命令 —— **同一张稿的两个版本**对比（回答"这次设计改了什么"）。 */
+async function cmdDiff({ args, cookie }) {
+  const r = await diffDesign({
+    projectId: args.project, imageId: args.image, url: args.url,
+    from: args.from, to: args.to,
+    includeNoise: Boolean(args.all),
+    cookie, account: args.account,
+  });
+  if (args.json) printJson(r);
+  else {
+    console.log(r.text);
+    console.log('');
+    console.log(`— diff 模式 | v${String(r.from?.id ?? '').slice(0, 8)} → v${String(r.to?.id ?? '').slice(0, 8)}`
+      + ` | 未变 ${r.counts.unchanged} / 变化 ${r.counts.changed.blocks} / 新增 ${r.counts.added} / 删除 ${r.counts.removed}`
+      + ` | 匹配可靠度 ${r.reliable ? '可信' : '**不可靠**'} | 输出 ${kb(r.text)}`);
+  }
+  return r;
+}
+
+/** `audit` 命令 —— **跨稿一致性审计**（扫一个项目的多张稿，报"设计系统漂移"）。 */
+async function cmdAudit({ args, cookie }) {
+  const r = await auditProject({
+    projectId: args.project, url: args.url,
+    limit: args.limit === undefined ? undefined : Number(args.limit),
+    includeNoise: Boolean(args.all),
+    allowWeakNaming: Boolean(args['allow-weak-naming']),
+    cookie, account: args.account,
+  });
+  if (args.json) printJson(r);
+  else {
+    console.log(r.text);
+    console.log('');
+    console.log(`— audit 模式 | 扫描 ${r.scanned}/${r.total}${r.truncated ? '（截断）' : ''}`
+      + ` | 漂移 ${r.driftedCategories.length} 类：${r.driftedCategories.map((c) => AUDIT_CATEGORY_LABEL[c]).join(' / ') || '无'}`
+      + ` | ${r.reliable ? '可信' : '**不可靠**'} | 输出 ${kb(r.text)}`);
   }
   return r;
 }
@@ -6213,6 +8849,8 @@ const CLI_COMMANDS = {
   'search': cmdSearch,
   'read': cmdRead,
   'blocks': cmdBlocks,
+  'diff': cmdDiff,
+  'audit': cmdAudit,
   'product-docs': cmdProductDocs,
   'product-doc': cmdProductDoc,
   'log': cmdLog,
@@ -6246,6 +8884,19 @@ const USAGE = `dsh-lanhu —— 蓝湖设计稿读取
            （x/y 各自独立缩放，**非等比** —— 长宽比不同的两个坐标系也能对上）
   blocks   [--url "<蓝湖链接>" | --project <id> --image <id>] [--region y0,y1] [--kind card,pill] [--min-width N] [--all]
            块级清单：卡片/胶囊/文本/图片/分割线，每块六项属性（圆角·大小·文字色·字号·底色·边框）
+  diff     [--url "<蓝湖链接>" | --project <id> --image <id>] --from <版本id> [--to <版本id>] [--all]
+           **同一张稿的两个版本**对比（--to 省略 = 最新版 latest）：尺寸/圆角·颜色·布局·文字·边框·结构·新增·删除，
+           每类只列**有变化的**、数值给「从→到」；零变化只给一句汇总，两版无差异时**明说"两版一致"**。
+           --from 给不存在的版本 id 会**报错**（不静默回退 latest）。输出里报**匹配可靠度**
+           （精确/近似/无法匹配）；两版大面积对不上时**明说"逐块对比不可靠"**、不出明细表。
+   audit    [--url "<蓝湖链接>" | --project <id>] [--limit N] [--all] [--allow-weak-naming]
+            **跨稿一致性审计**（蓝湖不提供）：扫一个项目的多张稿，报「设计系统漂移」——
+            ① 同一组件多种规格（圆角/高度分布 + 建议以哪个为准）② 字号阶梯（含只出现 1 次的野值）
+            ③ 近重复色（RGB 距离阈值）④ 间距尺度 ⑤ 圆角家族。
+            同一组件 = **层名归一化后相同**；工具默认名（Rectangle 12 / 矩形 3）与空名**一律不认**。
+            ⚠️ 成本：**扫 N 张 = 2N 次请求** → 默认只扫限额张数，--limit 可加但**不超过硬上限**；
+            输出里写明 scanned / total / 是否被截断。命名不可靠时**判不可靠、不出明细**
+            （--allow-weak-naming 只放开不看层名的那几项）。
   product-docs --url "<原型链接>" | --project <pid> --team <tid>
            列**产品文档（Axure 原型 / PRD）**——不是设计稿。含 docId / 最新版本 / 版本数 / 更新时间
   product-doc  --url "<原型链接>" [--page-id <id>] [--page-name <名>] [--limit N] [--version <id>]
@@ -6254,6 +8905,7 @@ const USAGE = `dsh-lanhu —— 蓝湖设计稿读取
            读原型的页面树 + 命中页正文（**先不带 --page-id 看树**，一份原型常有上百个节点）
            --page-id 跨版本稳定，推荐；正文取自页面 HTML（data.js 里常为空）
   read/blocks/product-doc/slices 均可加 --version <版本id>（默认 latest；给错会报错，不静默回退）
+             （**diff 不认 --version** —— 它要比两个版本，用 --from / --to）
   read/blocks 可加 --dual-units：**宽表**的尺寸列也给双单位（形如 120×152px / 240×304rpx）
              换算比按**画板宽度**算（rpx = px × 750 ÷ 画板宽；宽 375 的稿即 ×2），输出里会写明基准。
              「间距一览」与 region 输出**始终**双单位 —— 那两处就是要直接抄进 CSS 的。

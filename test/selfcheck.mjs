@@ -41,6 +41,47 @@ const {
   parseColor,
   buildBlocks,
   renderBlocks,
+  visibleBlocks,
+  contrastRatio,
+  relativeLuminance,
+  compositeOver,
+  isLargeText,
+  shadeToReach,
+  parentIndexOf,
+  effectiveBackground,
+  auditTextContrast,
+  renderContrastDigest,
+  versionInfo,
+  metaSuffix,
+  readBlocks,
+  readDesign,
+  downloadSlices,
+  normalizeSketchPluginTree,
+  diffDesign,
+  diffBlockItems,
+  matchVersionBlocks,
+  matchApproxBlocks,
+  diffReliability,
+  renderDiff,
+  DIFF_CATEGORIES,
+  DIFF_CATEGORY_LABEL,
+  // —— 设计系统审计（第 3 步）——
+  auditProject,
+  auditComponentSpecs,
+  collectAuditComponents,
+  auditFontScale,
+  collectAuditColors,
+  nearColorClusters,
+  auditSpacing,
+  auditRadiusFamily,
+  auditReliability,
+  auditSkipReason,
+  isAutoLayerName,
+  auditNameKey,
+  rgbDistance,
+  AUDIT_CATEGORIES,
+  AUDIT_CATEGORY_LABEL,
+  LIMITS,
   renderTokens,
   renderFonts,
   renderRegion,
@@ -261,7 +302,7 @@ group('④.4 描述/输出同步');
 //    调用方（模型）只能靠猜 —— 于是新列、新判定形同不存在（详见 docs/蓝湖插件读取缺陷排查）。
 //    断言写在这里，是为了让"下次又忘了"在自检这一步就红掉，而不是等还原完才发现。
 const DESC_MUST = {
-  lanhu_read_blocks: ['不透明', '字体族', '行高·字距'],
+  lanhu_read_blocks: ['不透明', '字体族', '行高·字距', '对比度'],
   lanhu_read_design: ['mapBox', 'toBox'],
   lanhu_verify_spec: ['字体族'],
   lanhu_verify_blocks: ['字体族'],
@@ -794,6 +835,1576 @@ group('⑥.12 坐标映射');
 
   // 不传参照框时**不加列** —— 不能悄悄改变既有输出
   ok('不传 mapBox/toBox 时不出现映射列', !renderRegion([hotspot], { y0: 0, y1: 1000 }).text.includes('映射 x,y'));
+}
+
+/* ═══════════════ ⑥.13 无障碍对比度（§4.8） ═══════════════ */
+group('⑥.13 无障碍对比度（§4.8）');
+
+/* ── 公式：三组已知值**写死**（防"自己发明公式"与"忘了线性化"） ── */
+{
+  const ratio = (a, b) => contrastRatio(a, b);
+  ok('#000 on #fff = 21:1（WCAG 锚点值）', Math.abs(ratio('#000000', '#ffffff') - 21) < 0.005,
+    ratio('#000000', '#ffffff').toFixed(4));
+  const v777 = ratio('#777777', '#ffffff');
+  ok('#777777 on #fff ≈ 4.48:1（**略低于** 4.5 —— 正好卡在阈值上）', Math.abs(v777 - 4.48) < 0.005 && v777 < 4.5,
+    v777.toFixed(4));
+  const v767 = ratio('#767676', '#ffffff');
+  ok('#767676 on #fff ≈ 4.54:1（**略高于** 4.5）', Math.abs(v767 - 4.54) < 0.005 && v767 > 4.5, v767.toFixed(4));
+  ok('对比度与顺序无关（内部按"亮的在上"取）', ratio('#000000', '#ffffff') === ratio('#ffffff', '#000000'));
+  ok('解析不出来的色值给 null（不猜 0 / 1）',
+    ratio('不是颜色', '#ffffff') === null && ratio(null, '#ffffff') === null);
+  eq('相对亮度：#000 = 0', relativeLuminance('#000000'), 0);
+  eq('相对亮度：#fff = 1', relativeLuminance('#ffffff'), 1);
+  // 这条是给"哪天有人把线性化去掉"留的证据：sRGB 直算 #777777 只有 ≈2.03，阈值结论整个反过来
+  const direct = (hex) => {
+    const c = parseColor(hex);
+    const L = (v) => v / 255;
+    return 0.2126 * L(c.r) + 0.7152 * L(c.g) + 0.0722 * L(c.b);
+  };
+  const noLinear = 1.05 / (direct('#777777') + 0.05);
+  ok('必须线性化：sRGB 直算 #777777 只有 ≈2.03（标准值是 4.48）', Math.abs(noLinear - 2.03) < 0.02, noLinear.toFixed(3));
+}
+
+/* ── 大号阈值：≥24px，或 ≥18.66px 且 bold ── */
+{
+  ok('大号：24px（不看字重）', isLargeText(24, 400) === true);
+  ok('大号：18.66px + 700', isLargeText(18.66, 700) === true);
+  ok('18px + 700 **不是**大号（差 0.66px 也不行）', isLargeText(18, 700) === false);
+  ok('20px + 400 **不是**大号（不够粗）', isLargeText(20, 400) === false);
+  ok('字号缺失 → null（不猜成大号，也不猜成正文）', isLargeText(null, 400) === null);
+  ok('对比度与阈值都是受控常量（不是裸写数字）',
+    LIMITS.contrastNormal === 4.5 && LIMITS.contrastLarge === 3 && LIMITS.largeTextBoldPx === 18.66);
+}
+
+/* ── 有效背景色：沿祖先链找 → 落画板 → 都没有就**明说算不出** ── */
+{
+  const fillNode = (hex, a = 1) => {
+    const c = parseColor(hex);
+    return { type: 'color', isEnabled: true, color: { value: `rgba(${c.r}, ${c.g}, ${c.b}, ${a})` } };
+  };
+  const gradNode = (values) => ({
+    type: 'gradient', isEnabled: true, gradient: { stops: values.map((v) => ({ color: { value: v } })) },
+  });
+  // 文本层**同时**带自己的 fill（= 文字色，Figma 语义）—— 它**绝不能**被当成自己的背景
+  const textNode = (hex, size, weight, alpha = 1) => {
+    const c = parseColor(hex);
+    const value = `rgba(${c.r}, ${c.g}, ${c.b}, ${alpha})`;
+    return {
+      id: 't1', type: 'textLayer', name: '说明文字', frame: { left: 20, top: 20, width: 120, height: 20 },
+      style: { fills: [{ type: 'color', isEnabled: true, color: { value } }] },
+      text: { style: { content: '说明文字', color: { value }, font: { name: 'Inter', size, fontWeight: weight } } },
+    };
+  };
+  const mkTree = (o = {}) => ({
+    id: 'ab', type: 'artboard', name: '自检稿',
+    meta: { device: 'iPhone 14' },
+    frame: { left: 0, top: 0, width: 375, height: 700 },
+    style: { fills: o.artboardFills ?? [fillNode('#ffffff')] },
+    layers: [{
+      id: 'card', type: 'frame', name: '底卡',
+      frame: { left: 0, top: 0, width: 375, height: 300 },
+      style: { fills: o.cardFills ?? [fillNode('#f5f5f5')] },
+      layers: [textNode(o.textColor ?? '#999999', o.size ?? 14, o.weight ?? 400, o.textAlpha ?? 1)],
+    }],
+  });
+  const spot = (o = {}) => {
+    const layers = flattenArtboard(mkTree(o));
+    const blocks = buildBlocks(layers);
+    const textBlock = blocks.find((b) => b.text);
+    return { layers, blocks, textBlock, bg: effectiveBackground(layers, textBlock.layerIndex) };
+  };
+
+  const a = spot();
+  eq('无底色的文本层 → 取**父层**的 fill', a.bg.ok && a.bg.backgrounds[0].hex, '#f5f5f5');
+  eq('来源不是画板（父层就够近）', a.bg.baseIsArtboard, false);
+  const b = spot({ cardFills: [] });
+  eq('父层也没底 → 落到**画板**底色', b.bg.ok && b.bg.backgrounds[0].hex, '#ffffff');
+  eq('来源标成画板', b.bg.baseIsArtboard, true);
+  const c = spot({ cardFills: [], artboardFills: [] });
+  ok('祖先链与画板都没有底色 → **明说算不出**（不是白底）',
+    c.bg.ok === false && c.bg.reason === 'no-fill', JSON.stringify(c.bg));
+  ok('文本层自己的 fill（= 文字色）不会被当成背景', c.bg.ok === false,
+    '若把文字色当背景，这里会得到 ok:true');
+  // 半透明：**逐层合成**到不透明底上（#574af4@10% 叠在白底 = #eeedfe）
+  const d = spot({ cardFills: [fillNode('#574af4', 0.1)] });
+  eq('半透明父层**合成**到画板白底（#574af4@10% → #eeedfe）', d.bg.backgrounds[0].hex, '#eeedfe');
+  eq('并标出「半透明」', d.bg.backgrounds[0].translucent, true);
+  ok('合成结果与手算一致（0.1×87 + 0.9×255 = 238）', compositeOver({ r: 87, g: 74, b: 244, a: 0.1 }, '#ffffff').r === 238);
+  const e = spot({ artboardFills: [], cardFills: [fillNode('#574af4', 0.1)] });
+  ok('半透明背景且**下面没有不透明底** → 明说算不出（不猜）',
+    e.bg.ok === false && e.bg.reason === 'translucent-no-base', JSON.stringify(e.bg));
+  // 多段渐变：逐段给候选（判的时候取最差）
+  const g = spot({ cardFills: [gradNode(['rgba(111, 103, 249, 1)', 'rgba(84, 70, 243, 1)'])] });
+  eq('多段渐变 → 每段一个候选', g.bg.backgrounds.length, 2);
+  eq('并标出「渐变」', g.bg.gradient, true);
+  ok('祖先链只认**父层**（不把兄弟层当背景）',
+    parentIndexOf(a.layers, a.textBlock.layerIndex) === a.layers.findIndex((l) => l.name === '底卡'));
+}
+
+/* ── 审计：只列不达标 / 大号 3:1 / 正文 4.5:1 / 背景算不出归另一处 ── */
+const CTX = (() => {
+  const fillNode = (hex, a = 1) => {
+    const c = parseColor(hex);
+    return { type: 'color', isEnabled: true, color: { value: `rgba(${c.r}, ${c.g}, ${c.b}, ${a})` } };
+  };
+  const textNode = (name, hex, size, weight, alpha = 1) => {
+    const c = parseColor(hex);
+    const value = `rgba(${c.r}, ${c.g}, ${c.b}, ${alpha})`;
+    return {
+      id: name, type: 'textLayer', name, frame: { left: 20, top: 20, width: 120, height: 20 },
+      style: { fills: [{ type: 'color', isEnabled: true, color: { value } }] },
+      text: { style: { content: name, color: { value }, font: { name: 'Inter', size, fontWeight: weight } } },
+    };
+  };
+  /** 画板白底 + 若干文本层（都在画板下，背景 = 画板） */
+  const tree = (texts, artboardFills) => ({
+    id: 'ab', type: 'artboard', name: '自检稿', frame: { left: 0, top: 0, width: 375, height: 700 },
+    style: { fills: artboardFills ?? [fillNode('#ffffff')] },
+    layers: texts,
+  });
+  const auditOf = (texts, artboardFills) => {
+    const layers = flattenArtboard(tree(texts, artboardFills));
+    const blocks = buildBlocks(layers);
+    return { layers, blocks, audit: auditTextContrast(visibleBlocks(blocks, {}), layers) };
+  };
+  return { fillNode, textNode, auditOf, tree };
+})();
+
+{
+  // 同一对色值：字号不同 → 结论不同（大号 3:1 过，正文 4.5:1 不过）
+  const normal = CTX.auditOf([CTX.textNode('灰字', '#949494', 14, 400)]);
+  const largeS = CTX.auditOf([CTX.textNode('灰字', '#949494', 20, 700)]);
+  eq('正文（14/400）判 4.5:1 → 不达标', [normal.audit.fail.length, normal.audit.fail[0].required], [1, 4.5]);
+  eq('大号（20/700）判 3:1 → 达标', [largeS.audit.fail.length, largeS.audit.minRatio > 3], [0, true]);
+  ok('同一对色值（#949494 / #ffffff，3.03:1）换个字号结论就不同 —— 阈值真的用上了',
+    normal.audit.fail.length === 1 && largeS.audit.fail.length === 0,
+    `正文 fail=${normal.audit.fail.length}，大号 fail=${largeS.audit.fail.length}`);
+
+  const seg = renderContrastDigest(normal.audit);
+  ok('每行给齐：块名 ｜ 文字色 / 背景色 ｜ 对比度 ｜ 差多少 ｜ 建议改法',
+    /^- 灰字 ｜ `#949494` \/ `#ffffff`（画板） ｜ \*\*3\.03:1\*\*（需 4\.5:1） ｜ 差 \*\*1\.47\*\* ｜ 文字色压暗到 \*\*#767676\*\* 或更深/m.test(seg),
+    seg.split('\n').find((l) => l.startsWith('- ')));
+  ok('建议改法是**可执行**的具体色值（不是"请提高对比度"）', /#[0-9a-f]{6}/.test(seg));
+  ok('表头写明判据与阈值（4.5 / 3 / 18.66 都在）',
+    seg.includes('4.5:1') && seg.includes('≥3:1') && seg.includes('18.66px') && seg.includes('线性化'));
+
+  // 只列不达标：达标的那几个**一个字都不许出现**
+  const mixed = CTX.auditOf([CTX.textNode('达标黑字', '#000000', 14, 400), CTX.textNode('不达标灰字', '#999999', 14, 400)]);
+  const mixedSeg = renderContrastDigest(mixed.audit);
+  eq('两个文本层都判了', mixed.audit.checked, 2);
+  ok('**只列不达标**的（达标的那个不出现）', mixedSeg.includes('不达标灰字') && !mixedSeg.includes('达标黑字'),
+    mixedSeg.split('\n').filter((l) => l.startsWith('- ')).join(' / '));
+  // 行数封顶：宁可少列也不列错（与「间距一览」同口径）
+  const twoFails = CTX.auditOf([CTX.textNode('灰A', '#999999', 14, 400), CTX.textNode('灰B', '#888888', 14, 400)]);
+  ok('不达标行数封顶（其余只给一句"略"）',
+    renderContrastDigest(twoFails.audit, { contrastMaxRows: 1 }).includes('其余 1 个不达标的略'));
+  ok('封顶只在超限时出现（没超就别说"略"）', !renderContrastDigest(twoFails.audit).includes('略'));
+
+  // 全达标也别沉默
+  const allPass = CTX.auditOf([CTX.textNode('黑字', '#000000', 14, 400)]);
+  const passSeg = renderContrastDigest(allPass.audit);
+  ok('全达标时给一句话（不是静默）', /全部达标\*\*（1 个文本层，最低 \*\*21:1\*\*）/.test(passSeg), passSeg.split('\n').pop());
+  ok('全达标时**不列**任何行', !passSeg.split('\n').some((l) => l.startsWith('- 黑字')));
+
+  // 背景算不出 → 单独归一处，且**不参与达标判断**
+  const noBg = CTX.auditOf([CTX.textNode('灰字', '#949494', 14, 400)], []);
+  const noBgSeg = renderContrastDigest(noBg.audit);
+  eq('背景算不出 → 不进 fail、进 unknown', [noBg.audit.fail.length, noBg.audit.unknown.length, noBg.audit.checked], [0, 1, 0]);
+  ok('明说"未做对比度判断"', noBgSeg.includes('背景无法确定') && noBgSeg.includes('未做对比度判断'));
+  ok('并把**原因**写清楚（不猜一个白底去算）', noBgSeg.includes('都没有底色') && noBgSeg.includes('不猜'), noBgSeg.split('\n').pop());
+  ok('背景算不出时**不提**"全部达标"（没判就别说达标）', !noBgSeg.includes('全部达标'));
+
+  // 半透明文字色：与背景合成后再算
+  const half = CTX.auditOf([CTX.textNode('半透明字', '#000000', 14, 400, 0.5)]);
+  eq('半透明黑字在白底上 = #808080（合成后再算，不是拿 #000000 算 21:1）',
+    half.audit.fail[0] && half.audit.fail[0].glyphHex, '#808080');
+  ok('行里注明「半透明文字色·已合成」', renderContrastDigest(half.audit).includes('半透明文字色·已合成'));
+}
+
+/* ── 与既有输出的边界：新增段是**纯追加**，别的一个字节都不动 ── */
+{
+  const fillNode = (hex) => {
+    const c = parseColor(hex);
+    return { type: 'color', isEnabled: true, color: { value: `rgba(${c.r}, ${c.g}, ${c.b}, 1)` } };
+  };
+  const layers = flattenArtboard(CTX.tree([CTX.textNode('灰字', '#949494', 14, 400)], [fillNode('#ffffff')]));
+  const blocks = buildBlocks(layers);
+  const meta = { name: '自检稿', width: 375, height: 700 };
+  const audit = auditTextContrast(visibleBlocks(blocks, {}), layers);
+  const noSeg = renderBlocks(blocks, meta, {});
+  const withSeg = renderBlocks(blocks, meta, { contrast: audit });
+  // 「新增段整段删掉」= 回到不传 contrast 的样子（尾注里的体积按正文算，故一并归一）
+  const stripSeg = (t) => t.replace(/\n\n## 对比度[\s\S]*?(?=\n\n— )/, '');
+  const kb = (t) => t.replace(/≈[\d.]+KB/, '≈KB');
+  const footer = (t) => t.split('\n').slice(-2).join('\n');
+  ok('不传 contrast → 输出里**没有**「对比度」段（原型那条链逐字节不变）', !noSeg.includes('对比度'));
+  ok('传 contrast → 严格是**纯追加**（把新增段整段删掉后逐字节相同）',
+    kb(stripSeg(withSeg)) === kb(noSeg),
+    stripSeg(withSeg) === noSeg ? '（连体积数字都一样）' : '删掉段落后仅体积数字不同');
+  ok('尾注文案不变（只有按正文算出来的体积数字会跟着变大）', kb(footer(withSeg)) === kb(footer(noSeg)),
+    `${footer(noSeg).split('\n')[0]} → ${footer(withSeg).split('\n')[0]}`);
+  ok('「间距一览」的位置与内容不变（对比度段在它之后）',
+    withSeg.indexOf('间距一览') < withSeg.indexOf('对比度'));
+  // 披露口径只有一份实现
+  const noisy = [{ noise: true, kind: 'text' }, { noise: false, kind: 'card' }];
+  ok('visibleBlocks 就是渲染层用的那套披露过滤（只有一份实现）',
+    JSON.stringify(visibleBlocks(noisy, {})) === JSON.stringify([noisy[1]])
+    && JSON.stringify(visibleBlocks(noisy, { includeNoise: true })) === JSON.stringify(noisy));
+  // 新增的块字段：指回源图层、且不破坏 lossless
+  ok('buildBlocks 新增 layerIndex 指回源图层（对比度靠它找祖先）',
+    blocks.every((blk) => layers[blk.layerIndex] && layers[blk.layerIndex].name === blk.name));
+  ok('buildBlocks 新增 colorAlpha（半透明文字色拿它合成）',
+    blocks.every((blk) => blk.colorAlpha === null || typeof blk.colorAlpha === 'number'));
+  ok('新增字段没破坏 lossless', findIllegal(blocks).length === 0, findIllegal(blocks).slice(0, 2).join(', '));
+}
+
+/* ═══════════════ ⑥.14 read_blocks 版本溯源（第 0 步） ═══════════════ */
+group('⑥.14 read_blocks 版本溯源');
+
+{
+  const VID = '97dd4840-9aa2-48d1-a958-1f5171445278';
+  const AT = 'Tue, 22 Sep 2026 16:58:24 GMT';
+  const meta = { versionId: VID, versionIsLatest: true, latestVersionAt: AT };
+  const detail = { versionRequested: 'latest', versionCount: 5, versionLatestId: VID, versionFromUrl: false, urlVersionIgnored: null };
+  const v = versionInfo(meta, detail);
+  eq('version.id 来自 meta（与标题行同一个来源）', v.id, VID);
+  eq('version.isLatest 来自 meta', v.isLatest, true);
+  eq('version.latestAt 来自 meta', v.latestAt, AT);
+  eq('顺带带上版本透明度字段', [v.requested, v.count, v.latestId], ['latest', 5, VID]);
+  ok('标题行里的 version 前缀 === version.id 前 8 位（两处不会各算一遍）',
+    metaSuffix(meta).includes(`version=${v.id.slice(0, 8)}`), metaSuffix(meta));
+  const none = versionInfo({}, {});
+  ok('拿不到版本 → 全 null（不编）',
+    none.id === null && none.isLatest === null && none.latestAt === null && metaSuffix({}) === '');
+  ok('读旧版时按「最新版更新于…（你读的是旧版）」，不把最新版时间当成这版的时间',
+    /最新版更新于 2026-09-22（你读的是旧版）/.test(metaSuffix({ ...meta, versionIsLatest: false })));
+  // 工具输出表里得声明它（否则"能力藏了"）
+  const t = TOOLS.find((x) => x.name === 'lanhu_read_blocks');
+  ok('read_blocks 的 output schema 声明了 version', !!t?.output?.schema?.properties?.version,
+    Object.keys(t?.output?.schema?.properties ?? {}).join(','));
+}
+
+/* ═══════════════ ⑥.15 read_blocks 端到端（mock fetch，零网络） ═══════════════ */
+group('⑥.15 read_blocks 端到端（mock fetch）');
+
+{
+  const VID = '00000009-0000-4000-8000-000000000009';
+  const AT = 'Tue, 22 Sep 2026 16:58:24 GMT';
+  const fillNode = (hex) => {
+    const c = parseColor(hex);
+    return { type: 'color', isEnabled: true, color: { value: `rgba(${c.r}, ${c.g}, ${c.b}, 1)` } };
+  };
+  const textNode = (name, hex, size, weight) => {
+    const c = parseColor(hex);
+    const value = `rgba(${c.r}, ${c.g}, ${c.b}, 1)`;
+    return {
+      id: name, type: 'textLayer', name, frame: { left: 20, top: 20, width: 120, height: 20 },
+      style: { fills: [{ type: 'color', isEnabled: true, color: { value } }] },
+      text: { style: { content: name, color: { value }, font: { name: 'Inter', size, fontWeight: weight } } },
+    };
+  };
+  const tree = {
+    meta: { device: 'iPhone 14' },
+    artboard: {
+      id: 'ab', type: 'artboard', name: '自检稿',
+      frame: { left: 0, top: 0, width: 375, height: 700 },
+      style: { fills: [fillNode('#ffffff')] },
+      layers: [
+        textNode('不达标灰字', '#999999', 14, 400),
+        textNode('大号达标字', '#949494', 20, 700),
+      ],
+    },
+  };
+  const mockRes = (obj) => ({
+    ok: true, status: 200,
+    headers: { get: () => 'application/json; charset=utf-8' },
+    arrayBuffer: async () => Buffer.from(JSON.stringify(obj), 'utf8'),
+  });
+  const realFetch = globalThis.fetch;
+  const seen = [];
+  globalThis.fetch = async (url) => {
+    const u = String(url);
+    seen.push(u);
+    if (u.includes('/api/project/image?')) {
+      return mockRes({
+        code: '00000',
+        result: { id: 'i-mock', name: '自检稿', width: 375, height: 700, versions: [{ id: VID, json_url: 'https://mock.lanhu/tree.json', create_time: AT }] },
+      });
+    }
+    if (u === 'https://mock.lanhu/tree.json') return mockRes(tree);
+    throw new Error('未预期的请求：' + u);
+  };
+  let r = null;
+  let err = null;
+  try {
+    r = await readBlocks({ projectId: 'p-mock', imageId: 'i-mock', account: 'mock', cookie: 'PASSPORT=x; user_token=y' });
+  } catch (e) { err = e; } finally { globalThis.fetch = realFetch; }
+
+  ok('read_blocks 能跑通（mock 两个请求：详情 + 图层树）', !!r && !err, err ? String(err.message) : `${seen.length} 个请求`);
+  if (r) {
+    eq('返回里**有 `version`**（第 0 步的核心）', typeof r.version === 'object' && r.version !== null, true);
+    eq('version.id 就是这一版的 id', r.version?.id, VID);
+    eq('version.latestAt 与 isLatest 都带上了', [r.version?.latestAt, r.version?.isLatest], [AT, true]);
+    eq('平铺字段 versionIsLatest / latestVersionAt 也给了', [r.versionIsLatest, r.latestVersionAt], [true, AT]);
+    ok('returns.version 与**标题行**里的 version 一致（防两处各算一遍）',
+      r.text.split('\n')[0].includes(`version=${VID.slice(0, 8)}`), r.text.split('\n')[0]);
+    ok('return 是 lossless（新增字段没带 undefined/NaN）',
+      findIllegal({ blocks: r.blocks, version: r.version, contrast: r.contrast }).length === 0,
+      findIllegal({ blocks: r.blocks, version: r.version, contrast: r.contrast }).slice(0, 2).join(', '));
+    eq('对比度审计进了返回（文本与字段同一次计算）',
+      [r.contrast.totalTextLayers, r.contrast.checked, r.contrast.failCount, r.contrast.unknownCount], [2, 2, 1, 0]);
+    const seg = r.text.split('## 对比度')[1] ?? '';
+    ok('文本里有「对比度」段，且只列不达标（大号达标的不列）',
+      seg.includes('不达标灰字') && !seg.includes('大号达标字'), seg.split('\n').find((l) => l.startsWith('- ')));
+    ok('对比度审计**零额外网络请求**（只发了详情 + 树两个请求）', seen.length === 2, seen.join(' | '));
+  }
+}
+
+/* ═══════════════ ⑥.15b 蓝湖 Sketch 插件格式（type: sketchPlugin） ═══════════════
+ *
+ * 这是**实测缺陷**的回归：某真实项目 252 张稿里 **11/20 = 55%** 是这种格式
+ * （图层平铺在 `info[]` 里、没有 `artboard`，层级靠 `parentID`）。
+ * 旧实现对它们会输出「共 **1** 块：画板 1」+ 一张空表 —— **看着跑成功、其实一个块都没解析出来**，
+ * AI 会据此认定"这张稿是空的"然后什么都不建（本仓库最忌讳的失败模式）。
+ *
+ * 这一组钉两件事：
+ *   ① **真的解析出来**（结构齐全、字段映射逐项有据、块数 > 0）；
+ *   ② 解析不出来时**明说**（人读文本说清格式/不代表稿子是空的/下一步；返回带机器可读标志），
+ *      且**任何情况下都不再出现「共 1 块：画板 1」**这种像成功的形态。
+ */
+group('⑥.15b Sketch 插件格式（type: sketchPlugin）');
+{
+  const VID = '0000000a-0000-4000-8000-00000000000a';
+  const AT = 'Tue, 22 Sep 2026 16:58:24 GMT';
+  const SP_ART = 'AAAA0000-0000-4000-8000-000000000001';
+  const mockRes = (obj) => ({
+    ok: true, status: 200,
+    headers: { get: () => 'application/json; charset=utf-8' },
+    async text() { return JSON.stringify(obj); },
+    arrayBuffer: async () => Buffer.from(JSON.stringify(obj), 'utf8'),
+  });
+  const PNG = Buffer.from('89504e470d0a1a0a0000000d49484452', 'hex');
+  const mockPng = () => ({
+    ok: true, status: 200, headers: { get: () => 'image/png' }, async arrayBuffer() { return PNG; },
+  });
+
+  /** 一份**结构真实**的 sketchPlugin 树：层级/坐标/圆角/色值/渐变/边框/文字/切图/隐藏层/全透层都有。 */
+  const spTree = () => ({
+    type: 'sketchPlugin', ArtboardID: SP_ART, device: 'Web @1x', ArtboardScale: 1, sliceScale: 2,
+    pageName: '页面 1', skVersion: 94.1, pluginVersion: '3.2.26',
+    info: [
+      // 画板：唯一没有 parentID 的项；left/top=0，画布绝对坐标在 position_x/position_y
+      { id: SP_ART, name: 'Sketch 自检稿', ddsType: 'artboard-group', left: 0, top: 0, width: 1920, height: 1080,
+        position_x: 2543, position_y: -445.5, index: '0', layers: [],
+        fills: [{ type: 'color', color: { value: 'rgba(251,251,251,1)' } }] },
+      // 卡片：圆角 [8]、底色、1px 边框、opacity 80（Sketch 是 0..100）
+      { id: 'CARD', name: '卡片', type: 'shape', ddsType: 'rectangle', left: 100, top: 200, width: 400, height: 300,
+        parentID: SP_ART, isVisible: true, opacity: 80, radius: [8],
+        fills: [{ type: 'color', color: { value: 'rgba(87,74,244,1)' } }],
+        borders: [{ position: '内边框', thickness: 1, isEnabled: true, color: { value: 'rgba(226,232,240,1)' } }] },
+      // 两段渐变：Sketch 给 `colorStops`，必须迁成 `stops`，否则整条渐变丢掉
+      { id: 'GRAD', name: '辉光', type: 'shape', ddsType: 'rectangle', left: 600, top: 200, width: 200, height: 100,
+        parentID: SP_ART, isVisible: true, opacity: 100,
+        fills: [{ type: 'gradient', isEnabled: true, gradient: { type: 'linear', colorStops: [
+          { position: 0, color: { value: 'rgba(20,89,148,1)' } },
+          { position: 1, color: { value: 'rgba(8,41,74,0.1)' } }] } }] },
+      // 文字：字重靠 postScriptName 后缀、行高 `line`、字距 `kerning`
+      { id: 'TXT', name: '标题', type: 'text', left: 120, top: 240, width: 100, height: 24, parentID: SP_ART,
+        isVisible: true, opacity: 100,
+        font: { content: '个人', size: 24, line: 36, kerning: 0.7, align: 'left', font: 'SourceHanSansCN-Bold',
+          displayName: '思源黑体 CN Bold', color: { value: 'rgba(44,51,42,1)' }, styles: [] } },
+      // 真位图层 → 是切图
+      { id: 'BMP', name: '头像位图', type: 'bitmap', left: 900, top: 300, width: 64, height: 64, parentID: SP_ART,
+        isVisible: true, opacity: 100,
+        ddsImage: { imageUrl: 'https://mock.lanhu/slice1.png', size: { width: 128, height: 128 }, point: { x: 1, y: 2 } } },
+      // ⚠️ shape 也带 ddsImage（实测 890/2348 层都带）—— **不该**被当成图片块、也不该进切图清单
+      { id: 'SHAPEIMG', name: '形状带导出图', type: 'shape', ddsType: 'oval', left: 1000, top: 300, width: 20, height: 20,
+        parentID: SP_ART, isVisible: true, opacity: 100,
+        fills: [{ type: 'color', color: { value: 'rgba(216,216,216,1)' } }],
+        ddsImage: { imageUrl: 'https://mock.lanhu/should-not-count.png' } },
+      // 组：被导出成一张图（`image.imageUrl`）→ 算切图；子层靠 parentID 挂进来
+      { id: 'GRP', name: '编组', type: 'layer-group', left: 700, top: 500, width: 200, height: 200, parentID: SP_ART,
+        isVisible: true, opacity: 100, image: { imageUrl: 'https://mock.lanhu/group.png' } },
+      // 子层坐标是**画板绝对坐标**（实测：44 个有父层的元素里 24 个超出父层局部框）
+      { id: 'GRP_CHILD', name: '组内文字', type: 'text', left: 720, top: 520, width: 60, height: 20, parentID: 'GRP',
+        isVisible: true, opacity: 100,
+        font: { content: '组内', size: 14, line: 20, font: 'SourceHanSansCN-Regular', color: { value: 'rgba(0,0,0,1)' } } },
+      // 隐藏层 / 全透明层：都不该成块
+      { id: 'HID', name: '隐藏层', type: 'shape', ddsType: 'rectangle', left: 10, top: 10, width: 50, height: 50,
+        parentID: SP_ART, isVisible: false, opacity: 100, fills: [{ type: 'color', color: { value: 'rgba(1,2,3,1)' } }] },
+      { id: 'ZERO', name: '全透层', type: 'shape', ddsType: 'rectangle', left: 10, top: 900, width: 50, height: 50,
+        parentID: SP_ART, isVisible: true, opacity: 0, fills: [{ type: 'color', color: { value: 'rgba(1,2,3,1)' } }] },
+      // 分割线：1px 高的实心条
+      { id: 'DIV', name: '分割线', type: 'shape', ddsType: 'rectangle', left: 100, top: 700, width: 400, height: 1,
+        parentID: SP_ART, isVisible: true, opacity: 100, fills: [{ type: 'color', color: { value: 'rgba(226,232,240,1)' } }] },
+    ],
+  });
+
+  const withSpMock = async (fn, { tree = spTree() } = {}) => {
+    const real = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      if (u.includes('/api/project/images?')) {
+        return mockRes({ code: '00000', result: { name: '自检项目', images: [
+          { id: 'i-mock', name: 'Sketch 稿', width: 480, height: 270 },
+        ] } });
+      }
+      if (u.includes('/api/project/image?')) {
+        return mockRes({ code: '00000', result: {
+          id: 'i-mock', name: 'Sketch 稿', width: 480, height: 270,   // ⚠️ 详情里的尺寸是**缩略图**尺寸
+          versions: [{ id: VID, json_url: 'https://mock.lanhu/sp.json', create_time: AT }],
+        } });
+      }
+      if (u === 'https://mock.lanhu/sp.json') return mockRes(tree);
+      if (u.includes('mock.lanhu/slice') || u.includes('mock.lanhu/group')) return mockPng();
+      throw new Error('未预期的请求：' + u);
+    };
+    try { return await fn(); } finally { globalThis.fetch = real; }
+  };
+  const A = { projectId: 'p-mock', imageId: 'i-mock', account: 'mock', cookie: 'PASSPORT=x; user_token=y' };
+
+  // ① 归一化纯函数：层级 / 绝对坐标 / 防环 / 切图判据
+  {
+    const n = normalizeSketchPluginTree(spTree());
+    eq('归一化：除画板外 10 层（层级靠 parentID 建起来，`layers` 恒空）', n.layerCount, 10);
+    eq('归一化：画板名取 `ArtboardID` 那一项', n.artboard?.name, 'Sketch 自检稿');
+    eq('归一化：切图只收 bitmap 的 ddsImage + 组导出图（shape 的 ddsImage **不算**）',
+      n.sliceUrls.slice().sort().join(','), 'https://mock.lanhu/group.png,https://mock.lanhu/slice1.png');
+    const grp = n.tree.artboard.layers.find((l) => l.name === '编组');
+    const child = grp?.layers?.[0];
+    eq('归一化：子层挂在父层的 `layers` 下（parentID → 树）', child?.name, '组内文字');
+    eq('归一化：子层坐标是**画板绝对坐标**（720,520，不是相对父层的 20,20）',
+      [child?.frame.left, child?.frame.top], [720, 520]);
+    eq('归一化：画板 frame 取 `position_x/position_y`（画布绝对坐标，与 Figma 稿同口径）',
+      [n.artboard?.frame?.left, n.artboard?.frame?.top], [2543, -445.5]);
+    const card = n.tree.artboard.layers.find((l) => l.name === '卡片');
+    eq('归一化：`opacity` 从 0..100 换算到 0..1（80 → 0.8）', card?.opacity, 0.8);
+    eq('归一化：圆角 `radius:[8]` → 四角 8', [card?.radius?.topLeft, card?.radius?.bottomRight], [8, 8]);
+    eq('归一化：渐变 `colorStops` → `stops`（不迁就整条丢）',
+      card?.style?.fills?.length ?? 0, 1);
+    const grad = n.tree.artboard.layers.find((l) => l.name === '辉光');
+    eq('归一化：两段渐变两个 stop 都在', grad?.style?.fills?.[0]?.gradient?.stops?.length ?? 0, 2);
+    const txt = n.tree.artboard.layers.find((l) => l.name === '标题');
+    eq('归一化：字体族由 postScriptName 去后缀、字重由后缀映射（Bold → 700）',
+      [txt?.text?.style?.font?.name, txt?.text?.style?.font?.fontWeight], ['SourceHanSansCN', 700]);
+    eq('归一化：行高取 `line`、字距取 `kerning`',
+      [txt?.text?.style?.font?.lineHeight?.value, txt?.text?.style?.font?.letterSpacing?.value], [36, 0.7]);
+    eq('归一化：文字内容取自 `font.content`', txt?.text?.style?.content, '个人');
+    // 防环：parentID 成环也不能死循环
+    const cyc = { type: 'sketchPlugin', info: [
+      { id: 'a', name: 'A', width: 1, height: 1, parentID: 'a' },
+      { id: 'b', name: 'B', width: 1, height: 1, parentID: 'a' },
+    ] };
+    const nc = normalizeSketchPluginTree(cyc);
+    eq('归一化：parentID 自指/成环时不死循环（a 与挂在它下面的 b 各算一层）', nc.layerCount, 2);
+    eq('归一化：既没有 ArtboardID 也没有根 → 不编内容（0 层）',
+      normalizeSketchPluginTree({ type: 'sketchPlugin', info: [] }).layerCount, 0);
+  }
+
+  // ② read_blocks：**真的解析出来**（不再「共 1 块：画板 1」）
+  {
+    const r = await withSpMock(() => readBlocks({ ...A }));
+    ok('★ read_blocks 对 sketchPlugin **真的解析出块**（块数 > 0）', r.ok === true && r.blockCount > 0, `块 ${r.blockCount}`);
+    eq('★ 返回带机器可读标志 `sourceFormat`', r.sourceFormat, 'sketchPlugin');
+    ok('★ `unsupported` 标志**缺席或为假**（这张稿是读得出来的）', !r.unsupported, String(r.unsupported));
+    ok('★ 文本里**不再出现**「共 1 块：画板 1」这种像成功的形态', !/共 \*\*1\*\* 块：画板 1/.test(r.text), r.text.split('\n')[2]);
+    ok('★ 文本里明说来源是 Sketch 插件导出（人读也知道数值是映射来的）',
+      r.text.includes('Sketch 插件导出') && r.text.includes('sketchPlugin'), r.text.split('\n')[2]);
+    eq('★ 画板尺寸取**图层树**（1920×1080），不是详情里的缩略图尺寸（480×270）',
+      [r.viewport.width, r.viewport.height], [1920, 1080]);
+    eq('图层清单完整（info 11 项：画板 + 10 层）', r.layerCount, 11);
+    const byName = Object.fromEntries(r.blocks.map((b) => [b.name, b]));
+    ok('块字段齐全：坐标/尺寸/色值/圆角/边框/文字', [
+      byName['卡片']?.x === 100, byName['卡片']?.y === 200, byName['卡片']?.w === 400,
+      byName['卡片']?.bg?.hex === '#574af4', byName['卡片']?.radius?.max === 8,
+      byName['卡片']?.border?.color === '#e2e8f0', byName['标题']?.text === '个人',
+      byName['标题']?.font?.size === 24, byName['标题']?.font?.weight === 700,
+      byName['标题']?.color === '#2c332a',
+    ].every(Boolean), JSON.stringify(byName['卡片'] ?? {}).slice(0, 200));
+    eq('图层不透明还原成 0.8（与底色 alpha 是两回事）', byName['卡片']?.opacity, 0.8);
+    eq('两段渐变全部 stop 都进了块（不再只显示第一段）',
+      (byName['辉光']?.bg?.stops ?? []).map((s) => s.hex).join('→'), '#145994→#08294a');
+    eq('组内子层也在清单里，且坐标是画板绝对值', [byName['组内文字']?.x, byName['组内文字']?.y], [720, 520]);
+    ok('子层深度比父层大一档（层级真的建起来了）',
+      byName['组内文字']?.depth === byName['编组']?.depth + 1, `${byName['组内文字']?.depth}/${byName['编组']?.depth}`);
+    ok('隐藏层与全透明层**都不成块**', !byName['隐藏层'] && !byName['全透层'], Object.keys(byName).join(','));
+    ok('1px 高的实心条被认成**分割线**', byName['分割线']?.kind === 'divider', String(byName['分割线']?.kind));
+    ok('⚠️ shape 带的 `ddsImage` **不**把形状变成图片块（实测 890/2348 层都带它）',
+      byName['形状带导出图']?.kind !== 'image', String(byName['形状带导出图']?.kind));
+    ok('真位图层与"组导出图"才算图片块',
+      byName['头像位图']?.kind === 'image' && byName['编组']?.kind === 'image',
+      `${byName['头像位图']?.kind}/${byName['编组']?.kind}`);
+    ok('返回是 lossless（映射没带出 undefined/NaN）',
+      findIllegal({ blocks: r.blocks, contrast: r.contrast }).length === 0,
+      findIllegal({ blocks: r.blocks }).slice(0, 2).join(', '));
+  }
+
+  // ③ read_design：同一条链（summary / tokens / fonts 都要能出数）
+  {
+    const s = await withSpMock(() => readDesign({ ...A }));
+    ok('★ read_design summary 也能读（图层数 = 11）',
+      s.format === 'summary' && s.layerCount === 11, `${s.format}/${s.layerCount}`);
+    eq('★ read_design 也带 `sourceFormat`', s.sourceFormat, 'sketchPlugin');
+    ok('★ summary 里也不再是"看着像成功"的空结果', !/共 \*\*1\*\* 块/.test(s.text) && s.tokens.colors.length > 0,
+      s.text.split('\n')[0]);
+    const t = await withSpMock(() => readDesign({ ...A, format: 'tokens' }));
+    ok('tokens 模式有字号/字重/圆角统计', t.tokens.fontSizes.length > 0 && t.tokens.radii.length > 0,
+      JSON.stringify(t.tokens.fontSizes));
+    const f = await withSpMock(() => readDesign({ ...A, format: 'fonts' }));
+    ok('fonts 模式认得出 Sketch 的字体族（SourceHanSansCN）', /SourceHanSansCN/.test(f.text), f.text.slice(0, 200));
+  }
+
+  // ④ download_slices：能拿到切图（而不是空手而归还说 ok）
+  {
+    const s = await withSpMock(() => downloadSlices({ ...A, outDir: path.join(TMP_HOME, 'sp-slices') }));
+    eq('★ download_slices 能真下到 sketchPlugin 稿的切图（2 张 URL；内容相同 → 哈希去重 1 张）',
+      s.downloaded + s.skipped, 2);
+    eq('★ 且带上 `sourceFormat`', s.sourceFormat, 'sketchPlugin');
+    ok('shape 的 ddsImage 没混进切图清单', (s.files ?? []).every((x) => !/should-not-count/.test(x.url ?? '')),
+      (s.files ?? []).map((x) => x.file).join(','));
+  }
+
+  // ⑤ diff：能 dif（两版同树 → 无差异）
+  {
+    let d = null; let derr = null;
+    try { d = await withSpMock(() => diffDesign({ ...A, from: VID, to: VID })); } catch (e) { derr = e; }
+    ok('★ diff_design 对 sketchPlugin 不再报"不是设计稿图层树"（解析得出来就该能比）',
+      !derr && d?.ok === true && d.sameVersion === true,
+      derr ? String(derr.message) : String(d?.text).split('\n')[0]);
+    eq('★ diff 结果也带 `sourceFormat`', d?.sourceFormat, 'sketchPlugin');
+  }
+
+  // ⑥ audit：能读的 sketchPlugin **要进统计**（不能再整类跳过）
+  {
+    const a = await withSpMock(() => auditProject({ ...A, limit: 1 }));
+    eq('★ 能解析的 sketchPlugin 稿被**正常扫描**（scanned=1）', a.scanned, 1);
+    ok('★ 它**不**落进 `sketch-format` 跳过类', !a.skipBuckets['sketch-format'], JSON.stringify(a.skipBuckets));
+    ok('审计真的看到了块（blocks > 0）', a.blocks > 0, String(a.blocks));
+  }
+
+  // ⑦ 【核心】取不出图层时 → **明示**，且机器可读
+  {
+    // 既有 fixture 那种形态：只有一个无坐标、无子层的项
+    const empty = { type: 'sketchPlugin', info: [{ id: 'ab', name: 'Sketch 稿' }] };
+    const r = await withSpMock(() => readBlocks({ ...A }), { tree: empty });
+    eq('★ 空壳 sketchPlugin：`unsupported` 为 true（机器可读，不用读文本）', r.unsupported, true);
+    eq('★ 空壳 sketchPlugin：`ok` 为 false（不是"看着成功"）', r.ok, false);
+    eq('★ 空壳 sketchPlugin：`sourceFormat` 标出格式', r.sourceFormat, 'sketchPlugin');
+    eq('★ 空壳 sketchPlugin：给稳定的 code', r.code, 'SKETCH_PLUGIN_NO_LAYERS');
+    ok('★ 空壳 sketchPlugin：块数为 0（不编数据）', r.blockCount === 0 && r.blocks.length === 0 && r.layerCount === 0,
+      `${r.blockCount}/${r.layerCount}`);
+    ok('★ **再也不出现**「共 1 块：画板 1」这种像成功的形态（连说明文案里都不许有那个字面短语）',
+      !/共 \*\*1\*\* 块/.test(r.text) && !/画板 1/.test(r.text),
+      r.text.split('\n').slice(0, 4).join(' / '));
+    ok('★ 文本说清"这是什么格式"', r.text.includes('Sketch 插件导出') && r.text.includes('sketchPlugin'), r.text.split('\n')[0]);
+    ok('★ 文本说清"本次输出为空 **不代表**这张稿是空的"', r.text.includes('不代表这张稿是空的'), r.text.split('\n')[2]);
+    ok('★ 文本给出下一步（换稿 / 让设计师重导 / 只要图就用 download_slices）',
+      r.text.includes('下一步') && r.text.includes('换一张') && r.text.includes('download_slices'), r.text.slice(-500));
+    ok('文本里点出"以前会静默输出共 1 块画板 1，现在改为明说"', r.text.includes('静默'), r.text.slice(0, 400));
+    ok('明示结果也是 lossless', findIllegal({ ok: r.ok, blockCount: r.blockCount, code: r.code }).length === 0);
+
+    const d = await withSpMock(() => readDesign({ ...A, format: 'summary' }), { tree: empty });
+    ok('★ read_design 对同一张稿也**明示**（不是静默空结果）',
+      d.unsupported === true && d.ok === false && d.text.includes('不代表这张稿是空的'), d.text.split('\n')[0]);
+    const t = await withSpMock(() => readDesign({ ...A, format: 'tokens' }), { tree: empty });
+    ok('★ format=tokens / fonts / region 也走同一条明示（不是各写一套）',
+      t.unsupported === true && t.text.includes('不代表这张稿是空的'), t.text.split('\n')[0]);
+
+    const s = await withSpMock(() => downloadSlices({ ...A, outDir: path.join(TMP_HOME, 'sp-empty') }), { tree: empty });
+    ok('★ download_slices 对读不出的稿**明说**（不再"下载了 0 张、一切正常"）',
+      s.unsupported === true && s.ok === false && /不代表|不等于/.test(s.note), s.note);
+    eq('★ 且 downloaded 仍是 0（不编数字）', s.downloaded, 0);
+
+    let threw = null;
+    try { await withSpMock(() => diffDesign({ ...A, from: VID, to: VID }), { tree: empty }); } catch (e) { threw = e; }
+    ok('★ diff_design 对读不出的稿**报错点名格式**（不再归错因"不是设计稿图层树"）',
+      threw?.code === 'SKETCH_PLUGIN_NO_LAYERS' && /Sketch 插件/.test(String(threw?.message)), String(threw?.code));
+
+    const a = await withSpMock(() => auditProject({ ...A, limit: 1 }), { tree: empty });
+    eq('★ audit 仍把"取不出图层"的单独归一类（不混进"读取失败"）', a.skipBuckets['sketch-format'], 1);
+    ok('★ 抬头文案与"能读"的新能力一致（说明是"取不出子层"，不是"不认这种树"）',
+      a.skippedBrief.includes('Sketch 插件格式') && a.text.includes('已知空缺')
+      && a.text.includes('同一套') && !a.text.includes('当前解析器只认'), a.skippedBrief);
+  }
+
+  // ⑧ 认不出的树格式：也不许静默（既无 artboard、也无 info、也无 pages）
+  {
+    const weird = { hello: 'world', layers: [] };
+    const r = await withSpMock(() => readBlocks({ ...A }), { tree: weird });
+    eq('★ 未知格式：`unsupported` 为 true', r.unsupported, true);
+    eq('★ 未知格式：`sourceFormat` 为 unknown', r.sourceFormat, 'unknown');
+    eq('★ 未知格式：稳定的 code', r.code, 'UNKNOWN_TREE_FORMAT');
+    ok('★ 未知格式：不出现「共 1 块：画板 1」', !r.text.includes('共 **1** 块'), r.text.split('\n')[0]);
+    ok('★ 未知格式：说清"既没有 artboard 也没有 info/pages"并给下一步',
+      r.text.includes('artboard') && r.text.includes('info') && r.text.includes('下一步'), r.text.slice(0, 400));
+  }
+
+  // ⑨ 【硬约束】普通稿（非 sketchPlugin）的返回体**不许**多出 `sourceFormat` 键
+  {
+    const plain = {
+      meta: { device: 'iPhone 14' },
+      artboard: {
+        id: 'ab', type: 'artboard', name: '普通稿',
+        frame: { left: 0, top: 0, width: 375, height: 700 },
+        style: { fills: [{ type: 'color', isEnabled: true, color: { value: 'rgba(255,255,255,1)' } }] },
+        layers: [{ id: 'r1', type: 'shapeLayer', name: '按钮', frame: { left: 16, top: 16, width: 100, height: 40 },
+          paths: [{ type: 'rect', radius: { topLeft: 8, topRight: 8, bottomRight: 8, bottomLeft: 8 } }],
+          style: { fills: [{ type: 'color', isEnabled: true, color: { value: 'rgba(87,74,244,1)' } }] } }],
+      },
+    };
+    const r = await withSpMock(() => readBlocks({ ...A }), { tree: plain });
+    ok('★ 普通稿返回体里**没有** `sourceFormat` 键（逐字节不变的守卫）',
+      !Object.prototype.hasOwnProperty.call(r, 'sourceFormat'), Object.keys(r).filter((k) => /source/i.test(k)).join(','));
+    ok('★ 普通稿文本里**没有** Sketch 来源交代', !r.text.includes('Sketch 插件导出'), r.text.split('\n')[2]);
+    const d = await withSpMock(() => readDesign({ ...A }), { tree: plain });
+    ok('★ read_design 同样不多键、不加来源段',
+      !Object.prototype.hasOwnProperty.call(d, 'sourceFormat') && !d.text.includes('Sketch 插件导出'));
+  }
+}
+
+/* ═══════════════ ⑥.16 设计变更 diff（第 2 步） ═══════════════ */
+group('⑥.16 设计变更 diff');
+
+/** 造一个块（字段形状与 `buildBlocks` 的输出一致）—— 只覆盖要比对的那几项。 */
+const mkBlk = (o = {}) => ({
+  uid: 0, kind: 'card', name: '块', path: '画板/块', depth: 1, noise: false,
+  x: 0, y: 0, w: 100, h: 50, inset: null,
+  radius: { corners: [14, 14, 14, 14], max: 14, pill: false },
+  bg: { hex: '#ffffff', alpha: 1, stops: [] },
+  opacity: 1, border: null, text: null, color: null, colorAlpha: null,
+  font: null, hasImage: false, shape: 'rect', childCount: 0, layerIndex: 0,
+  ...o,
+});
+const labelsOf = (items) => items.map((i) => i.label);
+const catsOf = (items) => [...new Set(items.map((i) => i.cat))].sort();
+
+/** diffReliability 的调用样板（省得每处都写全字段）。 */
+const rel = (o) => diffReliability({
+  matched: 0, exact: 0, approx: 0, onlyFrom: 0, onlyTo: 0, fromCount: 0, toCount: 0, ...o,
+});
+
+/* —— ① 配对策略：身份优先，可解释 —— */
+{
+  // 内容完全一致，只是**数组顺序被打乱**（设计工具导出顺序不保证稳定）
+  const A = [
+    mkBlk({ uid: 0, path: '画板/一', name: '一', x: 0 }),
+    mkBlk({ uid: 1, path: '画板/二', name: '二', x: 100 }),
+    mkBlk({ uid: 2, path: '画板/三', name: '三', x: 200 }),
+  ];
+  const B = [A[2], A[0], A[1]].map((b, i) => ({ ...b, uid: i }));
+  const m = matchVersionBlocks(A, B);
+  ok('顺序打乱也能全部配对', m.pairs.length === 3 && m.onlyFrom.length === 0 && m.onlyTo.length === 0);
+  ok('配对走**身份（path）**：一配一、二配二、三配三 —— 不是按数组下标',
+    m.pairs.every((p) => p.a.path === p.b.path),
+    m.pairs.map((p) => `${p.a.path}→${p.b.path}`).join(' | '));
+  ok('顺序打乱**不产生假差异**（下标一一对应会报出一堆假布局变化）',
+    m.pairs.every((p) => diffBlockItems(p.a, p.b).length === 0),
+    m.pairs.flatMap((p) => labelsOf(diffBlockItems(p.a, p.b))).join(' | '));
+  ok('全部是精确匹配（how=exact）', m.pairs.every((p) => p.how === 'exact'));
+}
+{
+  // 同 path 有多个块（实测 159 块 / 134 个唯一 path）→ 组内按几何最近邻挑"是哪一个"
+  const A = [
+    mkBlk({ uid: 0, path: '画板/同名', name: '同名', y: 0 }),
+    mkBlk({ uid: 1, path: '画板/同名', name: '同名', y: 100 }),
+  ];
+  const B = [
+    mkBlk({ uid: 0, path: '画板/同名', name: '同名', y: 100 }),
+    mkBlk({ uid: 1, path: '画板/同名', name: '同名', y: 0 }),
+  ];
+  const m = matchVersionBlocks(A, B);
+  ok('同 path 多个块：按几何最近邻配对（顺序换了也对得上）',
+    m.pairs.length === 2 && m.pairs.every((p) => p.a.y === p.b.y),
+    m.pairs.map((p) => `${p.a.y}→${p.b.y}`).join(' | '));
+}
+{
+  // 身份对不上 → 近似匹配，且**必须标注**，不许冒充精确
+  const A = [mkBlk({ uid: 0, path: '画板/旧名', name: '旧名' })];
+  const B = [mkBlk({ uid: 0, path: '画板/新名', name: '新名' })];
+  const m = matchVersionBlocks(A, B);
+  ok('身份对不上时退到近似匹配，并**标注 how=approx**（不冒充精确）',
+    m.pairs.length === 1 && m.pairs[0].how === 'approx', m.pairs.map((p) => p.how).join(','));
+  ok('近似匹配把改名前后都留着（旧 path → 新 path 可解释）',
+    m.pairs[0].a.path === '画板/旧名' && m.pairs[0].b.path === '画板/新名');
+  ok('近似匹配过几何门槛：挪太远不认',
+    matchApproxBlocks(A, [mkBlk({ uid: 0, path: '画板/新名', x: 5000 })]).length === 0);
+  ok('近似匹配过尺寸门槛：尺寸差太多不认',
+    matchApproxBlocks(A, [mkBlk({ uid: 0, path: '画板/新名', w: 400 })]).length === 0);
+  ok('近似匹配过类型门槛：类型不同不认',
+    matchApproxBlocks(A, [mkBlk({ uid: 0, path: '画板/新名', kind: 'text', text: 'x' })]).length === 0);
+  ok('近似匹配过文本门槛：文案不同不认（宁可报新增/删除）',
+    matchApproxBlocks(A, [mkBlk({ uid: 0, path: '画板/新名', kind: 'text', text: '甲' })]).length === 0
+    && matchApproxBlocks([mkBlk({ uid: 0, kind: 'text', text: '甲' })], [mkBlk({ uid: 0, kind: 'text', text: '乙', path: '别的' })]).length === 0);
+}
+{
+  // 改了文案 + 改了层名 → 不该硬认成同一块
+  const A = [mkBlk({ uid: 0, kind: 'text', path: '画板/旧', name: '旧', text: '立即咨询' })];
+  const B = [mkBlk({ uid: 0, kind: 'text', path: '画板/新', name: '新', text: '马上咨询' })];
+  const m = matchVersionBlocks(A, B);
+  ok('改名 + 改文案 → 报"删除 1 / 新增 1"，不硬认',
+    m.pairs.length === 0 && m.onlyFrom.length === 1 && m.onlyTo.length === 1,
+    `pairs=${m.pairs.length} from=${m.onlyFrom.length} to=${m.onlyTo.length}`);
+}
+
+/* —— ② 匹配可靠度：大面积对不上必须明说不可靠 —— */
+{
+  const A = Array.from({ length: 20 }, (_, i) => mkBlk({ uid: i, path: `旧/${i}`, name: `旧${i}`, x: i * 10 }));
+  const B = Array.from({ length: 20 }, (_, i) => mkBlk({ uid: i, path: `新/${i}`, name: `新${i}`, x: 3000 + i * 10 }));
+  const m = matchVersionBlocks(A, B);
+  const r = rel({ matched: m.pairs.length, exact: 0, approx: m.pairs.length, onlyFrom: m.onlyFrom.length, onlyTo: m.onlyTo.length, fromCount: 20, toCount: 20 });
+  ok('整版重画（path 与几何全换）→ 一块都配不上', m.pairs.length === 0 && r.matched === 0);
+  ok('大面积对不上 → 判「不可靠」并给出原因', r.reliable === false && typeof r.reason === 'string' && r.reason.length > 0, r.reason ?? '(没给原因)');
+}
+{
+  const A = Array.from({ length: 20 }, (_, i) => mkBlk({ uid: i, path: `旧/${i}`, name: `旧${i}`, x: i * 10 }));
+  const B = Array.from({ length: 20 }, (_, i) => mkBlk({ uid: i, path: `新/${i}`, name: `新${i}`, x: i * 10 }));
+  const m = matchVersionBlocks(A, B);
+  const r = rel({ matched: m.pairs.length, exact: 0, approx: m.pairs.length, fromCount: 20, toCount: 20 });
+  ok('层名整片换过（全部只能靠几何猜）→ 也判不可靠',
+    m.pairs.length === 20 && m.pairs.every((p) => p.how === 'approx') && r.reliable === false, r.reason ?? '');
+}
+{
+  const r = rel({ matched: 12, exact: 12, approx: 0, onlyFrom: 8, onlyTo: 8, fromCount: 20, toCount: 20 });
+  ok('匹配率的分母是**两边块数的较大值**（不是"已匹配+未匹配之和"，那会把未匹配算两遍）',
+    r.total === 20, `total=${r.total}（若算成 28 就是那个坑）`);
+  ok('12/20 = 60% ≥ 阈值 → 仍判可信（不误报不可靠）', r.reliable === true, r.reason ?? '');
+  const r2 = rel({ matched: 8, exact: 8, approx: 0, onlyFrom: 12, onlyTo: 12, fromCount: 20, toCount: 20 });
+  ok('8/20 = 40% < 阈值 → 判不可靠', r2.reliable === false, r2.reason ?? '');
+}
+{
+  const small = rel({ matched: 3, exact: 0, approx: 3, fromCount: 3, toCount: 3 });
+  ok('块数很少且**全部**靠猜 → 明说不可靠（不因样本小而放过）',
+    small.reliable === false && /全部/.test(small.reason ?? ''), small.reason ?? '');
+  const fine = rel({ matched: 3, exact: 3, approx: 0, fromCount: 3, toCount: 3 });
+  ok('块数很少但全部精确 → 不误判', fine.reliable === true && fine.smallSample === true);
+}
+
+/* —— ③ 变化分类：尺寸/圆角 · 颜色 · 布局 · 文字 · 边框 · 结构 —— */
+{
+  const base = mkBlk();
+  ok('圆角 14→16 → 尺寸/圆角类，文案「圆角 14→16」',
+    JSON.stringify(labelsOf(diffBlockItems(base, mkBlk({ radius: { corners: [16, 16, 16, 16], max: 16, pill: false } })))) === JSON.stringify(['圆角 14→16']));
+  ok('只改高度 → 「高度 42→44」',
+    labelsOf(diffBlockItems(mkBlk({ h: 42 }), mkBlk({ h: 44 })))[0] === '高度 42→44');
+  ok('只改宽度 → 「宽度 100→120」',
+    labelsOf(diffBlockItems(base, mkBlk({ w: 120 })))[0] === '宽度 100→120');
+  ok('宽高同改 → 合并成一条「尺寸 120×152→130×160」',
+    labelsOf(diffBlockItems(mkBlk({ w: 120, h: 152 }), mkBlk({ w: 130, h: 160 })))[0] === '尺寸 120×152→130×160');
+  ok('圆角 + 尺寸同时变 → 两条都在 size 类',
+    labelsOf(diffBlockItems(base, mkBlk({ w: 120, radius: { corners: [16, 16, 16, 16], max: 16, pill: false } }))).length === 2);
+  ok('完全没变 → 零条（不是空数组以外的任何东西）', diffBlockItems(base, mkBlk()).length === 0);
+}
+{
+  const a = mkBlk({
+    bg: { hex: '#574af4', alpha: 0.08, stops: [] }, color: '#333333', colorAlpha: 1, opacity: 1,
+    border: { color: '#e2e8f0', alpha: 1, colorKnown: true, width: 1, single: false, widths: { top: 1, right: 1, bottom: 1, left: 1 } },
+  });
+  const b = mkBlk({
+    bg: { hex: '#4f46e5', alpha: 0.1, stops: [] }, color: '#111111', colorAlpha: 0.5, opacity: 0.8,
+    border: { color: '#cbd5e1', alpha: 1, colorKnown: true, width: 1, single: false, widths: { top: 1, right: 1, bottom: 1, left: 1 } },
+  });
+  const items = diffBlockItems(a, b);
+  eq('底色/文字色/不透明度/描边色 四项都归「颜色」类', catsOf(items), ['color']);
+  ok('半透明底色给「@8%→@10%」且带 rgba（照抄不用换算）',
+    items.find((i) => i.field === 'bg').label.includes('#574af4@8%') && items.find((i) => i.field === 'bg').label.includes('rgba(87, 74, 244'),
+    items.find((i) => i.field === 'bg').label);
+  ok('半透明文字色也带 alpha（不能只给 hex）',
+    items.find((i) => i.field === 'color').label.includes('@50%'),
+    items.find((i) => i.field === 'color').label);
+  ok('不透明度变化单列一条', items.some((i) => i.field === 'opacity' && i.label === '不透明度 1→0.8'));
+  ok('渐变 stop 变了也算颜色变化',
+    diffBlockItems(mkBlk({ bg: { hex: '#a', alpha: 1, stops: [{ hex: '#a', alpha: 1 }, { hex: '#b', alpha: 1 }] } }),
+      mkBlk({ bg: { hex: '#a', alpha: 1, stops: [{ hex: '#a', alpha: 1 }, { hex: '#c', alpha: 1 }] } }))
+      .some((i) => i.field === 'bg'));
+}
+{
+  ok('布局：只改 y → 「下移 8px」', labelsOf(diffBlockItems(mkBlk({ y: 120 }), mkBlk({ y: 128 })))[0].startsWith('下移 8px'));
+  ok('布局：y 变小 → 「上移」', labelsOf(diffBlockItems(mkBlk({ y: 128 }), mkBlk({ y: 120 })))[0].startsWith('上移 8px'));
+  ok('布局：只改 x → 「右移 4px」', labelsOf(diffBlockItems(mkBlk({ x: 20 }), mkBlk({ x: 24 })))[0].startsWith('右移 4px'));
+  ok('布局：x/y 都变 → 「移动 (3, 4)px」', labelsOf(diffBlockItems(mkBlk({ x: 0, y: 0 }), mkBlk({ x: 3, y: 4 })))[0].startsWith('移动 (3, 4)px'));
+  const art = diffBlockItems(
+    mkBlk({ kind: 'artboard', path: '稿', x: -9876, y: 463, radius: null }),
+    mkBlk({ kind: 'artboard', path: '稿', x: -9879, y: 487, radius: null }));
+  ok('🔒 画板块的 x/y 变化**不算布局变化**（那是画布绝对坐标，报出来就是纯假差异）',
+    art.filter((i) => i.cat === 'layout').length === 0, labelsOf(art).join(' | '));
+}
+{
+  const a = mkBlk({ kind: 'text', text: '立即咨询', font: { family: 'Inter', size: 20, weight: 600, lineHeight: 28, letterSpacing: 0, align: 'left' } });
+  const b = mkBlk({ kind: 'text', text: '马上咨询', font: { family: 'PingFang SC', size: 22, weight: 700, lineHeight: 32, letterSpacing: 0.5, align: 'center' } });
+  const items = diffBlockItems(a, b);
+  eq('文字类：文案/字号/字重/字体族/行高/字距/对齐 七项都报', items.length, 7);
+  ok('文案给「从→到」', items[0].label === '文案 "立即咨询"→"马上咨询"', items[0].label);
+  ok('字号/字重给「从→到」',
+    items.some((i) => i.label === '字号 20→22') && items.some((i) => i.label === '字重 600→700'),
+    labelsOf(items).join(' | '));
+  ok('换字体也报（字体族）', items.some((i) => i.field === 'fontFamily' && i.label.includes('Inter→PingFang SC')));
+  ok('字重没变就不报（不硬凑）',
+    diffBlockItems(a, mkBlk({ ...a, text: '别的' })).every((i) => i.field !== 'fontWeight'));
+}
+{
+  const items = diffBlockItems(mkBlk({ kind: 'image', hasImage: true }), mkBlk({ kind: 'card', hasImage: false }));
+  eq('结构类：类型 + 切图 两条', items.length, 2);
+  eq('类型给「图片→卡片」', items[0].label, '类型 图片→卡片');
+  eq('切图给「有→无」', items[1].label, '切图 有→无');
+  ok('形状变化也报',
+    diffBlockItems(mkBlk({ shape: 'rect' }), mkBlk({ shape: 'ellipse' })).some((i) => i.field === 'shape'));
+  ok('子层数变化也报',
+    diffBlockItems(mkBlk({ childCount: 3 }), mkBlk({ childCount: 4 })).some((i) => i.field === 'childCount'));
+}
+{
+  const items = diffBlockItems(
+    mkBlk({ border: { color: '#e2e8f0', width: 1, single: true, widths: { top: 1, right: 0, bottom: 0, left: 0 } } }),
+    mkBlk({ border: null }));
+  ok('边框：有→无 归「边框」类，颜色变化归「颜色」类（两条各归其位，不混）',
+    items.some((i) => i.cat === 'border' && i.label.includes('→无'))
+    && items.some((i) => i.cat === 'color' && i.field === 'borderColor'),
+    labelsOf(items).join(' | '));
+}
+
+/* —— ④ 渲染：只列有变化的、无变化要明说、不可靠不出明细 —— */
+const mkDiff = (o = {}) => ({
+  ok: true, format: 'diff', name: '自检稿', viewport: { width: 375, height: 700 }, versionCount: 3,
+  from: { id: '11111111-0000-4000-8000-000000000001', createTime: 'Mon, 01 Sep 2026 00:00:00 UTC', index: 2, isLatest: false },
+  to: { id: '33333333-0000-4000-8000-000000000003', createTime: 'Thu, 04 Sep 2026 12:00:00 UTC', index: 0, isLatest: true },
+  sameVersion: false, gapSeconds: 302400, gapDays: 3.5,
+  identical: false, reliable: true,
+  reliability: { exact: 3, approx: 0, unmatched: 0, matched: 3, total: 3, matchedRatio: 1, approxShare: 0, smallSample: true, reliable: true, reason: null },
+  counts: { fromBlocks: 3, toBlocks: 3, noiseFrom: 0, noiseTo: 0, matched: 3, unchanged: 2, changed: { size: 1, color: 0, layout: 0, text: 0, border: 0, structure: 0, blocks: 1 }, added: 0, removed: 0 },
+  changes: {
+    size: [{ path: '画板/卡片', name: '卡片', kind: 'card', kindFrom: 'card', how: 'exact', field: 'radius', label: '圆角 14→16', from: 14, to: 16, where: '卡片' }],
+    color: [], layout: [], text: [], border: [], structure: [],
+  },
+  added: [], removed: [], notes: [],
+  ...o,
+});
+{
+  const t = renderDiff(mkDiff());
+  ok('明细里给「从→到」', t.includes('圆角 14→16'), t);
+  ok('零变化的块**只给一句汇总**（"其余 2 块未变"）', t.includes('未变：其余 2 块'), t);
+  ok('块数/版本/相隔天数都在抬头里', t.includes('块数 3 → 3') && t.includes('相隔 3.5 天'), t.split('\n')[0]);
+  ok('报出匹配可靠度（精确/近似/无法匹配）', /匹配可靠度：✅ 3 块按 path 精确匹配/.test(t));
+  ok('to 是最新版时写明"最新版"', t.includes('最新版'));
+}
+{
+  const t = renderDiff(mkDiff({
+    identical: true,
+    counts: { ...mkDiff().counts, unchanged: 3, changed: { size: 0, color: 0, layout: 0, text: 0, border: 0, structure: 0, blocks: 0 } },
+    changes: { size: [], color: [], layout: [], text: [], border: [], structure: [] },
+  }));
+  ok('零变化时**明说"两版一致"**（不是静默空输出）', t.includes('两版一致') && t.includes('没有任何差异'), t);
+  ok('零变化时给出可行动的结论（代码可以不动）', t.includes('设计没改'), t);
+  ok('零变化时不再重复"未变：其余 N 块"（那句话在"完全一致"时是废话）', !t.includes('未变：其余'));
+}
+{
+  const t = renderDiff(mkDiff({
+    reliable: false,
+    reliability: { exact: 1, approx: 0, unmatched: 19, matched: 1, total: 20, matchedRatio: 0.05, approxShare: 0, smallSample: false, reliable: false, reason: '只有 1/20 块能配上（匹配率 5%），19 块对不上。' },
+    counts: { ...mkDiff().counts, matched: 1, changed: { size: 0, color: 0, layout: 0, text: 0, border: 0, structure: 0, blocks: 0 }, added: 10, removed: 9 },
+    changes: { size: [], color: [], layout: [], text: [], border: [], structure: [] },
+    added: [{ path: 'x', name: '新块', kind: 'card', w: 10, h: 10, where: '新块' }],
+    removed: [{ path: 'y', name: '旧块', kind: 'card', w: 10, h: 10, where: '旧块' }],
+  }));
+  ok('大面积对不上 → 明说「逐块对比不可靠」并**拒绝出明细表**',
+    t.includes('逐块对比不可靠') && t.includes('不出明细表'), t);
+  ok('不可靠时**不列**新增/删除清单（硬凑的清单比不给更糟）', !t.includes('新块') && !t.includes('旧块'), t);
+  ok('不可靠时也把原因和计数说清楚', t.includes('匹配率 5%') || t.includes('1/20'), t);
+}
+{
+  const t = renderDiff(mkDiff({ sameVersion: true }));
+  ok('同一版本比自己 → 明说「两版一致」且点出"同一个版本"',
+    t.includes('两版一致') && t.includes('同一个版本'), t);
+}
+{
+  const many = Array.from({ length: 60 }, (_, i) => ({ path: `p${i}`, name: `块${i}`, kind: 'card', kindFrom: 'card', how: 'exact', field: 'radius', label: '圆角 1→2', from: 1, to: 2, where: `块${i}` }));
+  const t = renderDiff(mkDiff({ changes: { ...mkDiff().changes, size: many }, counts: { ...mkDiff().counts, changed: { ...mkDiff().counts.changed, size: 60 } } }));
+  ok('同类超过上限时**明说被截断**（不静默吞掉）', t.includes('还有 20 处'), t.split('\n').slice(-4).join(' / '));
+}
+
+/* —— ⑤ 端到端（mock fetch，零网络）：三次请求，两个版本 —— */
+{
+  const mockRes = (obj) => ({
+    ok: true, status: 200,
+    headers: { get: () => 'application/json; charset=utf-8' },
+    arrayBuffer: async () => Buffer.from(JSON.stringify(obj), 'utf8'),
+  });
+  const fxFill = (hex, alpha = 1) => {
+    const c = parseColor(hex);
+    return { type: 'color', isEnabled: true, color: { value: `rgba(${c.r}, ${c.g}, ${c.b}, ${alpha})` } };
+  };
+  const fxRect = (name, frame, o = {}) => ({
+    id: name, type: 'rectLayer', name, frame,
+    paths: o.radius ? [{ type: 'rect', radius: { topLeft: o.radius, topRight: o.radius, bottomRight: o.radius, bottomLeft: o.radius } }] : [],
+    style: { fills: o.fill === undefined ? [] : [fxFill(o.fill, o.fillAlpha ?? 1)], borders: o.borders ?? [] },
+  });
+  const fxText = (name, content, frame, o = {}) => {
+    const hex = o.color ?? '#333333';
+    const c = parseColor(hex);
+    return {
+      id: name, type: 'textLayer', name, frame,
+      style: { fills: [fxFill(hex, o.colorAlpha ?? 1)] },
+      text: {
+        style: {
+          content, color: { value: `rgba(${c.r}, ${c.g}, ${c.b}, ${o.colorAlpha ?? 1})` },
+          font: { name: o.family ?? 'Inter', size: o.size ?? 14, fontWeight: o.weight ?? 400, lineHeight: { value: o.lineHeight ?? 20 } },
+        },
+      },
+    };
+  };
+  const fxImage = (name, frame) => ({ id: name, type: 'rectLayer', name, frame, hasExportImage: true, style: {} });
+  const mkTree = (radius, title, size, btn, canvasLeft) => ({
+    meta: { device: 'iPhone 14' },
+    artboard: {
+      id: 'ab', type: 'artboard', name: '自检稿',
+      frame: { left: canvasLeft, top: 463, width: 375, height: 700 },
+      style: { fills: [fxFill('#ffffff')] },
+      layers: [
+        fxRect('卡片', { left: 16, top: 100, width: 343, height: 120 }, { radius, fill: '#ffffff' }),
+        fxText('标题', title, { left: 33, top: 120, width: 200, height: 24 }, { size, weight: 600 }),
+        fxText('按钮', btn, { left: 33, top: 190, width: 100, height: 24 }),
+        fxText('未变块甲', '甲', { left: 33, top: 240, width: 60, height: 20 }),
+        fxText('未变块乙', '乙', { left: 33, top: 270, width: 60, height: 20 }),
+        fxImage('头像', { left: 300, top: 120, width: 40, height: 40 }),
+        // 3×8 的图形碎片（面积 < 36）→ 判为 noise，默认不参与比对（两版都在，所以不影响差异）
+        fxRect('Path 3×8', { left: 350, top: 10, width: 3, height: 8 }, { fill: '#cccccc' }),
+      ],
+    },
+  });
+  const V1 = '11111111-0000-4000-8000-000000000001';
+  const V2 = '22222222-0000-4000-8000-000000000002';
+  const V3 = '33333333-0000-4000-8000-000000000003';
+  const T1 = 'https://mock.lanhu/t-v1.json';
+  const T2 = 'https://mock.lanhu/t-v2.json';
+  const T3 = 'https://mock.lanhu/t-v3.json';
+  const treeV1 = mkTree(14, '旧标题', 20, '立即咨询', -9876);
+  const treeV23 = mkTree(16, '新标题', 22, '马上咨询', -9879);
+  const versions = [
+    { id: V3, json_url: T3, create_time: 'Thu, 04 Sep 2026 12:00:00 UTC' },
+    { id: V2, json_url: T2, create_time: 'Thu, 04 Sep 2026 00:00:00 UTC' },
+    { id: V1, json_url: T1, create_time: 'Mon, 01 Sep 2026 00:00:00 UTC' },
+  ];
+  // ⚠️ `seen` 由调用方传进来 —— 用返回值传的话，**抛错那条路径拿不到它**，
+  //    而"报错前只发了几次请求"恰恰是要断言的东西（实测踩过：断言退化成看空数组）。
+  const withMockFetch = async (fn, seen) => {
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      seen.push(u);
+      if (u.includes('/api/project/image?')) {
+        return mockRes({ code: '00000', result: { id: 'i-mock', name: '自检稿', width: 375, height: 700, versions } });
+      }
+      if (u === T1) return mockRes(treeV1);
+      if (u === T2 || u === T3) return mockRes(treeV23);
+      throw new Error('未预期的请求：' + u);
+    };
+    try { return await fn(); } finally { globalThis.fetch = realFetch; }
+  };
+  const ACCT = { account: 'mock', cookie: 'PASSPORT=x; user_token=y' };
+
+  {
+    const seen = [];
+    const r = await withMockFetch(() => diffDesign({ projectId: 'p-mock', imageId: 'i-mock', from: V1, ...ACCT }), seen);
+    ok('端到端跑通（from 旧版 → to 默认最新版）', r?.ok === true && r.format === 'diff', r?.text?.split('\n')[0] ?? '');
+    eq('恰好 **3 次请求**：1 次版本列表 + **2 次图层树**（不做逐版本探测）', seen.length, 3);
+    eq('其中树请求**正好 2 个**', seen.filter((u) => u === T1 || u === T2 || u === T3).length, 2);
+    eq('块数（画板 + 6 块）', [r.counts.fromBlocks, r.counts.toBlocks], [7, 7]);
+    eq('全部按 path 精确匹配', [r.reliability.exact, r.reliability.approx, r.reliability.unmatched], [7, 0, 0]);
+    eq('变化 3 块 / 未变 4 块', [r.counts.changed.blocks, r.counts.unchanged], [3, 4]);
+    eq('各分类的变化块数', [r.counts.changed.size, r.counts.changed.text, r.counts.changed.layout, r.counts.changed.color], [1, 2, 0, 0]);
+    eq('尺寸类：卡片 圆角 14→16', r.changes.size.map((e) => `${e.where} ${e.label}`), ['卡片 圆角 14→16']);
+    ok('文字类：文案与字号都给「从→到」',
+      r.changes.text.some((e) => e.label === '字号 20→22') && r.changes.text.some((e) => e.label.includes('旧标题') && e.label.includes('新标题')),
+      r.changes.text.map((e) => e.label).join(' | '));
+    ok('🔒 **不逐块列未变的块**（文本里不出现未变块的名字）',
+      !r.text.includes('未变块甲') && !r.text.includes('未变块乙') && !r.text.includes('头像'), r.text);
+    ok('未变的块只给一句汇总', r.text.includes('未变：其余 4 块'), r.text);
+    ok('🔒 画板画布坐标变化**不算设计变更**（不进 layout，但用"注"如实交代）',
+      r.counts.changed.layout === 0 && r.notes.some((n) => n.includes('画布坐标')), r.notes.join(' | '));
+    ok('返回是 lossless（工具出口会过宿主那一关）', findIllegal(r).length === 0, findIllegal(r).slice(0, 3).join(', '));
+    ok('机器可读摘要齐备（changed / added / removed / unchanged / matchReliability）',
+      typeof r.counts.changed.size === 'number' && r.counts.added === 0 && r.counts.removed === 0
+      && r.counts.unchanged === 4 && typeof r.reliability.exact === 'number');
+    ok('提示里说明碎片块未参与比对（口径透明，不是静默少比了几块）',
+      r.notes.some((n) => n.includes('碎片') && n.includes('未参与比对')), r.notes.join(' | '));
+  }
+  {
+    const seen = [];
+    const r = await withMockFetch(() => diffDesign({ projectId: 'p-mock', imageId: 'i-mock', from: V2, to: V3, ...ACCT }), seen);
+    ok('两个版本内容一致 → identical:true', r.identical === true && r.reliable === true, JSON.stringify(r.counts));
+    eq('一致时各分类都是空的', r.counts.changed.blocks, 0);
+    eq('一致时没有新增/删除', [r.counts.added, r.counts.removed], [0, 0]);
+    ok('一致时**明说"两版一致"**（不是静默空输出）', r.text.includes('两版一致') && r.text.includes('没有任何差异'), r.text);
+    eq('同样只发 3 次请求', seen.length, 3);
+  }
+  {
+    const seen = [];
+    const r = await withMockFetch(() => diffDesign({ projectId: 'p-mock', imageId: 'i-mock', from: V3, to: V3, ...ACCT }), seen);
+    ok('🔒 **同一版本比自己 → 必须报"两版一致"**（防"永远有差异"的假阳性）',
+      r.identical === true && r.sameVersion === true && r.text.includes('两版一致'), r.text);
+  }
+  {
+    let err = null;
+    const seen = [];
+    try {
+      await withMockFetch(() => diffDesign({ projectId: 'p-mock', imageId: 'i-mock', from: 'no-such-version', ...ACCT }), seen);
+    } catch (e) { err = e; }
+    ok('🔒 `from` 给不存在的版本 id → **明确报错**（不许静默回退 latest）',
+      !!err && err.code === 'VERSION_NOT_FOUND' && /指定的版本不存在/.test(err.message), err ? `${err.code}: ${err.message}` : '(没抛错)');
+    ok('报错文案点名"不会静默回退到最新版"', !!err && /不会.*静默回退/.test(err.hint ?? ''), err?.hint ?? '');
+    eq('🔒 报错发生在**拉树之前**（只有 1 次版本列表请求，没有任何树请求）', seen.length, 1);
+  }
+  {
+    let err = null;
+    const seen = [];
+    try {
+      await withMockFetch(() => diffDesign({ projectId: 'p-mock', imageId: 'i-mock', ...ACCT }), seen);
+    } catch (e) { err = e; }
+    ok('不传 from → 明确报错并指出下一步', !!err && err.code === 'DIFF_FROM_REQUIRED' && /需要 `from`/.test(err.message), err ? err.message : '(没抛错)');
+    eq('不传 from 时**零树请求**', seen.length, 1);
+  }
+}
+
+/* —— ⑥ 工具层：注册、schema、系统提示 —— */
+{
+  const t = TOOLS.find((x) => x.name === 'lanhu_diff_design');
+  ok('lanhu_diff_design 已注册进 TOOLS', !!t);
+  ok('output schema 声明了 reliable / reliability / identical（能力不能藏着）',
+    !!t?.output?.schema?.properties?.reliable && !!t?.output?.schema?.properties?.reliability
+    && !!t?.output?.schema?.properties?.identical, Object.keys(t?.output?.schema?.properties ?? {}).join(','));
+  ok('from 是必填（写进标准 schema 的 required 数组）',
+    (t?.parameters?.required ?? []).includes('from'), JSON.stringify(t?.parameters?.required));
+  const r = await t.execute({ projectId: 'p', imageId: 'i' });
+  ok('缺 from 被 schema 拦下（进不了业务层，不花网络请求）',
+    r.failed === true && /from/.test(r.text), r.text.split('\n')[0]);
+  const toolDef = TOOLS.find((x) => x.name === 'lanhu_read_blocks');
+  ok('🔒 既有工具的 schema 与形状没被这次新增动过',
+    (toolDef?.parameters?.required ?? []).length === 0
+    && !!toolDef?.output?.schema?.properties?.version);
+}
+{
+  const hostSrc = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'lib', 'index.js'), 'utf8');
+  const from = hostSrc.indexOf('const SYSTEM_HINT = [');
+  const hint = hostSrc.slice(from, hostSrc.indexOf("].join('\\n');", from));
+  ok('SYSTEM_HINT 的工具决策树里有「要对比设计改了什么 → lanhu_diff_design」',
+    hint.includes('lanhu_diff_design') && hint.includes('这次设计改了什么'), hint.includes('lanhu_diff_design') ? '' : '(决策树里没有)');
+  ok('SYSTEM_HINT 里也明说了"差异过大时不给硬凑的差异表"', hint.includes('逐块对比不可靠'));
+
+  const cliSrc = fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'lanhu.mjs'), 'utf8');
+  ok('CLI 注册了 diff 命令', cliSrc.includes("'diff': cmdDiff,"));
+  ok('CLI 的 USAGE 里写了 diff（能力不能藏着）', /^ {2}diff {5}\[--url/m.test(cliSrc), (cliSrc.match(/^ {2}diff.*$/m) ?? ['(没有)'])[0]);
+  ok('CLI 里点明 diff **不认** --version（免得有人拿它当"读某一版"用）',
+    cliSrc.includes('**diff 不认 --version**'));
+}
+
+/* ═══════════════ ⑥.17 设计系统审计（第 3 步） ═══════════════ */
+group('⑥.17 设计系统审计');
+
+/** 造一个"稿"（审计只吃 `{imageId, imageName, blocks}`）。 */
+const mkScan = (imageId, imageName, blocks) => ({ imageId, imageName, blocks });
+/** 造一个块（字段形状与 `buildBlocks` 的输出一致）—— 只覆盖审计要看的那几项。 */
+const mkAuditBlk = (o = {}) => ({
+  kind: 'card', name: '块', path: '画板/块', x: 0, y: 0, w: 100, h: 40,
+  radius: { corners: [8, 8, 8, 8], max: 8, pill: false },
+  bg: null, opacity: 1, border: null, text: null, color: null, colorAlpha: null,
+  font: null, hasImage: false, noise: false, ...o,
+});
+/** 一行文字块。 */
+const mkText = (name, size, o = {}) => mkAuditBlk({ kind: 'text', name, font: { size, weight: 400, family: 'Inter' }, ...o });
+
+/* —— ① 判据：同一个组件怎么认 —— */
+{
+  ok('判据是「层名归一化后相同」：全角/大小写/连续空白折叠成同一个键',
+    auditNameKey('  主按钮　') === auditNameKey('主按钮') && auditNameKey('BTN') === auditNameKey('btn')
+    && auditNameKey('A  B') === auditNameKey('A B'),
+    `${JSON.stringify(auditNameKey('  主按钮　'))} / ${JSON.stringify(auditNameKey('  BTN '))}`);
+
+  const autoYes = ['Rectangle 12', '矩形 3', 'Group 5', 'Path 3×8', 'Frame 427', '椭圆 2', '12', 'A1', '副本 2', '', '   ', '组 2', '占位符'];
+  const autoNo = ['主按钮', 'MainFrame', 'CardGroup', 'icon-arrow', '按钮-primary', '标题栏', 'logo2'];
+  const missed = autoYes.filter((n) => !isAutoLayerName(n).auto);
+  const hurt = autoNo.filter((n) => isAutoLayerName(n).auto);
+  ok('工具默认名一律判为不可靠（Rectangle 12 / 矩形 3 / Path 3×8 / 空名 / 纯数字…）', missed.length === 0, missed.join(', '));
+  ok('🔒 真名不被误伤（MainFrame / CardGroup / icon-arrow / logo2 …）', hurt.length === 0, hurt.join(', '));
+  ok('空名单独归类（why=empty，与"模板名"分开计）', isAutoLayerName('').why === 'empty' && isAutoLayerName('Rectangle 12').why === 'template');
+  ok('空名/模板名/太短 三种原因可分辨', isAutoLayerName('底').why === 'tooShort');
+
+  // 同名归一组：3 张稿里的「主按钮」进同一个组（另有一颗"卡片"必须**另成一组** ——
+  // 这条让"按块下标/不认名字"的退化当场红：那样所有块会被并成一组）
+  const scans = [
+    mkScan('i1', '稿1', [mkAuditBlk({ name: '主按钮' }), mkAuditBlk({ name: '主按钮' }), mkAuditBlk({ name: '卡片' })]),
+    mkScan('i2', '稿2', [mkAuditBlk({ name: ' 主按钮 ' })]),
+  ];
+  const comp = collectAuditComponents(scans);
+  ok('同名（归一化后）的块归为**一组**，不同名的**另成一组**',
+    comp.groups.size === 2 && comp.groups.has('主按钮') && comp.groups.has('卡片'),
+    JSON.stringify([...comp.groups.keys()]));
+  ok('参与判定按名字分组算：主按钮（2 张稿 / 3 块）参与，卡片（1 块）不参与',
+    comp.participated.length === 1 && comp.participated[0].name === '主按钮' && comp.participated[0].blocks.length === 3,
+    `participated=${comp.participated.map((g) => g.name).join(',')}`);
+  ok('组里记着跨了几张稿、几块', comp.participated[0].images.size === 2 && comp.participated[0].blocks.length === 3);
+  ok('归一化不剥尾号：`主按钮` 与 `主按钮 2` 是两组（硬并会造出假"多规格"）',
+    collectAuditComponents([mkScan('i1', '稿1', [mkAuditBlk({ name: '主按钮' }), mkAuditBlk({ name: '主按钮 2' })])]).groups.size === 2);
+
+  // 自动名/空名被排除，且计数进"未参与"
+  const mixed = collectAuditComponents([
+    mkScan('i1', '稿1', [mkAuditBlk({ name: '主按钮' }), mkAuditBlk({ name: 'Rectangle 12' }), mkAuditBlk({ name: '' })]),
+    mkScan('i2', '稿2', [mkAuditBlk({ name: '主按钮' }), mkAuditBlk({ name: '矩形 3' }), mkAuditBlk({ name: '  ' })]),
+  ]);
+  ok('自动名**不参与**归组，但计数进 naming.auto', mixed.naming.auto === 2 && mixed.groups.size === 1,
+    `auto=${mixed.naming.auto} groups=${mixed.groups.size}`);
+  ok('空名**不参与**归组，但计数进 naming.empty', mixed.naming.empty === 2);
+  ok('命名覆盖率给出分母与分子（说清"这条结论建立在什么基础上"）',
+    mixed.naming.total === 6 && mixed.naming.named === 2 && mixed.naming.namedShare === 0.33,
+    `total=${mixed.naming.total} named=${mixed.naming.named} share=${mixed.naming.namedShare}`);
+
+  // 参与门槛
+  const thin = collectAuditComponents([
+    mkScan('i1', '稿1', [mkAuditBlk({ name: '只看一次' })]),
+    mkScan('i2', '稿2', [mkAuditBlk({ name: '主按钮' }), mkAuditBlk({ name: '主按钮' })]),
+  ]);
+  ok('只出现在 1 张稿里的组件名**不参与**（跨稿结论需要跨稿样本）',
+    thin.participated.length === 0 && thin.thinBlocks === 3, `participated=${thin.participated.length}`);
+  ok('参与门槛（≥2 张稿 且 ≥3 块）进了 LIMITS，没有裸写在逻辑里',
+    LIMITS.auditMinComponentImages === 2 && LIMITS.auditMinComponentBlocks === 3);
+}
+
+/* —— ② 同一组件、多种规格（最有价值的一项） —— */
+{
+  const scans = [
+    mkScan('i1', '首页', [mkAuditBlk({ name: '主按钮', radius: { max: 8 }, h: 44 })]),
+    mkScan('i2', '详情页', [mkAuditBlk({ name: '主按钮', radius: { max: 8 }, h: 44 })]),
+    mkScan('i3', '下单页', [mkAuditBlk({ name: '主按钮', radius: { max: 12 }, h: 44 })]),
+    mkScan('i4', '我的', [mkAuditBlk({ name: '主按钮', radius: { max: 8 }, h: 44 })]),
+    mkScan('i5', '设置', [mkAuditBlk({ name: '主按钮', radius: { max: 9999 }, h: 48 })]),
+  ];
+  const comp = collectAuditComponents(scans);
+  const r = auditComponentSpecs(comp.participated);
+  const btn = r.findings.find((f) => f.name === '主按钮');
+  ok('同一个组件、多种圆角 → 出发现（且只把同名块归进这一组）',
+    !!btn && comp.groups.size === 1 && btn.blocks === 5 && btn.images === 5,
+    JSON.stringify([r.findings.map((f) => f.name), comp.groups.size]));
+  const rad = btn?.dims.find((d) => d.dim === 'radius');
+  ok('圆角分布给「值 + 计数 + 张数」：8px(3) / 12px(1) / 9999px(1)',
+    rad?.distinct === 3 && rad.values.map((v) => `${v.value}:${v.count}`).join(',') === '8:3,12:1,9999:1',
+    JSON.stringify(rad?.values?.map((v) => [v.value, v.count])));
+  ok('给出「建议以哪个为准」= 多数派', rad?.majority === 8 && rad.majorityCount === 3);
+  ok('每个取值带**具体例子（哪几张稿）**',
+    rad.values[0].examples.join(',') === '首页,详情页,我的', JSON.stringify(rad.values[0].examples));
+  ok('高度也单独报（同一颗按钮两种高度）',
+    btn.dims.some((d) => d.dim === 'height' && d.distinct === 2 && d.majority === 44));
+
+  const only = auditComponentSpecs(collectAuditComponents([
+    mkScan('i1', '稿1', [mkAuditBlk({ name: '卡片', radius: { max: 8 } }), mkAuditBlk({ name: '卡片', radius: { max: 8 } })]),
+    mkScan('i2', '稿2', [mkAuditBlk({ name: '卡片', radius: { max: 8 } })]),
+  ]).participated);
+  ok('只有一种规格 → **不算发现**（"只有一种"不是漂移）', only.findings.length === 0 && only.converged === 1);
+
+  const tie = auditComponentSpecs(collectAuditComponents([
+    mkScan('i1', '稿1', [mkAuditBlk({ name: '标签', radius: { max: 4 } })]),
+    mkScan('i2', '稿2', [mkAuditBlk({ name: '标签', radius: { max: 6 } })]),
+    mkScan('i3', '稿3', [mkAuditBlk({ name: '标签', radius: { max: 4 } }), mkAuditBlk({ name: '标签', radius: { max: 6 } })]),
+  ]).participated);
+  const tagRad = tie.findings[0]?.dims.find((d) => d.dim === 'radius');
+  ok('🔒 次数并列时**明说无法判定多数派**（不硬挑一个当"建议"）',
+    tagRad?.tie === true && tagRad.majority === null, JSON.stringify(tagRad ? [tagRad.tie, tagRad.majority] : null));
+}
+
+/* —— ③ 字号阶梯 —— */
+{
+  const many = [];
+  for (let i = 0; i < 6; i += 1) many.push(mkText('标题', 14, { path: `p${i}` }));
+  for (let i = 0; i < 4; i += 1) many.push(mkText('正文', 12, { path: `q${i}` }));
+  for (let i = 0; i < 3; i += 1) many.push(mkText('说明', 16, { path: `r${i}` }));
+  many.push(mkText('怪一号', 13, { path: 's1' }));
+  many.push(mkText('怪二号', 15, { path: 's2' }));
+  const scans = [mkScan('i1', '稿1', many)];
+  const f = auditFontScale(scans);
+  ok('字号阶梯：统计种类与总数', f.distinct === 5 && f.total === 15, `distinct=${f.distinct} total=${f.total}`);
+  ok('只出现 1 次的字号被单独列成"一次性野值"（13 / 15）',
+    f.oneOffs.map((o) => o.value).join(',') === '13,15', JSON.stringify(f.oneOffs.map((o) => o.value)));
+  ok('野值给收敛建议（并到最近的"常用档"：13→12、15→14）',
+    f.oneOffs.map((o) => `${o.value}->${o.nearest}`).join(',') === '13->12,15->14'
+    && f.ladder.join(',') === '12,14,16',
+    JSON.stringify(f.oneOffs.map((o) => [o.value, o.nearest])));
+  ok('字号阶梯失控 → 出发现', f.drift === true);
+
+  const clean = auditFontScale([mkScan('i1', '稿1', [mkText('a', 12), mkText('b', 12), mkText('c', 14), mkText('d', 14)])]);
+  ok('字号收敛（无一次性野值、种类不多）→ 不报漂移', clean.drift === false && clean.oneOffs.length === 0);
+
+  ok('不看层名也能算（命名不可靠时它仍然可用）',
+    auditFontScale([mkScan('i1', '稿1', [mkText('Rectangle 12', 12), mkText('Rectangle 13', 12)])]).distinct === 1);
+}
+
+/* —— ④ 近重复色 —— */
+{
+  const scans = [
+    mkScan('i1', '稿1', [mkAuditBlk({ name: 'a', bg: { hex: '#574af4', alpha: 1, stops: [] } }), mkAuditBlk({ name: 'b', bg: { hex: '#574af4', alpha: 1, stops: [] } })]),
+    mkScan('i2', '稿2', [mkAuditBlk({ name: 'c', bg: { hex: '#574bf5', alpha: 1, stops: [] } })]),
+    mkScan('i3', '稿3', [mkAuditBlk({ name: 'd', bg: { hex: '#ff0000', alpha: 1, stops: [] } })]),
+  ];
+  const colors = [...collectAuditColors(scans).values()];
+  const clusters = nearColorClusters(colors);
+  ok('近重复色聚成一簇（#574af4 ≈ #574bf5）', clusters.length === 1 && clusters[0].members.length === 2,
+    JSON.stringify(clusters.map((c) => c.members.map((m) => m.key))));
+  ok('簇里给出**距离**与阈值（判据可解释）', clusters[0].maxDistance === 1.41 && LIMITS.auditNearColorDistance === 12,
+    `${clusters[0].maxDistance} vs ${LIMITS.auditNearColorDistance}`);
+  ok('给出「建议统一为哪个」= 用得最多的那个', clusters[0].majority === '#574af4');
+  ok('距离超阈值的色**不**聚在一起（#ff0000 不在这一簇）',
+    clusters.every((c) => c.members.every((m) => m.key !== '#ff0000')));
+  ok('阈值进 LIMITS（不在逻辑里裸写 12）', typeof LIMITS.auditNearColorDistance === 'number'
+    && /LIMITS\.auditNearColorDistance/.test(fs.readFileSync(path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'lanhu.mjs'), 'utf8')));
+  ok('RGB 距离判据本身可算（#574af4 vs #574bf5 = √2 ≈ 1.41）',
+    Math.abs(rgbDistance(parseColor('#574af4'), parseColor('#574bf5')) - Math.SQRT2) < 1e-9);
+  ok('`#333` 与 `#333333` 是**同一个**色值（归一化后不重复计数）',
+    collectAuditColors([mkScan('i1', '稿1', [mkAuditBlk({ name: 'x', bg: { hex: '#333', alpha: 1, stops: [] } })])]).size === 1
+    && parseColor('#333').r === parseColor('#333333').r);
+  ok('🔒 半透明与不透明是**两个**色值（alpha 进 key，不混为一谈）',
+    collectAuditColors([mkScan('i1', '稿1', [
+      mkAuditBlk({ name: 'x', bg: { hex: '#000000', alpha: 1, stops: [] } }),
+      mkAuditBlk({ name: 'y', bg: { hex: '#000000', alpha: 0.1, stops: [] } }),
+    ])]).size === 2);
+  ok('全透明（alpha 0）不算色值', collectAuditColors([mkScan('i1', '稿1', [mkAuditBlk({ name: 'x', bg: { hex: '#000000', alpha: 0, stops: [] } })])]).size === 0);
+  ok('文字色 / 描边色 / 渐变 stop 都进色板',
+    collectAuditColors([mkScan('i1', '稿1', [mkAuditBlk({
+      name: 'x', bg: { hex: '#111111', alpha: 1, stops: [{ hex: '#222222', alpha: 1 }, { hex: '#333333', alpha: 1 }] },
+      color: '#444444', colorAlpha: 1, border: { color: '#555555', alpha: 1 },
+    })])]).size === 5);
+  ok('🔒 同 hex、不同透明度**不**聚成一簇（#4693ff 与 #4693ff@60% 不是"同一色的两种写法"）',
+    nearColorClusters([
+      { key: '#4693ff', hex: '#4693ff', alpha: 1, count: 50, roles: new Set(['bg']), images: new Map(), rgb: parseColor('#4693ff') },
+      { key: '#4693ff@60%', hex: '#4693ff', alpha: 0.6, count: 8, roles: new Set(['border']), images: new Map(), rgb: parseColor('#4693ff') },
+    ]).length === 0);
+  {
+    // 🔒 链式陷阱：A≈B、B≈C 但 A 与 C 差 22.5 —— 用连通分量会连成 {A,B,C} 并谎称"肉眼分不出"
+    const mk = (hex, count) => ({ key: hex, hex, alpha: 1, count, roles: new Set(['bg']), images: new Map(), rgb: parseColor(hex) });
+    const chained = nearColorClusters([mk('#ffffff', 10), mk('#f9f9f9', 5), mk('#f2f2f2', 3)]);
+    ok('🔒 色簇用**完全链接**（链式近似不许连成一簇）',
+      chained.length === 1 && chained[0].members.length === 2 && !chained[0].members.some((m) => m.key === '#f2f2f2'),
+      JSON.stringify(chained.map((c) => c.members.map((m) => m.key))));
+    ok('🔒 簇内**任意两个**都 ≤ 阈值（"肉眼分不出"不是假话）',
+      chained.every((c) => c.maxDistance <= LIMITS.auditNearColorDistance), JSON.stringify(chained.map((c) => c.maxDistance)));
+    // 反向：真正紧邻的三兄弟（#333333 / #333 / #343434）必须进同一簇
+    const tight = nearColorClusters([mk('#333333', 4), mk('#343434', 2), mk('#323232', 1)]);
+    ok('真正紧邻的"三种深灰"进同一簇（#333333 / #343434 / #323232）',
+      tight.length === 1 && tight[0].members.length === 3 && tight[0].majority === '#333333',
+      JSON.stringify(tight.map((c) => c.members.map((m) => m.key))));
+  }
+}
+
+/* —— ⑤ 间距尺度 / 圆角家族（参考项） —— */
+{
+  const scans = [mkScan('i1', '稿1', [
+    mkAuditBlk({ name: 'a', x: 0, y: 0, w: 100, h: 40, radius: { max: 8 } }),
+    mkAuditBlk({ name: 'b', x: 113, y: 0, w: 100, h: 40, radius: { max: 6 } }),   // 间距 13 → 野值
+    mkAuditBlk({ name: 'c', x: 228, y: 0, w: 100, h: 40, radius: { max: 10 } }),  // 间距 15 → 野值
+    mkAuditBlk({ name: 'd', x: 0, y: 100, w: 100, h: 40, radius: { max: 38 } }),  // 间距 60（栅格内），圆角 38 特例
+  ])];
+  const sp = auditSpacing(scans);
+  ok('间距野值被识别（不在 4 的倍数上）', sp.offGrid.map((v) => v.value).join(',') === '13,15', JSON.stringify(sp.offGrid.map((v) => v.value)));
+  ok('间距判据（栅格）进 LIMITS', sp.grid === LIMITS.auditSpacingGrid && LIMITS.auditSpacingGrid === 4);
+  ok('野值不够多时不报漂移（阈值在 LIMITS 里）', sp.drift === (sp.offGridCount >= LIMITS.auditOffGridMinValues), `off=${sp.offGridCount} drift=${sp.drift}`);
+  ok('间距只统计 ≤ auditSpacingMaxDistance 的（几百 px 是留白不是尺度）',
+    sp.top.every((v) => v.value <= LIMITS.auditSpacingMaxDistance), JSON.stringify(sp.top.map((v) => v.value)));
+
+  const clean = auditSpacing([mkScan('i1', '稿1', [
+    mkAuditBlk({ name: 'a', x: 0, y: 0, w: 100, h: 40 }),
+    mkAuditBlk({ name: 'b', x: 116, y: 0, w: 100, h: 40 }),
+  ])]);
+  ok('间距都在栅格上 → 不报漂移', clean.drift === false && clean.offGridCount === 0);
+
+  const rad = auditRadiusFamily([mkScan('i1', '稿1', [
+    mkAuditBlk({ name: 'a', radius: { max: 8 } }), mkAuditBlk({ name: 'b', radius: { max: 9999 } }),
+    mkAuditBlk({ name: 'c', radius: { max: 38 } }),
+  ])]);
+  ok('圆角家族：9999（胶囊）在刻度的白名单里，38 是特例',
+    rad.offScale.map((v) => v.value).join(',') === '38', JSON.stringify(rad.offScale.map((v) => v.value)));
+  ok('刻度清单进 LIMITS（不裸写）', Array.isArray(LIMITS.auditRadiusScale) && LIMITS.auditRadiusScale.includes(9999));
+  ok('圆角家族标注为参考项（不是"错误"）', rad.offScaleCount === 1 && rad.drift === false);
+}
+
+/* —— ⑥ 可靠度：命名不可靠 → 拒绝出明细 —— */
+{
+  const autoOnly = [
+    mkScan('i1', '稿1', [mkAuditBlk({ name: 'Rectangle 12', radius: { max: 8 } }), mkAuditBlk({ name: 'Rectangle 13', radius: { max: 12 } }), mkAuditBlk({ name: 'Group 1', radius: { max: 4 } })]),
+    mkScan('i2', '稿2', [mkAuditBlk({ name: 'Rectangle 12', radius: { max: 8 } }), mkAuditBlk({ name: '', radius: { max: 12 } }), mkAuditBlk({ name: '矩形 3', radius: { max: 4 } })]),
+  ];
+  const rel = auditReliability({ imagesWithLayers: 2, totalBlocks: 6, naming: collectAuditComponents(autoOnly).naming });
+  ok('🔒 命名不可靠 → reliable:false 并给出原因', rel.reliable === false && /命名不可靠/.test(rel.reasons[0]), rel.reasons.join(' | '));
+  ok('可靠率阈值进 LIMITS（30%，不裸写）', LIMITS.auditMinNamedShare === 0.3);
+  ok('命名覆盖率自带 namedShare（判可靠度的输入不许散在两个字段里）',
+    collectAuditComponents(autoOnly).naming.namedShare === 0);
+  ok('样本太少（读到图层的稿 < 2 张）→ 也判不可靠',
+    auditReliability({ imagesWithLayers: 1, totalBlocks: 5, naming: { total: 5, named: 5, auto: 0, empty: 0, namedShare: 1 } }).reliable === false);
+  ok('命名好、样本够 → 判可靠',
+    auditReliability({ imagesWithLayers: 3, totalBlocks: 5, naming: { total: 5, named: 5, auto: 0, empty: 0, namedShare: 1 } }).reliable === true);
+}
+
+/* —— ⑦ 端到端（mock fetch，零网络）：成本受控 + 三种漂移 + 无漂移明说 —— */
+{
+  const mkRes = (obj) => ({
+    ok: true, status: 200,
+    headers: { get: () => 'application/json; charset=utf-8' },
+    arrayBuffer: async () => Buffer.from(JSON.stringify(obj), 'utf8'),
+  });
+  const fxFill = (hex, alpha = 1) => {
+    const c = parseColor(hex);
+    return { type: 'color', isEnabled: true, color: { value: `rgba(${c.r}, ${c.g}, ${c.b}, ${alpha})` } };
+  };
+  const fxRect = (name, frame, o = {}) => ({
+    id: name, type: 'rectLayer', name, frame,
+    paths: o.radius ? [{ type: 'rect', radius: { topLeft: o.radius, topRight: o.radius, bottomRight: o.radius, bottomLeft: o.radius } }] : [],
+    style: { fills: o.fill === undefined ? [] : [fxFill(o.fill, o.fillAlpha ?? 1)] },
+  });
+  const fxText = (name, content, frame, o = {}) => {
+    const hex = o.color ?? '#333333';
+    const c = parseColor(hex);
+    return {
+      id: name, type: 'textLayer', name, frame,
+      style: { fills: [fxFill(hex, o.colorAlpha ?? 1)] },
+      text: { style: { content, color: { value: `rgba(${c.r}, ${c.g}, ${c.b}, ${o.colorAlpha ?? 1})` },
+        font: { name: 'Inter', size: o.size ?? 14, fontWeight: 400, lineHeight: { value: 20 } } } },
+    };
+  };
+  const uid = (i) => `0000000${i}-0000-4000-8000-00000000000${i}`;
+  /** 一版"稿"：按钮圆角/高度/底色 + 标题字号可变（其余固定）。 */
+  const mkTree = (label, { radius, btnH, btnColor, titleSize, autoNames = false }) => ({
+    meta: { device: 'iPhone 14' },
+    artboard: {
+      id: 'ab', type: 'artboard', name: label,
+      frame: { left: -100, top: 0, width: 375, height: 700 },
+      style: { fills: [fxFill('#ffffff')] },
+      layers: [
+        fxRect(autoNames ? 'Rectangle 12' : '主按钮', { left: 16, top: 100, width: 343, height: btnH }, { radius, fill: btnColor }),
+        fxText(autoNames ? 'Text 1' : '标题', `${label}标题`, { left: 33, top: 60, width: 200, height: 24 }, { size: titleSize }),
+        fxText(autoNames ? 'Text 2' : '正文', '甲', { left: 33, top: 300, width: 60, height: 20 }),
+        fxRect('Path 3×8', { left: 350, top: 10, width: 3, height: 8 }, { fill: '#cccccc' }),
+      ],
+    },
+  });
+  const withMock = async (fn, spec) => {
+    const seen = [];
+    const real = globalThis.fetch;
+    globalThis.fetch = async (url) => {
+      const u = String(url);
+      seen.push(u);
+      if (u.includes('/api/project/images?')) {
+        return mkRes({ code: '00000', result: { name: '审计项目', images: spec.images } });
+      }
+      const m = u.match(/image_id=([^&]+)/);
+      if (u.includes('/api/project/image?')) {
+        const i = spec.images.findIndex((x) => x.id === decodeURIComponent(m[1]));
+        if (i < 0) return mkRes({ code: '00000', result: {} });
+        const img = spec.images[i];
+        if (img.bad === 'noLayers') return mkRes({ code: '00000', result: { id: img.id, name: img.name, width: 375, height: 700, versions: [{ id: uid(0) }] } });
+        if (img.bad === 'error') throw new Error('mock 网络炸了：' + img.name);
+        return mkRes({ code: '00000', result: {
+          id: img.id, name: img.name, width: 375, height: 700,
+          versions: [{ id: uid(i), json_url: `https://mock.lanhu/t${i}.json` }],
+        } });
+      }
+      const t = u.match(/t(\d+)\.json/);
+      if (t) {
+        const idx = Number(t[1]);
+        if (spec.images[idx]?.bad === 'sketch') return mkRes({ type: 'sketchPlugin', info: [{ id: 'ab', name: 'Sketch 稿' }] });
+        return mkRes(spec.trees[idx]);
+      }
+      throw new Error('未预期的请求：' + u);
+    };
+    try { return { r: await fn(), seen }; } finally { globalThis.fetch = real; }
+  };
+  const ACCT = { account: 'mock', cookie: 'PASSPORT=x; user_token=y' };
+  const specOf = (n, opts = {}) => {
+    const images = Array.from({ length: n }, (_, i) => ({ id: uid(i), name: `稿${i}`, width: 93.75, height: 175 }));
+    const trees = images.map((img, i) => mkTree(img.name, {
+      radius: opts.radius ? opts.radius(i) : 8,
+      btnH: opts.btnH ? opts.btnH(i) : 44,
+      btnColor: opts.btnColor ? opts.btnColor(i) : '#574af4',
+      titleSize: opts.titleSize ? opts.titleSize(i) : 14,
+      autoNames: Boolean(opts.autoNames),
+    }));
+    return { images, trees };
+  };
+
+  {
+    const spec = specOf(5, {
+      radius: (i) => (i === 3 ? 12 : (i === 4 ? 9999 : 8)),
+      btnH: (i) => (i === 4 ? 48 : 44),
+      btnColor: (i) => (i === 2 ? '#574bf5' : '#574af4'),
+      titleSize: (i) => [20, 20, 13, 15, 17][i],
+    });
+    const { r, seen } = await withMock(() => auditProject({ projectId: 'p-mock', limit: 5, ...ACCT }), spec);
+    ok('端到端跑通（format=audit）', r?.ok === true && r.format === 'audit', r?.text?.split('\n')[0] ?? '');
+    eq('🔒 成本 = 1 次列稿 + **每张 2 次**（scanned×2 + 1）', seen.length, 1 + 5 * 2);
+    eq('扫描张数', r.scanned, 5);
+    eq('未被截断时 truncated=false', r.truncated, false);
+    eq('三种漂移都被识别', r.driftedCategories.slice().sort().join(','), 'colorDrift,componentSpec,fontScale');
+    ok('① 组件多规格：圆角 8(3 张) / 12(1) / 9999(1) + 多数派建议',
+      r.findings.componentSpec.findings[0].dims.some((d) => d.dim === 'radius' && d.majority === 8),
+      JSON.stringify(r.findings.componentSpec.findings[0]?.dims));
+    ok('② 字号阶梯：13/15/17 只出现 1 次',
+      r.findings.fontScale.oneOffs.map((o) => o.value).sort((a, b) => a - b).join(',') === '13,15,17');
+    ok('③ 近重复色：一簇、多数派是 #574af4',
+      r.findings.colorDrift.clusters.length === 1 && r.findings.colorDrift.clusters[0].majority === '#574af4');
+    ok('判据写进结果（不必猜"同一个组件"是什么意思）',
+      /层名归一化后相同/.test(r.findings.componentSpec.basis) && /Rectangle 12/.test(r.findings.componentSpec.basisExcludes));
+    ok('输出写明 scanned / total / truncated',
+      r.text.includes('扫描：**5 / 5 张**') && r.text.includes('项目共 **5** 张'), r.text.split('\n')[2]);
+    ok('人读文本里也有三种漂移的小节与例子',
+      r.text.includes('## ① 同一组件、多种规格') && r.text.includes('## ② 字号阶梯') && r.text.includes('## ③ 色值漂移（近重复色）')
+      && r.text.includes('建议以 **8px** 为准'));
+    ok('④ 间距与 ⑤ 圆角标注为"参考项"（只给分布，不下判决）',
+      r.text.includes('参考项') && r.text.includes('不是硬规范'), r.text.split('\n').filter((l) => l.startsWith('> ')).join(' / '));
+    ok('返回是 lossless（工具出口会过宿主那一关）', findIllegal(r).length === 0, findIllegal(r).slice(0, 3).join(', '));
+    ok('机器可读摘要齐备（scanned/total/truncated/reliable/naming/driftedCategories/findings）',
+      typeof r.scanned === 'number' && typeof r.total === 'number' && typeof r.truncated === 'boolean'
+      && typeof r.reliable === 'boolean' && typeof r.naming.named === 'number' && Array.isArray(r.driftedCategories)
+      && typeof r.findings === 'object');
+  }
+  {
+    // 无漂移：全部收敛 → **明说"未发现漂移"**，不是静默空输出
+    const spec = specOf(4, { autoNames: false });
+    // 让字号只有一种（都 14），色值只有一种，圆角都 8
+    const { r } = await withMock(() => auditProject({ projectId: 'p-mock', limit: 4, ...ACCT }), spec);
+    ok('🔒 没有漂移时**明说"未发现漂移"**（不是静默空输出）', r.anyDrift === false && r.text.includes('未发现漂移'), r.text.split('\n').slice(3, 6).join(' / '));
+    ok('每一类各自也说清"未发现漂移/特例"（不是只给一句总结）',
+      (r.text.match(/未发现漂移|未发现特例/g) ?? []).length >= 3, String((r.text.match(/未发现漂移|未发现特例/g) ?? []).length));
+    ok('无漂移时机器可读的 driftedCategories 是空数组', r.driftedCategories.length === 0);
+  }
+  {
+    // 命名不可靠 → 默认拒绝出明细
+    const spec = specOf(3, { autoNames: true, radius: (i) => (i === 1 ? 12 : 8) });
+    const { r } = await withMock(() => auditProject({ projectId: 'p-mock', limit: 3, ...ACCT }), spec);
+    ok('🔒 命名不可靠 → reliable:false', r.reliable === false && /命名不可靠/.test(r.reasons.join(' ')), r.reasons.join(' | '));
+    ok('🔒 命名不可靠时 primaryReason=naming（与"样本为空"分开）', r.primaryReason === 'naming', String(r.primaryReason));
+    ok('🔒 工具默认名（Rectangle 12 / Text 1 / Path 3×8）**没参与**组件识别，且计数进 naming.auto',
+      r.naming.auto === 3 * 3 && !r.findings.componentSpec.findings?.some((f) => /Rectangle|Text|Path/.test(f.name)),
+      `auto=${r.naming.auto} named=${r.naming.named}`);
+    ok('🔒 命名不可靠 → **默认一项明细都不出**（连不看名字的字号也不出）',
+      r.suppressed.length === 5 && r.findings.componentSpec.findings.length === 0
+      && r.findings.fontScale.suppressed === true && r.findings.colorDrift.suppressed === true);
+    ok('🔒 人读文本明说「本项审计不可靠 —— 不出明细」并交代为什么',
+      r.text.includes('本项审计不可靠') && r.text.includes('不出明细') && r.text.includes('认错组件'), r.text.slice(-400));
+    ok('不可靠时给出可执行的下一步（规范化层名 / allowWeakNaming）',
+      r.text.includes('层名规范化') && r.text.includes('allowWeakNaming'));
+    ok('不可靠时不硬凑出"几种圆角"的表（正文里没有组件规格小节的数据行）',
+      !/建议以 \*\*\d+px\*\* 为准/.test(r.text));
+
+    const { r: weak } = await withMock(() => auditProject({ projectId: 'p-mock', limit: 3, allowWeakNaming: true, ...ACCT }), spec);
+    ok('allowWeakNaming 只放开**不依赖层名**的那几项（组件规格仍然跳过）',
+      weak.weakMode === true && weak.suppressed.join(',') === 'componentSpec'
+      && weak.findings.componentSpec.suppressed === true && weak.findings.fontScale.suppressed === false);
+    ok('弱模式下人读文本明确标注「已跳过」与"只看块属性、不看层名"',
+      weak.text.includes('已跳过') && weak.text.includes('不看层名'), weak.text.split('\n').slice(0, 12).join(' / '));
+    ok('弱模式下仍然 reliable:false（没有把"放宽"说成"可信"）', weak.reliable === false);
+  }
+  {
+    // 上限：默认只扫默认张数；传大值不许超过硬上限
+    const images = Array.from({ length: 7 }, (_, i) => ({ id: uid(i), name: `稿${i}`, width: 93.75, height: 175 }));
+    const trees = images.map((img) => mkTree(img.name, { radius: 8, btnH: 44, btnColor: '#574af4', titleSize: 14 }));
+    const { r: d } = await withMock(() => auditProject({ projectId: 'p-mock', ...ACCT }), { images, trees });
+    eq('🔒 不传 limit → 用**默认上限**而不是全量（limitApplied = 默认值）', d.limitApplied, LIMITS.auditDefaultImages);
+    eq('不传 limit 时 limitRequested 也是默认值', d.limitRequested, LIMITS.auditDefaultImages);
+    eq('默认上限进 LIMITS 且克制（50）', LIMITS.auditDefaultImages, 50);
+    ok('项目张数少于默认上限时，扫全部（不因上限而少扫）', d.scanned === 7 && d.truncated === false);
+    const { r: big } = await withMock(() => auditProject({ projectId: 'p-mock', limit: 9999, ...ACCT }), { images, trees });
+    eq('🔒 limit 传 9999 → 被**硬上限**压回（不许无限拉取）', big.limitApplied, LIMITS.auditMaxImages);
+    ok('被压回时说得明白（clamped 标记 + 文本里写出来）',
+      big.limitClamped === true && big.text.includes('硬上限'), big.text.split('\n')[2]);
+    const { r: small } = await withMock(() => auditProject({ projectId: 'p-mock', limit: 3, ...ACCT }), { images, trees });
+    eq('limit=3 → 只扫 3 张', small.scanned, 3);
+    eq('🔒 被截断时 truncated=true 且 total 是项目总张数（不是扫描数）', [small.truncated, small.total], [true, 7]);
+    ok('被截断时人读文本明说「已被上限截断」', small.text.includes('已被上限截断'), small.text.split('\n')[2]);
+    const { r: empty } = await withMock(() => auditProject({ projectId: 'p-mock', ...ACCT }), { images: [], trees: [] });
+    ok('空项目 → 不炸；判"样本不足"并明说理由（不是静默空输出）',
+      empty.scanned === 0 && empty.total === 0 && empty.reliable === false && empty.text.includes('不可靠'),
+      empty.text.split('\n')[2]);
+    eq('空项目零漂移类别', empty.driftedCategories.length, 0);
+  }
+  {
+    // 单张稿失败不影响整体；跳过原因翻成人话
+    const images = [
+      { id: uid(0), name: '好稿', width: 93.75, height: 175 },
+      { id: uid(1), name: '整页图.jpg', width: 93.75, height: 175, bad: 'noLayers' },
+      { id: uid(2), name: '炸了', width: 93.75, height: 175, bad: 'error' },
+      { id: uid(3), name: 'Sketch稿', width: 93.75, height: 175, bad: 'sketch' },
+    ];
+    const trees = [mkTree('好稿', { radius: 8, btnH: 44, btnColor: '#574af4', titleSize: 14 })];
+    const { r } = await withMock(() => auditProject({ projectId: 'p-mock', limit: 5, ...ACCT }), { images, trees });
+    ok('单张稿失败**不炸整次审计**（其余照常统计）', r.scanned === 1 && r.blocks > 0);
+    ok('跳过原因被翻成人话（图片型条目 ≠ 插件坏了）',
+      r.skipBuckets['no-layers'] === 1 && r.skipBuckets.error === 1 && r.skippedBrief.includes('没有图层数据'),
+      r.skippedBrief);
+    ok('🔒 Sketch 插件格式单独归一类（不混进"读取失败"，也不假装能读）',
+      r.skipBuckets['sketch-format'] === 1 && r.skippedBrief.includes('Sketch 插件格式'), r.skippedBrief);
+    ok('🔒 抬头里指明 Sketch 格式是**已知空缺**、不是"这些不是设计稿"',
+      r.text.includes('Sketch 插件格式') && r.text.includes('已知空缺'), r.text.split('\n').slice(2, 8).join(' / '));
+    ok('人读文本里点明"这些稿不进统计，也不等于没扫到"',
+      r.text.includes('没有图层数据') && r.text.includes('不等于'), r.text.split('\n').slice(2, 6).join(' / '));
+    ok('样本不足（只有 1 张读到图层）→ 判不可靠',
+      r.reliable === false && r.suppressed.length === 5, r.reasons.join(' | '));
+    ok('🔒 样本不足的原因分得清（`primaryReason=sample`，不是"命名不可靠"）',
+      r.primaryReason === 'sample', String(r.primaryReason));
+    ok('🔒 样本不足时**不**指向"去规范层名"（那是另一码事）',
+      r.text.includes('位图') && !r.text.includes('层名规范化'), r.text.slice(-320));
+    const { r: w } = await withMock(() => auditProject({ projectId: 'p-mock', limit: 5, allowWeakNaming: true, ...ACCT }), { images, trees });
+    ok('🔒 样本为空时 allowWeakNaming 也不放开（没数据可出，放开只会印一堆 0）',
+      w.suppressed.length === 5 && w.weakMode === false, `suppressed=${w.suppressed.length} weak=${w.weakMode}`);
+  }
+  {
+    // 不给项目定位 → 本地报错（不静默返回空结果、也不发网络请求）
+    const r = await auditProject({}).catch((e) => e);
+    ok('不给 projectId 也不给 url → 明确报错并指出下一步',
+      r instanceof Error && /需要 projectId/.test(r.message) && String(r.hint ?? '').length > 0,
+      r instanceof Error ? r.message : String(r));
+  }
+  {
+    // 走**工具层**（execute → lossless 出口）—— 真宿主调的就是这条路径
+    const toolDef = TOOLS.find((x) => x.name === 'lanhu_audit_project');
+    const env = process.env.LANHU_COOKIE;
+    process.env.LANHU_COOKIE = 'PASSPORT=x; user_token=y';   // fetch 是 mock 的，串不会发出去
+    let r;
+    try {
+      ({ r } = await withMock(() => toolDef.execute({ projectId: '639b8833-6a8c-401f-a002-7d5b3f090365', limit: 4 }), specOf(4)));
+    } finally {
+      if (env === undefined) delete process.env.LANHU_COOKIE; else process.env.LANHU_COOKIE = env;
+    }
+    ok('通过**工具层**（execute + lossless 出口）也能跑通',
+      r?.ok === true && r.format === 'audit' && typeof r.text === 'string' && findIllegal(r).length === 0,
+      r?.text?.split('\n')[0] ?? JSON.stringify(r)?.slice(0, 120));
+  }
+}
+
+/* —— ⑧ 工具层与 CLI / 系统提示（能力不能藏着） —— */
+{
+  const t = TOOLS.find((x) => x.name === 'lanhu_audit_project');
+  ok('lanhu_audit_project 已注册进 TOOLS', !!t);
+  ok('output schema 声明了 reliable / scanned / truncated（能力不能藏着）',
+    !!t?.output?.schema?.properties?.reliable && !!t?.output?.schema?.properties?.scanned
+    && !!t?.output?.schema?.properties?.truncated, Object.keys(t?.output?.schema?.properties ?? {}).join(','));
+  ok('limit 的 schema 说明了硬上限与成本（工具描述要能拦住"一上来拉满"）',
+    /硬上限/.test(t?.parameters?.properties?.limit?.description ?? '') && /2 次请求|2N|两次请求/.test(String(t?.description ?? '')),
+    t?.parameters?.properties?.limit?.description ?? '');
+  const bad = await t.execute({ projectId: 'not-a-uuid' });
+  ok('坏 projectId 被本地预检拦下（不花网络请求，且带下一步）',
+    bad.failed === true && String(bad.hint ?? '').length > 0, bad.text.split('\n')[0]);
+
+  const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const hostSrc = fs.readFileSync(path.join(root, 'lib', 'index.js'), 'utf8');
+  const from = hostSrc.indexOf('const SYSTEM_HINT = [');
+  const hint = hostSrc.slice(from, hostSrc.indexOf("].join('\\n');", from));
+  ok('SYSTEM_HINT 决策树里有「要看整个项目的设计系统一致性 → lanhu_audit_project」',
+    hint.includes('lanhu_audit_project') && hint.includes('设计系统一致性'), hint.includes('lanhu_audit_project') ? '' : '(决策树里没有)');
+  ok('SYSTEM_HINT 里也明说了"命名不可靠时判不可靠、拒绝出明细"', hint.includes('拒绝出明细'));
+
+  const cliSrc = fs.readFileSync(path.join(root, 'lanhu.mjs'), 'utf8');
+  ok('CLI 注册了 audit 命令', cliSrc.includes("'audit': cmdAudit,"));
+  ok('CLI 的 USAGE 里写了 audit（能力不能藏着）', /^ {2,3}audit {4}\[--url/m.test(cliSrc), (cliSrc.match(/^ *audit.*$/m) ?? ['(没有)'])[0]);
+  ok('CLI 的 USAGE 点明成本模型（扫 N 张 = 2N 次请求）', cliSrc.includes('扫 N 张 = 2N 次请求'));
+
+  // 既有工具的形状没被这次新增动过（纯新增）
+  const rb = TOOLS.find((x) => x.name === 'lanhu_read_blocks');
+  const dd = TOOLS.find((x) => x.name === 'lanhu_diff_design');
+  ok('🔒 既有工具的 schema 与形状没被这次新增动过',
+    (rb?.parameters?.required ?? []).length === 0 && !!rb?.output?.schema?.properties?.version
+    && (dd?.parameters?.required ?? []).includes('from'));
 }
 
 /* ═══════════════ ⑦ 多账号档案与归属判定 ═══════════════ */
@@ -1761,7 +3372,7 @@ group('注入与结果优化');
   const hm = /const SYSTEM_HINT = \[([\s\S]*?)\]\.join/.exec(hintSrc);
   ok('SYSTEM_HINT 能定位', Boolean(hm), '找不到定义 → 后面全部无从谈起');
   const hint = hm ? hm[1] : '';
-  for (const kw of ['read_blocks', 'gapMaxDistance', 'verify_blocks', 'rpx', 'region', 'format=tokens', 'version']) {
+  for (const kw of ['read_blocks', 'gapMaxDistance', 'verify_blocks', 'rpx', 'region', 'format=tokens', 'version', '对比度']) {
     ok(`注入含「${kw}」（决策树 / 换算 / 溯源）`, hint.includes(kw), `缺「${kw}」→ AI 不知道有这个能力，就会退回"summary 不够→full→自己写脚本"`);
   }
   ok('注入不再说「拿到 token 后」（§3.6 过时术语）', !/拿到 token/.test(hint), '会被理解成"得先拿 token 才能干活"——实际返回的是图层数值');
@@ -2004,6 +3615,954 @@ group('注入与结果优化');
   // ④ UUID_RE 只有一个定义（复用，不写第二个）
   const reDefs = (fs.readFileSync(path.join(_root, 'lanhu.mjs'), 'utf8').match(/const UUID_RE =/g) ?? []).length;
   ok('UUID_RE 全项目只有一处定义（工具层复用它）', reDefs === 1, `lanhu.mjs 里 ${reDefs} 处`);
+}
+
+/* ═══════════════ ⑨ 版本自述（Host：当前版本 + npm 最新版） ═══════════════ */
+group('⑨ 版本自述（Host）');
+{
+  const _root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const mod = await import('../lanhu.mjs');
+  const {
+    pluginPackagePath, readPluginVersion, parseSemver, compareSemver, isStableVersion,
+    computeUpdateAvailable, npmLatestVersion, pluginVersionInfo, resetNpmVersionCache,
+    NPM_LATEST_URL, NPM_PACKAGE, VERSION_CACHE_TTL, VERSION_FETCH_TIMEOUT,
+  } = mod;
+  const { makeLanhuHandler } = await import('../lib/index.js');
+  const pkg = JSON.parse(fs.readFileSync(path.join(_root, 'package.json'), 'utf8'));
+  const lanhuSrc = fs.readFileSync(path.join(_root, 'lanhu.mjs'), 'utf8');
+  const idxSrc = fs.readFileSync(path.join(_root, 'lib/index.js'), 'utf8');
+
+  /* ── ① 当前版本：只认 package.json（硬编码必红） ── */
+  ok('pluginPackagePath() 指向真实的 package.json',
+    path.basename(pluginPackagePath()) === 'package.json' && fs.existsSync(pluginPackagePath()), pluginPackagePath());
+  eq('readPluginVersion() 等于 package.json 的 version', readPluginVersion(), pkg.version);
+  // ★ 防硬编码的关键一条：换成版本号完全不同的临时 package.json ——
+  //   任何写死版本号的实现（哪怕写的就是当前版本）都会在这里露馅。
+  const tmpPkg = path.join(TMP_HOME, 'package.json');
+  fs.writeFileSync(tmpPkg, JSON.stringify({ name: NPM_PACKAGE, version: '9.9.9-standin' }));
+  eq('readPluginVersion 真的从给定 package.json 读（硬编码必红）',
+    readPluginVersion({ packagePath: tmpPkg }), '9.9.9-standin');
+  eq('package.json 读不到 → null（降级，不抛）',
+    readPluginVersion({ packagePath: path.join(TMP_HOME, 'nope.json') }), null);
+  {
+    const seg = lanhuSrc.slice(lanhuSrc.indexOf('export function readPluginVersion'), lanhuSrc.indexOf('const SEMVER_RE'));
+    ok('readPluginVersion 段里没有写死的版本号字面量',
+      !/\d+\.\d+\.\d+/.test(seg), (seg.match(/\d+\.\d+\.\d+/) ?? [''])[0]);
+  }
+
+  /* ── ② 版本比较：纯函数，按语义 ── */
+  eq('compareSemver：0.5.10 > 0.5.9（不是字符串比较）', compareSemver('0.5.10', '0.5.9'), 1);
+  eq('compareSemver：0.5.4 == 0.5.4', compareSemver('0.5.4', '0.5.4'), 0);
+  eq('compareSemver：1.0.0 > 0.9.9（跨段位）', compareSemver('1.0.0', '0.9.9'), 1);
+  eq('compareSemver：容忍 v 前缀', compareSemver('v0.5.4', '0.5.4'), 0);
+  eq('compareSemver：预发布 < 正式（0.6.0-rc.1 < 0.6.0）', compareSemver('0.6.0-rc.1', '0.6.0'), -1);
+  eq('compareSemver：预发布数字标识按数值比（rc.2 < rc.10）', compareSemver('1.0.0-rc.2', '1.0.0-rc.10'), -1);
+  eq('compareSemver：解析不了 → null（不瞎判）', compareSemver('abc', '1.0.0'), null);
+  eq('parseSemver：忽略 +build 元数据',
+    JSON.stringify(parseSemver('0.5.4+build.7')), JSON.stringify({ major: 0, minor: 5, patch: 4, pre: [] }));
+  eq('parseSemver：段位不全 → null', parseSemver('0.5'), null);
+  ok('isStableVersion 只认稳定版',
+    isStableVersion('0.5.4') === true && isStableVersion('0.5.4-rc.1') === false && isStableVersion(null) === false);
+  eq('computeUpdateAvailable：0.5.4 → 0.5.5 有更新', computeUpdateAvailable('0.5.4', '0.5.5'), true);
+  eq('computeUpdateAvailable：0.5.4 == 0.5.4 无更新', computeUpdateAvailable('0.5.4', '0.5.4'), false);
+  eq('computeUpdateAvailable：0.5.10 不比 0.5.9 旧（语义比较才判得出）',
+    computeUpdateAvailable('0.5.10', '0.5.9'), false);
+  eq('computeUpdateAvailable：npm 上是预发布 → 不给判断', computeUpdateAvailable('0.5.4', '0.5.5-rc.1'), null);
+  eq('computeUpdateAvailable：本机是预发布 → 不给判断', computeUpdateAvailable('0.5.4-rc.1', '0.5.3'), null);
+  eq('computeUpdateAvailable：latest 缺失 → 不给判断', computeUpdateAvailable('0.5.4', null), null);
+
+  /* ── ③ npm 查询：缓存 + 降级（全部用桩，绝不碰真实 registry） ── */
+  const mkRes = (body) => ({ ok: true, status: 200, json: async () => body });
+  resetNpmVersionCache();
+  let calls = 0;
+  const goodFetch = async () => { calls += 1; return mkRes({ version: '9.9.9' }); };
+  eq('npm 查询返回 registry 的 version', await npmLatestVersion({ fetchImpl: goodFetch }), '9.9.9');
+  eq('缓存命中：第二次调用返回同一个值', await npmLatestVersion({ fetchImpl: goodFetch }), '9.9.9');
+  ok('缓存生效：两次调用只打了一次 npm（去掉缓存必红）', calls === 1, `实际请求 ${calls} 次`);
+  ok('确实走的是 registry 的 latest 端点', NPM_LATEST_URL.endsWith(`/${NPM_PACKAGE}/latest`), NPM_LATEST_URL);
+  await npmLatestVersion({ fetchImpl: goodFetch, cache: false });
+  ok('cache:false 时确实每次都请求（证明上面那条在数请求，不是空跑）', calls === 2, `实际请求 ${calls} 次`);
+
+  resetNpmVersionCache();
+  const t0 = 1_000_000;
+  await npmLatestVersion({ fetchImpl: goodFetch, now: t0 });
+  const base = calls;
+  await npmLatestVersion({ fetchImpl: goodFetch, now: t0 + VERSION_CACHE_TTL - 1 });
+  ok('TTL 内不重复请求', calls === base, `实际请求 ${calls - base} 次`);
+  await npmLatestVersion({ fetchImpl: goodFetch, now: t0 + VERSION_CACHE_TTL + 1 });
+  ok('TTL 过了会重新请求（缓存不是永久的）', calls === base + 1, `实际请求 ${calls - base} 次`);
+
+  resetNpmVersionCache();
+  let failCalls = 0;
+  const deadFetch = async () => { failCalls += 1; throw new Error('ENOTFOUND registry.npmjs.org'); };
+  // 「绝不抛」必须自己站起来断言：只靠"炸掉整个自检"也算红，但看不出是哪条性质坏了
+  const settle = async (p) => { try { return { value: await p }; } catch (e) { return { error: e }; } };
+  const firstTry = await settle(npmLatestVersion({ fetchImpl: deadFetch }));
+  ok('npm 不可达**绝不抛**（附加项不能拖挂主职责）', firstTry.error === undefined,
+    firstTry.error ? String(firstTry.error.message) : '');
+  eq('npm 不可达 → latest 为 null', firstTry.value, null);
+  eq('npm 不可达第二次仍是 null（失败已缓存）',
+    (await settle(npmLatestVersion({ fetchImpl: deadFetch }))).value, null);
+  ok('失败也进缓存：不会每次渲染都去打 npm', failCalls === 1, `实际请求 ${failCalls} 次`);
+
+  resetNpmVersionCache();
+  const hangFetch = (url, opts) => new Promise((_, reject) => {
+    opts.signal.addEventListener('abort',
+      () => reject(Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' })));
+  });
+  const timedOut = await settle(npmLatestVersion({ fetchImpl: hangFetch, timeout: 20, cache: false }));
+  ok('查询超时也绝不抛', timedOut.error === undefined, timedOut.error ? String(timedOut.error.message) : '');
+  eq('超时 → null（降级，不抛）', timedOut.value, null);
+  ok('默认超时是几秒级（不会把面板拖住）', VERSION_FETCH_TIMEOUT <= 5000, `${VERSION_FETCH_TIMEOUT}ms`);
+
+  const infoTry = await settle(pluginVersionInfo({ packagePath: tmpPkg, fetchImpl: deadFetch, cache: false }));
+  ok('pluginVersionInfo 也绝不抛', infoTry.error === undefined, infoTry.error ? String(infoTry.error.message) : '');
+  eq('pluginVersionInfo：npm 挂了也返回结构完整的对象',
+    JSON.stringify(infoTry.value),
+    JSON.stringify({ version: '9.9.9-standin', latest: null, updateAvailable: null }));
+
+  /* ── ④ /lanhu/status：带上版本三件套，且 npm 挂了也不能拖挂登录态 ── */
+  const callStatus = async (handler, url = '/lanhu/status') => {
+    const out = { status: 0, body: null, threw: undefined };
+    const req = { url, method: 'GET', headers: {}, socket: { remoteAddress: '127.0.0.1' } };
+    const resp = { writeHead(s) { out.status = s; }, end(t) { out.body = JSON.parse(t); } };
+    try { await handler(req, resp); } catch (e) { out.threw = e; }
+    return out;
+  };
+  const authOk = async () => ({ ok: true, account: 'acme', cookieSource: 'file', teamCount: 3 });
+
+  // 先热缓存 → 真实 pluginVersionInfo 不会去打 npm（整条断言链全程离线）
+  resetNpmVersionCache();
+  await npmLatestVersion({ fetchImpl: async () => mkRes({ version: '9.9.9' }) });
+  const full = await callStatus(makeLanhuHandler({ checkAuth: authOk }));
+  eq('status 仍是 HTTP 200', full.status, 200);
+  eq('status 里含 version 且等于 package.json 的 version', full.body?.data?.version, pkg.version);
+  eq('status 里含 latest', full.body?.data?.latest, '9.9.9');
+  eq('status 里含 updateAvailable（比较在 Host 做，不留给客户端）', full.body?.data?.updateAvailable, true);
+  ok('登录态主字段没被版本字段挤掉',
+    full.body?.data?.ok === true && full.body?.data?.teamCount === 3, JSON.stringify(full.body?.data));
+
+  resetNpmVersionCache();
+  await settle(npmLatestVersion({ fetchImpl: deadFetch }));   // 缓存里是「失败」，handler 不会再打网络
+  const down = await callStatus(makeLanhuHandler({ checkAuth: authOk }));
+  ok('npm 不可达时 handler 本身也没抛', down.threw === undefined,
+    down.threw ? String(down.threw.message) : '');
+  eq('npm 不可达时 status 仍然成功（HTTP 200）', down.status, 200);
+  eq('npm 不可达时 ok 仍为 true（版本失败不能把登录态拖成失败）', down.body?.ok, true);
+  eq('npm 不可达时 latest 为 null', down.body?.data?.latest, null);
+  eq('npm 不可达时 updateAvailable 为 null（不误报有更新）', down.body?.data?.updateAvailable, null);
+  eq('npm 不可达时登录态字段照样在', down.body?.data?.teamCount, 3);
+  ok('npm 不可达没有把 status 变成失败', down.body?.error === undefined, JSON.stringify(down.body));
+
+  let probed = 0;
+  const meta = await callStatus(
+    makeLanhuHandler({ checkAuth: async () => { probed += 1; return { ok: true }; } }),
+    '/lanhu/status?meta=1',
+  );
+  eq('?meta=1 只回版本三件套',
+    JSON.stringify(Object.keys(meta.body?.data ?? {})), JSON.stringify(['version', 'latest', 'updateAvailable']));
+  ok('?meta=1 不惊动蓝湖（面板一打开不该打一次 lanhuapp.com）', probed === 0, `探活 ${probed} 次`);
+  eq('仍然只有一条 /lanhu 路由（版本没另开通道）',
+    (idxSrc.match(/path:\s*'\/lanhu'/g) ?? []).length, 1);
+  ok('版本自述已接进状态路由（不是只加了个没人用的函数）',
+    /const \[r, v\] = await Promise\.all\(\[probeAuth\(\), readVersion\(\)\]\)/.test(idxSrc), '');
+}
+
+/* ═══════════════ ⑩ 面板标题栏版本（Client：真实组件离屏渲染） ═══════════════ */
+group('⑩ 面板版本自述（Client）');
+{
+  const _root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const clientSrc = fs.readFileSync(path.join(_root, 'lib/client.js'), 'utf8');
+
+  /**
+   * 用「壳提供的 React 的替身」把**真实 bundle** 跑起来。
+   * 自检里拿不到 react（它是壳的单例、不是本插件的依赖），所以给一个最小的
+   * createElement / Component / hooks 替身 —— 组件本身、状态机、渲染规则都是真代码。
+   */
+  function loadPanel(payload) {
+    const calls = [];
+    const fetchImpl = async (url) => {
+      calls.push(String(url));
+      if (payload instanceof Error) throw payload;
+      return { status: 200, json: async () => payload };
+    };
+    class Component { constructor(props) { this.props = props || {}; this.state = {}; } }
+    const createElement = (type, props, ...children) => {
+      const p = Object.assign({}, props || {});
+      if (children.length === 1) p.children = children[0];
+      else if (children.length > 1) p.children = children;
+      return { type, props: p };
+    };
+    const React = {
+      createElement, Component, Fragment: 'Fragment',
+      useState: (init) => [typeof init === 'function' ? init() : init, () => {}],
+      useEffect: () => {}, useRef: (v) => ({ current: v === undefined ? null : v }),
+    };
+    let loaded = null;
+    const win = { __ModuleLoader__: { load: (m) => { loaded = m; } } };
+    new Function('window', 'console', 'fetch', clientSrc)(win, console, fetchImpl);
+    const exports = loaded.factory((id) => {
+      if (id === 'react') return React;
+      throw new Error('未提供的模块：' + id);
+    });
+    const captured = {};
+    exports.apply({
+      effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {}; },
+      slots: {
+        inject: (name, fn) => { fn(); return () => {}; },
+        register: (meta, comp) => { captured[meta.id] = comp; return () => {}; },
+      },
+    });
+    return { captured, exports, calls };
+  }
+
+  function collect(node, out, depth = 0) {
+    if (node === null || node === undefined || typeof node === 'boolean' || depth > 40) return out;
+    if (Array.isArray(node)) { for (const n of node) collect(n, out, depth + 1); return out; }
+    if (typeof node === 'string' || typeof node === 'number') { out.text.push(String(node)); return out; }
+    if (typeof node !== 'object') return out;
+    const { type, props = {} } = node;
+    out.nodes.push({ type: typeof type === 'function' ? (type.name || 'anon') : String(type), props });
+    if (typeof type === 'function') {
+      let rendered;
+      try {
+        rendered = (type.prototype && typeof type.prototype.render === 'function')
+          ? new type(props).render()
+          : type(props);
+      } catch (e) { out.errors.push((type.name || 'anon') + ': ' + String(e && e.message || e)); return out; }
+      collect(rendered, out, depth + 1);
+      return out;
+    }
+    collect(props.children, out, depth + 1);
+    return out;
+  }
+
+  /** 点一下侧边栏入口 = 打开面板（和用户操作同一条路径），再渲染整棵面板树。 */
+  async function renderPanel(payload) {
+    const { captured, calls } = loadPanel(payload);
+    const entry = captured['lanhu'];
+    const overlay = captured['lanhu-panel'];
+    if (typeof entry !== 'function' || typeof overlay !== 'function') {
+      return { text: '', nodes: [], errors: ['入口/面板没注册上'], calls: [] };
+    }
+    const entryEl = entry({ wide: true });
+    entryEl.props.onClick();
+    await new Promise((r) => setTimeout(r, 15));
+    const out = { text: [], nodes: [], errors: [] };
+    collect(overlay({}), out);
+    const partOf = (part) => out.nodes.filter((n) => n.props && n.props['data-dsh-part'] === part);
+    return {
+      text: out.text.join(' '), nodes: out.nodes, errors: out.errors, calls,
+      versionNodes: [...partOf('version'), ...partOf('version-update')],
+      hasVersionNode: partOf('version').length > 0,
+      updateDot: partOf('version-update')[0] ? partOf('version-update')[0].props : null,
+    };
+  }
+
+  const noUpdate = await renderPanel({ ok: true, data: { version: '9.9.9', latest: '9.9.9', updateAvailable: false } });
+  ok('拿到的版本号真的渲染进标题栏（数据驱动，写死必红）', noUpdate.text.includes('v9.9.9'), noUpdate.text.slice(0, 80));
+  ok('标题「蓝湖设计稿」仍在', noUpdate.text.includes('蓝湖设计稿'));
+  ok('无更新时不渲染提示点', noUpdate.updateDot === null);
+  ok('面板整棵树渲染无异常（客户端绝不 throw）', noUpdate.errors.length === 0, noUpdate.errors.join('; '));
+  ok('版本数据只走 /lanhu/status（没开第二条通道）',
+    noUpdate.calls.length > 0 && noUpdate.calls.every((u) => u.startsWith('/lanhu/')), noUpdate.calls.join(', '));
+  ok('版本自述走 ?meta=1（打开面板不触发蓝湖探活）',
+    noUpdate.calls.includes('/lanhu/status?meta=1'), noUpdate.calls.join(', '));
+
+  const withUpdate = await renderPanel({ ok: true, data: { version: '9.9.9', latest: '9.9.10', updateAvailable: true } });
+  ok('有更新时才渲染那个提示点', !!withUpdate.updateDot);
+  ok('提示点带 title（hover 就能看懂是「有新版本」）',
+    /新版本/.test(String(withUpdate.updateDot && withUpdate.updateDot.title)), String(withUpdate.updateDot && withUpdate.updateDot.title));
+  ok('有更新时当前版本照显', withUpdate.text.includes('v9.9.9'));
+  ok('不显示具体的最新版本号（按简化后的需求）', !withUpdate.text.includes('9.9.10'), withUpdate.text.slice(0, 80));
+
+  const unsure = await renderPanel({ ok: true, data: { version: '9.9.9', latest: '9.9.10-rc.1', updateAvailable: null } });
+  ok('Host 拿不准（updateAvailable:null）时不提示', unsure.updateDot === null);
+
+  const noData = await renderPanel(new Error('fetch failed'));
+  ok('拿不到 npm 数据 → 完全不渲染版本（连占位都没有）',
+    !noData.hasVersionNode && !/v9\.9\.9/.test(noData.text), noData.text.slice(0, 60));
+  ok('拿不到数据也不抛、面板照常渲染',
+    noData.errors.length === 0 && noData.text.includes('蓝湖设计稿'), noData.errors.join('; '));
+  ok('拿不到数据不产生「检查失败」之类噪音', !/新版本/.test(noData.text));
+
+  // 颜色铁律：版本标签里每个 var() 都必须带 fallback，且不许有裸色值
+  {
+    const bad = [];
+    for (const n of withUpdate.versionNodes) {
+      for (const [k, v] of Object.entries(n.props.style || {})) {
+        if (typeof v !== 'string') continue;
+        if (v.includes('var(')) { if (!/var\(--[\w-]+,\s*[^)]+\)/.test(v)) bad.push(k + '=' + v); }
+        else if (/^#[0-9a-fA-F]{3,8}$/.test(v) || /^rgba?\(/.test(v)) bad.push(k + '=' + v);
+      }
+    }
+    ok('版本标签的颜色全部走令牌 + fallback（没有裸色值）', bad.length === 0, bad.join(', '));
+    ok('确实检查到了版本节点的样式（不是空跑）', withUpdate.versionNodes.length >= 2,
+      `检查了 ${withUpdate.versionNodes.length} 个节点`);
+  }
+  {
+    const seg = clientSrc.slice(clientSrc.indexOf('function versionTagModel'), clientSrc.indexOf('function LanhuOverlay'));
+    const hit = seg.match(/#[0-9a-fA-F]{3,8}\b|rgba?\(/);
+    ok('版本自述源码段里也没有裸色值', !hit && seg.length > 200, hit ? hit[0] : `长度 ${seg.length}`);
+  }
+  {
+    // 「别开第二条通道」的守门断言：客户端**每一处**取数都必须挂在同源的 API 常量上。
+    // （不查「有没有 lanhuapp.com 字样」—— 那是粘贴 Cookie 的提示文案，不是数据通道。）
+    const callSites = [...clientSrc.matchAll(/\bjsonFetch\(([^,\n)]+)/g)]
+      .map((m) => m[1].trim())
+      .filter((s) => s !== 'url');
+    ok('客户端所有取数都走同源 API 常量（没有第二条通道）',
+      callSites.length >= 4 && callSites.every((s) => s.startsWith('API')),
+      callSites.join(' | '));
+  }
+}
+
+/* ═══════════════ ⑪ 面板「体检」Tab（Client 真渲染 + Host 新路由） ═══════════════ */
+group('⑪ 面板「体检」Tab');
+{
+  const _root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const clientSrc = fs.readFileSync(path.join(_root, 'lib/client.js'), 'utf8');
+  const idxSrc = fs.readFileSync(path.join(_root, 'lib/index.js'), 'utf8');
+  const { makeLanhuHandler } = await import('../lib/index.js');
+
+  /* ── 真机形状的 fixture（数值抄自真跑一次的返回：小程序 / 人才详情） ── */
+  const PID = 'f623608b-d75d-453f-ab42-f997f0f43b80';
+  const IID = 'd11572f8-dfa1-4e14-9706-b52946f614a7';
+  const IID2 = 'a91f2aaf-4162-488b-8fc0-43498437cde3';
+  const V5 = '97dd4840-9aa2-48d1-a958-1f5171445278';
+  const V4 = 'f4fbf3f3-1845-4721-a808-e95572d21bae';
+  const AT5 = 'Tue, 22 Sep 2026 16:58:24 UTC';
+  const AT4 = 'Tue, 22 Sep 2026 16:57:36 UTC';
+
+  const DIFF_OK = {
+    ok: true, format: 'diff', name: '人才详情',
+    viewport: { width: 375, height: 1333 },
+    from: { id: V4, createTime: AT4, index: 1, isLatest: false },
+    to: { id: V5, createTime: AT5, index: 0, isLatest: true },
+    versionCount: 5, versionLatestId: V5, sameVersion: false, gapSeconds: 48, gapDays: 0,
+    identical: false, reliable: true,
+    reliability: {
+      exact: 131, approx: 0, unmatched: 0, matched: 131, total: 131,
+      matchedRatio: 1, approxShare: 0, smallSample: false, reliable: true, reason: null,
+    },
+    counts: {
+      fromBlocks: 131, toBlocks: 131, noiseFrom: 28, noiseTo: 28, matched: 131, unchanged: 130,
+      changed: { size: 0, color: 0, layout: 0, text: 0, border: 0, structure: 1, blocks: 1 },
+      added: 0, removed: 0,
+    },
+    changes: {
+      size: [], color: [], layout: [], text: [], border: [],
+      structure: [{
+        path: '人才详情/人才证书', name: '人才证书', kind: 'card', kindFrom: 'image', how: 'exact',
+        field: 'kind', label: '类型 图片→卡片', from: 'image', to: 'card', where: '人才证书',
+      }],
+    },
+    added: [], removed: [],
+    notes: ['系统 UI / 图形碎片共 56 块未参与比对（与块级清单同一个折叠口径）。'],
+    account: 'quanzi', accountBy: 'default',
+    text: '设计变更：vf4fbf3f3 → v97dd4840\n· 稿：人才详情 375×1333 · 块数 131 → 131\n· 结构：\n  - 人才证书 类型 图片→卡片\n· 未变：其余 130 块',
+    textBytes: 96,
+  };
+  // 不可靠版：后端**故意不出明细**（changes 全空、reliable:false），面板必须把这件事顶在最上面
+  const DIFF_UNRELIABLE = {
+    ...DIFF_OK, identical: false, reliable: false,
+    reliability: {
+      exact: 2, approx: 40, unmatched: 89, matched: 42, total: 131,
+      matchedRatio: 0.32, approxShare: 0.95, smallSample: false, reliable: false,
+      reason: '只有 42/131 块能配上（匹配率 32%），89 块对不上 —— 这通常意味着设计整版重画/重排或换了一套图层命名。',
+    },
+    counts: Object.assign({}, DIFF_OK.counts, {
+      changed: { size: 0, color: 0, layout: 0, text: 0, border: 0, structure: 0, blocks: 0 },
+      unchanged: 0, added: 12, removed: 20,
+    }),
+    changes: { size: [], color: [], layout: [], text: [], border: [], structure: [] },
+    text: '设计变更：vf4fbf3f3 → v97dd4840\n⚠️ 差异过大，逐块对比不可靠 —— 不出明细表。',
+  };
+  const AUDIT_OK = {
+    ok: true, format: 'audit', projectId: PID, projectName: '小程序',
+    scanned: 3, attempted: 3, total: 10, truncated: true,
+    limitRequested: 3, limitApplied: 3, limitClamped: false, limitDefault: 50, limitHard: 200,
+    imagesWithLayers: 3, blocks: 929,
+    naming: { total: 926, named: 647, auto: 279, empty: 0, namedShare: 0.7 },
+    reliable: true, reasons: [], primaryReason: null, weakMode: false,
+    suppressed: [], nameDependent: ['componentSpec'],
+    findings: {
+      componentSpec: {
+        suppressed: false, drift: true, converged: 0, findingCount: 1,
+        participatedNames: 6, participatedBlocks: 166,
+        notParticipating: { autoName: 279, emptyName: 0, thin: 481 },
+        findings: [{
+          name: 'Button', blocks: 15, images: 3, kinds: ['pill'],
+          dims: [{
+            dim: 'radius', label: '圆角', distinct: 3, total: 15,
+            values: [{ value: 9999, count: 9, imageCount: 3, examples: ['人才详情'] }, { value: 27, count: 3, imageCount: 1 }],
+            truncatedValues: 0, majority: 9999, majorityCount: 9, tie: false,
+          }],
+        }],
+      },
+      fontScale: { suppressed: false, drift: true, distinct: 13, total: 328, sizes: [], oneOffs: [], ladder: [10, 11, 12, 14] },
+      colorDrift: {
+        suppressed: false, drift: true, threshold: 12, metric: 'RGB 欧氏距离', distinct: 155, clusterCount: 22,
+        clusters: [{
+          members: [{ key: '#f4f5ff', count: 9, imageCount: 1, roles: ['bg'] }, { key: '#eef0fa', count: 3, imageCount: 1, roles: ['border'] }],
+          maxDistance: 11.22, majority: '#f4f5ff', tie: false,
+        }],
+      },
+      spacingScale: { suppressed: false, drift: true, grid: 4, distinct: 407, total: 1924, offGridCount: 378, offGrid: [{ value: 10, count: 91 }, { value: 14, count: 85 }] },
+      radiusFamily: { suppressed: false, drift: true, distinct: 16, total: 295, offScaleCount: 6, offScale: [{ value: 7, count: 9 }] },
+    },
+    drift: {}, driftedCategories: ['componentSpec', 'fontScale', 'colorDrift', 'spacingScale', 'radiusFamily'],
+    anyDrift: true, noDriftBrief: [],
+    skipped: [], skippedBrief: '', skipBuckets: {}, account: 'quanzi', accountBy: 'default',
+    text: '# 设计系统审计 — 小程序\n· 扫描：**3 / 3 张**已尝试、项目共 **10** 张 → **已被上限截断**\n· 命名基础：可靠块名 **647/926** 块（70%）',
+  };
+  // 命名不可靠版：五类**全部 suppressed**（一项都不出），面板必须显眼说明
+  const AUDIT_WEAK = Object.assign({}, AUDIT_OK, {
+    reliable: false, weakMode: false, primaryReason: 'naming', anyDrift: false,
+    driftedCategories: [], noDriftBrief: [],
+    reasons: ['**命名不可靠**：可靠块名只覆盖 647/926 块（70%，低于 30%）—— 其余是 `Rectangle 12` 这类工具默认名或空名。'],
+    suppressed: ['componentSpec', 'fontScale', 'colorDrift', 'spacingScale', 'radiusFamily'],
+    findings: Object.fromEntries(['componentSpec', 'fontScale', 'colorDrift', 'spacingScale', 'radiusFamily']
+      .map((c) => [c, { suppressed: true, drift: false, reason: '命名不可靠，拒绝出明细' }])),
+    text: '# 设计系统审计 — 小程序\n⚠️ 判不可靠：命名不可靠 —— 一项都不出。',
+  });
+  const ACCOUNTS = {
+    ok: true,
+    data: {
+      default: 'quanzi',
+      accounts: [{
+        alias: 'quanzi', company: '全咨', isDefault: true, hasCookie: true,
+        teamCount: 1, projectCount: 1, cookieMasked: 'PASSPORT****',
+        expiry: { expiresAt: '2026-12-15T08:22:13.000Z', daysLeft: 67 },
+        indexedAt: '2026-10-09T00:00:00.000Z', indexAgeDays: 0, indexStale: false,
+        teams: [{ teamId: 'dcf8c993-1d4d-4596-b546-dab02a3f36ca', name: '全咨' }],
+        projects: [{ projectId: PID, name: '小程序' }],
+      }],
+    },
+  };
+  const baseResponses = {
+    '/lanhu/status?meta=1': { ok: true, data: { version: '9.9.9', latest: '9.9.9', updateAvailable: false } },
+    '/lanhu/accounts': ACCOUNTS,
+    '/lanhu/log?limit=80': { ok: true, data: { total: 0, entries: [], source: 'memory', file: path.join(TMP_HOME, 'usage.jsonl') } },
+    ['/lanhu/designs?pid=' + PID]: {
+      ok: true,
+      data: { projectId: PID, imageId: null, projectName: '小程序', images: [{ imageId: IID, name: '人才详情' }, { imageId: IID2, name: '人才首页' }] },
+    },
+    ['/lanhu/versions?pid=' + PID + '&iid=' + IID]: {
+      ok: true,
+      data: {
+        projectId: PID, imageId: IID, name: '人才详情',
+        versions: [{ id: V5, createTime: AT5, info: '版本5', hasLayoutData: true }, { id: V4, createTime: AT4, info: '版本4', hasLayoutData: true }],
+      },
+    },
+    '/lanhu/diff': { ok: true, data: DIFF_OK },
+    '/lanhu/audit': { ok: true, data: AUDIT_OK },
+  };
+
+  /* ── 最小 React 替身（与 ⑩ 同一套做法）：组件、状态机、渲染规则都是真代码 ── */
+  function loadFitPanel(scenario = {}) {
+    const calls = [];
+    const posts = [];
+    const hanging = {};
+    const fetchImpl = (url, options) => {
+      const u = String(url);
+      calls.push(u);
+      if (options && options.body) posts.push({ url: u, body: JSON.parse(options.body) });
+      if (scenario.hangUrl && u.includes(scenario.hangUrl)) {
+        return new Promise((resolve) => { hanging[u] = resolve; });      // 挂住不返回，用来测"运行中"
+      }
+      if (scenario.failUrl && u.includes(scenario.failUrl)) return Promise.reject(new Error('fetch failed'));
+      const hit = Object.keys(scenario.responses || baseResponses).find((k) => u === k || u.startsWith(k));
+      const body = hit ? (scenario.responses || baseResponses)[hit] : { ok: true, data: {} };
+      return Promise.resolve({ status: 200, json: async () => body });
+    };
+    class Component { constructor(props) { this.props = props || {}; this.state = {}; } }
+    const createElement = (type, props, ...children) => {
+      const p = Object.assign({}, props || {});
+      if (children.length === 1) p.children = children[0];
+      else if (children.length > 1) p.children = children;
+      return { type, props: p };
+    };
+    const React = {
+      createElement, Component, Fragment: 'Fragment',
+      useState: (init) => [typeof init === 'function' ? init() : init, () => {}],
+      useEffect: () => {}, useRef: (v) => ({ current: v === undefined ? null : v }),
+    };
+    let loaded = null;
+    const win = { __ModuleLoader__: { load: (m) => { loaded = m; } } };
+    new Function('window', 'console', 'fetch', clientSrc)(win, console, fetchImpl);
+    const exports = loaded.factory((id) => {
+      if (id === 'react') return React;
+      throw new Error('未提供的模块：' + id);
+    });
+    const captured = {};
+    exports.apply({
+      effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {}; },
+      slots: {
+        inject: (name, fn) => { fn(); return () => {}; },
+        register: (meta, comp) => { captured[meta.id] = comp; return () => {}; },
+      },
+    });
+    // 把"挂住的那个请求"按需要放回来（测「取消后回包不许覆盖状态」）
+    const release = (sub, body) => {
+      const key = Object.keys(hanging).find((k) => k.includes(sub));
+      if (!key) return false;
+      const r = hanging[key];
+      delete hanging[key];
+      r({ status: 200, json: async () => body });
+      return true;
+    };
+    return { captured, calls, posts, release };
+  }
+
+  function collectFit(node, out, underFit = false, depth = 0) {
+    if (node === null || node === undefined || typeof node === 'boolean' || depth > 60) return;
+    if (Array.isArray(node)) { for (const n of node) collectFit(n, out, underFit, depth + 1); return; }
+    if (typeof node === 'string' || typeof node === 'number') { out.text.push(String(node)); return; }
+    if (typeof node !== 'object') return;
+    const { type, props = {} } = node;
+    const isFit = underFit || props['data-dsh-part'] === 'fit';
+    out.nodes.push({ type: typeof type === 'function' ? (type.name || 'anon') : String(type), props, underFit: isFit });
+    if (typeof type === 'function') {
+      let rendered;
+      try {
+        rendered = (type.prototype && typeof type.prototype.render === 'function')
+          ? new type(props).render()
+          : type(props);
+      } catch (e) { out.errors.push((type.name || 'anon') + ': ' + String((e && e.message) || e)); return; }
+      collectFit(rendered, out, isFit, depth + 1);
+      return;
+    }
+    collectFit(props.children, out, isFit, depth + 1);
+  }
+
+  const tick = () => new Promise((r) => setTimeout(r, 15));
+  // text 直接给**拼好的字符串**（这些断言就是"人眼在面板上看到的那句话"）；textArr 留给需要逐句的场景
+  const renderFit = (overlay) => {
+    const o = { text: [], nodes: [], errors: [] };
+    collectFit(overlay({}), o);
+    return { nodes: o.nodes, errors: o.errors, textArr: o.text, text: o.text.join(' | ') };
+  };
+  const byText = (out, text) => out.nodes.find((n) => n.type === 'button' && n.props.children === text);
+  const byPart = (out, part) => out.nodes.filter((n) => n.props['data-dsh-part'] === part);
+  const opts = (node) => (Array.isArray(node.props.children) ? node.props.children : [node.props.children])
+    .filter((c) => c && c.type === 'option').map((c) => c.props.value);
+
+  /** 打开面板 → 点「体检」Tab（和用户操作同一条路径），返回可反复渲染的句柄。 */
+  async function mountFit(scenario) {
+    const p = loadFitPanel(scenario);
+    const overlay = p.captured['lanhu-panel'];
+    const entry = p.captured['lanhu'];
+    if (typeof entry !== 'function' || typeof overlay !== 'function') return { p, out: { text: [], nodes: [], errors: ['入口/面板没注册上'] } };
+    entry({ wide: true }).props.onClick();
+    await tick();
+    let out = renderFit(overlay);
+    const tab = byPart(out, 'tab-fit')[0];
+    if (tab) { tab.props.onClick(); await tick(); }
+    out = renderFit(overlay);
+    return { p, out, render: () => renderFit(overlay) };
+  }
+
+  /** 选项目 → 选稿（把两个下拉都真的点一遍）。 */
+  async function pickProjectAndDesign(h) {
+    const proj = byPart(h.out, 'fit-project')[0];
+    proj.props.onChange({ target: { value: opts(proj)[1] } });
+    await tick();
+    h.out = h.render();
+    const dsel = byPart(h.out, 'fit-design')[0];
+    if (dsel && opts(dsel).length > 1) {
+      dsel.props.onChange({ target: { value: opts(dsel)[1] } });
+      await tick();
+      h.out = h.render();
+    }
+    return h.out;
+  }
+
+  /* ── ① Tab 真的注册进面板（不是"代码里写了但没挂上"） ── */
+  {
+    const h = await mountFit({});
+    const tabs = ['tab-blocks', 'tab-status', 'tab-log', 'tab-fit'].map((p) => byPart(h.out, p)[0]);
+    ok('「体检」tab 真的注册进面板（tab 条里出现）', !!tabs[3], JSON.stringify(byPart(h.out, 'tab-fit').length));
+    eq('tab 文字就是「体检」', tabs[3] && tabs[3].props.children, '体检');
+    ok('原有三个 tab 一个都没少（块级/账号/记录）', tabs.slice(0, 3).every(Boolean),
+      tabs.slice(0, 3).map((t) => (t ? t.props.children : '缺')).join('/'));
+    ok('「体检」排在最后（不挤掉谁的位置）', tabs.filter(Boolean).map((t) => t.props.children).join(',') === '块级,账号,记录,体检');
+    ok('点「体检」后整棵树渲染无异常（客户端绝不 throw）', h.out.errors.length === 0, h.out.errors.join('; '));
+    ok('体检页三个区块都在（目标项目 / 变更 / 一致性）',
+      h.out.text.includes('目标项目') && h.out.text.includes('变更（设计变更 diff）') && h.out.text.includes('一致性（跨稿审计）'),
+      h.out.text.slice(0, 120));
+  }
+
+  /* ── ② 两个功能的完整走一遍（项目 → 稿 → 版本 → 对比 / 审计） ── */
+  {
+    const h = await mountFit({});
+    await pickProjectAndDesign(h);
+    const callsNow = h.p.calls.filter((u) => u.startsWith('/lanhu/'));
+    ok('选项目/选稿都走同源 /lanhu 路由（没开第二条通道）',
+      callsNow.length > 0 && callsNow.every((u) => u.startsWith('/lanhu/')), h.p.calls.join(', '));
+    ok('选项目 → 真的去列了稿（/lanhu/designs）', h.p.calls.some((u) => u.startsWith('/lanhu/designs')), h.p.calls.join(', '));
+    ok('选稿 → 真的去读了版本（/lanhu/versions）', h.p.calls.some((u) => u.startsWith('/lanhu/versions')), h.p.calls.join(', '));
+    const from = byPart(h.out, 'fit-from')[0];
+    const to = byPart(h.out, 'fit-to')[0];
+    eq('起点版本默认选中"上一版"（不是最新版自己跟自己比）', from && from.props.value, V4);
+    eq('终点版本默认是最新版', to && to.props.value, V5);
+
+    const run = byText(h.out, '对比两个版本');
+    ok('「对比两个版本」按钮在（可触发）', !!run);
+    run.props.onClick();
+    await tick();
+    h.out = h.render();
+    const posted = h.p.posts.filter((x) => x.url === '/lanhu/diff');
+    eq('点按钮 → POST /lanhu/diff，且 body 带 projectId/imageId/from/to', posted.length, 1);
+    eq('POST body 的 from 就是下拉里那个版本', posted[0] && posted[0].body.from, V4);
+    eq('POST body 的 to 就是终点版本', posted[0] && posted[0].body.to, V5);
+    const res = byPart(h.out, 'fit-diff-result')[0];
+    ok('结果区渲染出来（变化块数看得见）', !!res && h.out.text.includes('变化 1 块'), h.out.text.slice(0, 160));
+    ok('逐块明细带「从→到」（人一眼能抄）', h.out.text.includes('人才证书 · 类型 图片→卡片'));
+  }
+
+  /* ── ②b 兜底路径：贴一条"索引里没有的项目"的链接 ── */
+  {
+    const PID2 = '2f9b3333-fe3a-4be3-b6db-d6c86813e711';
+    const LINK = 'https://lanhuapp.com/web/#/item/project/detailDetach?pid=' + PID2 + '&image_id=' + IID;
+    const responses = Object.assign({}, baseResponses, {
+      ['/lanhu/designs?url=' + encodeURIComponent(LINK)]: {
+        ok: true,
+        data: { projectId: PID2, imageId: IID, projectName: '索引里没有的项目', images: [{ imageId: IID, name: '人才详情' }, { imageId: IID2, name: '人才首页' }] },
+      },
+      ['/lanhu/versions?url=' + encodeURIComponent(LINK)]: {
+        // Host 的 /versions 也回 projectId（面板据此保持"目标项目"一致）—— 这里必须回 PID2，
+        // 否则会把 fitProject 覆盖回索引里那个项目，测出来的就不是这条路了（实测踩过）
+        ok: true,
+        data: Object.assign({}, baseResponses['/lanhu/versions?pid=' + PID + '&iid=' + IID].data, { projectId: PID2 }),
+      },
+    });
+    const h = await mountFit({ responses });
+    const link = byPart(h.out, 'fit-link')[0];
+    link.props.onChange({ target: { value: LINK } });
+    h.out = h.render();
+    byText(h.out, '用链接定位').props.onClick();
+    await tick();
+    h.out = h.render();
+    const proj = byPart(h.out, 'fit-project')[0];
+    eq('贴链接定位后，项目下拉的值就是链接里的项目', proj && proj.props.value, PID2);
+    ok('下拉里补出了这条"不在索引里"的项目（否则界面会显示成第一项，与真实状态不一致）',
+      opts(proj).includes(PID2), opts(proj).join(','));
+    ok('链接里带 image_id → 顺手把版本也读了（少点一次）',
+      h.p.calls.some((u) => u.startsWith('/lanhu/versions?url=')), h.p.calls.join(', '));
+    eq('版本下拉已就绪（起点默认上一版）', byPart(h.out, 'fit-from')[0] && byPart(h.out, 'fit-from')[0].props.value, V4);
+  }
+
+  /* ── ③ 运行中：按钮禁用 + 一句进度（不能让人以为卡死） ── */  {
+    const h = await mountFit({ hangUrl: '/lanhu/diff' });
+    await pickProjectAndDesign(h);
+    byText(h.out, '对比两个版本').props.onClick();
+    await tick();
+    h.out = h.render();
+    const btn = byText(h.out, '对比中…');
+    ok('跑起来后按钮文字变成「对比中…」', !!btn, h.out.text.slice(0, 120));
+    ok('跑起来后按钮被禁用（点不动，防重复触发）', !!btn && btn.props.disabled === true);
+    const running = byPart(h.out, 'fit-running-diff')[0];
+    ok('有一句明确的进度提示（不是无声等待）', !!running, JSON.stringify(byPart(h.out, 'fit-running-diff').length));
+    ok('进度里说明"已用多少秒"且点明是长任务',
+      !!running && /已用 \d+s/.test(String(running.props.children)) && String(running.props.children).includes('长任务'),
+      running ? String(running.props.children) : '');
+    ok('跑起来后「取消」变成可点（长任务必须能中断等待）', (byText(h.out, '取消') || {}).props?.disabled === false);
+
+    // 取消：立刻回到可点，且 Host 晚到的回包**不许**覆盖状态
+    byText(h.out, '取消').props.onClick();
+    await tick();
+    h.out = h.render();
+    ok('取消后按钮回到「对比两个版本」且不再禁用', (byText(h.out, '对比两个版本') || {}).props?.disabled === false);
+    ok('取消给出中性的说明（⏹，不是报错红）', h.out.text.includes('⏹ 已取消等待'), h.out.text.slice(0, 200));
+    ok('取消后没有进度行残留', byPart(h.out, 'fit-running-diff').length === 0);
+    h.p.release('/lanhu/diff', { ok: true, data: DIFF_OK });
+    await tick();
+    h.out = h.render();
+    ok('取消后 Host 的回包不会把结果又贴回来（结果作废）',
+      byPart(h.out, 'fit-diff-result').length === 0 && !h.out.text.includes('变化 1 块'));
+  }
+
+  /* ── ④ 审计：张数看得见、可触发、防误操作 ── */
+  {
+    const h = await mountFit({});
+    await pickProjectAndDesign(h);
+    const lim = byPart(h.out, 'fit-audit-limit')[0];
+    eq('扫描张数默认是 20（不是工具的 50，更不是硬上限 200 —— 默认不许悄悄跑很久）', lim && String(lim.props.value), '20');
+    eq('输入框写了硬上限（用户能看见上限在哪）', lim && String(lim.props.max), '200');
+    ok('默认值对应的成本写在界面上（本次约 40 次）', h.out.text.includes('本次约 40 次；'), h.out.text.slice(-160));
+    ok('界面写明扫的是整个项目（不只是选中那张稿）', h.out.text.includes('扫的是整个项目'));
+
+    lim.props.onChange({ target: { value: '3' } });
+    h.out = h.render();
+    ok('改张数后成本立刻跟着变（约 6 次）', h.out.text.includes('本次约 6 次；'), h.out.text.slice(-160));
+    byText(h.out, '开始审计').props.onClick();
+    await tick();
+    h.out = h.render();
+    const posted = h.p.posts.filter((x) => x.url === '/lanhu/audit');
+    eq('点按钮 → POST /lanhu/audit（一次）', posted.length, 1);
+    eq('POST 的 limit 就是面板上那个数', posted[0] && posted[0].body.limit, 3);
+    eq('POST 带上 projectId（选了下拉就不贴链接）', posted[0] && posted[0].body.projectId, PID);
+    ok('审计结果写明扫了多少 / 共多少（成本可见）', h.out.text.includes('扫描 3/10 张'), h.out.text.slice(0, 200));
+    ok('审计的五类结论都列出来了',
+      ['同一组件、多种规格', '字号阶梯', '色值漂移（近重复色）', '间距尺度', '圆角家族'].every((t) => h.out.text.includes(t)));
+    ok('漂移明细给了可直接核对的值（圆角 9999 建议 / 近重复色）',
+      h.out.text.includes('9999(9)') && h.out.text.includes('#f4f5ff'), h.out.text.slice(-400));
+  }
+
+  /* ── ⑤ 张数越界：面板自己也要夹（输 5000 不许真跑 5000） ── */
+  {
+    const h = await mountFit({ hangUrl: '/lanhu/audit' });
+    await pickProjectAndDesign(h);
+    const lim = byPart(h.out, 'fit-audit-limit')[0];
+    lim.props.onChange({ target: { value: '5000' } });
+    h.out = h.render();
+    byText(h.out, '开始审计').props.onClick();
+    await tick();
+    h.out = h.render();
+    const posted = h.p.posts.filter((x) => x.url === '/lanhu/audit');
+    eq('面板把 5000 夹到硬上限 200 再发（不靠用户自觉）', posted[0] && posted[0].body.limit, 200);
+    const running = byPart(h.out, 'fit-running-audit')[0];
+    ok('审计运行中：按钮禁用', (byText(h.out, '审计中…') || {}).props?.disabled === true);
+    ok('审计运行中的进度写明扫多少张（看着心里有数）',
+      !!running && String(running.props.children).includes('正在扫描 200 张稿'), running ? String(running.props.children) : '');
+  }
+
+  /* ── ⑥ 不可靠结论必须显眼（这是两个功能最要紧的一条纪律） ── */
+  {
+    const h = await mountFit({ responses: Object.assign({}, baseResponses, { '/lanhu/diff': { ok: true, data: DIFF_UNRELIABLE } }) });
+    await pickProjectAndDesign(h);
+    byText(h.out, '对比两个版本').props.onClick();
+    await tick();
+    h.out = h.render();
+    const banner = byPart(h.out, 'fit-diff-unreliable')[0];
+    ok('diff 匹配不可靠时，横幅**渲染出来**了（不是只写在长文本里）', !!banner, JSON.stringify(byPart(h.out, 'fit-diff-unreliable').length));
+    ok('横幅是 alert 语义（读屏也当它是警告）', banner && banner.props.role === 'alert');
+    ok('横幅明说"匹配不可靠 + 所以不出明细"',
+      !!banner && /匹配不可靠/.test(h.out.text) && /不列逐块差异明细/.test(h.out.text), h.out.text.slice(0, 200));
+    ok('横幅带可靠度数字（精确/近似/对不上/匹配率）',
+      !!banner && h.out.text.includes('精确匹配 2') && h.out.text.includes('匹配率 32%'));
+    const at = (part) => h.out.nodes.findIndex((n) => n.props['data-dsh-part'] === part);
+    ok('横幅排在结果区**上面**（先看到"不可靠"，再看到数字）',
+      at('fit-diff-unreliable') >= 0 && at('fit-diff-result') >= 0 && at('fit-diff-unreliable') < at('fit-diff-result'),
+      `横幅 @${at('fit-diff-unreliable')}，结果 @${at('fit-diff-result')}`);
+    ok('不可靠时**不出**分类明细表（后端不给，面板也不编）',
+      !h.out.text.includes('尺寸/圆角：') && !h.out.text.includes('结构：'), h.out.text.slice(-200));
+  }
+  {
+    const h = await mountFit({});
+    await pickProjectAndDesign(h);
+    byText(h.out, '对比两个版本').props.onClick();
+    await tick();
+    h.out = h.render();
+    ok('结论可靠时**不**渲染那个横幅（不是永远挂着的装饰）', byPart(h.out, 'fit-diff-unreliable').length === 0);
+  }
+  {
+    const h = await mountFit({ responses: Object.assign({}, baseResponses, { '/lanhu/audit': { ok: true, data: AUDIT_WEAK } }) });
+    await pickProjectAndDesign(h);
+    byText(h.out, '开始审计').props.onClick();
+    await tick();
+    h.out = h.render();
+    const banner = byPart(h.out, 'fit-audit-unreliable')[0];
+    ok('审计判不可靠时，横幅渲染出来了', !!banner && banner.props.role === 'alert');
+    ok('横幅明说"判不可靠 + 所以不出漂移明细"',
+      !!banner && /判不可靠/.test(h.out.text) && /不出漂移明细/.test(h.out.text), h.out.text.slice(0, 200));
+    ok('横幅带样本证据（读到图层 / 块 / 可靠块名）',
+      !!banner && h.out.text.includes('读到图层 3 张') && h.out.text.includes('可靠块名 647/926'));
+    ok('五类**每一项**都写着"未出（不可靠）"（不假装看过）',
+      h.out.text.split('未出（不可靠）').length - 1 >= 5, String(h.out.text.split('未出（不可靠）').length - 1));
+    ok('未出明细的原因也写出来了', h.out.text.includes('未出明细（命名不可靠，拒绝出明细）'));
+  }
+  {
+    const h = await mountFit({});
+    await pickProjectAndDesign(h);
+    byText(h.out, '开始审计').props.onClick();
+    await tick();
+    h.out = h.render();
+    ok('审计可靠时不渲染那个横幅', byPart(h.out, 'fit-audit-unreliable').length === 0);
+    ok('可靠时每类给"漂移/收敛"判定', h.out.text.includes('漂移') || h.out.text.includes('收敛'));
+  }
+
+  /* ── ⑦ 结果可复制（用户要拿去喂 AI） ── */
+  {
+    const h = await mountFit({});
+    await pickProjectAndDesign(h);
+    byText(h.out, '对比两个版本').props.onClick();
+    await tick();
+    h.out = h.render();
+    const copy = byText(h.out, '复制报告');
+    ok('有「复制报告」按钮', !!copy);
+    byText(h.out, '看原文').props.onClick();
+    h.out = h.render();
+    const raw = byPart(h.out, 'fit-diff-raw')[0];
+    ok('「看原文」展开一份**可手选**的纯文本区', !!raw && raw.type === 'textarea', raw ? raw.type : '没渲染');
+    eq('原文区里就是后端那份纯文本报告', raw && raw.props.value, DIFF_OK.text);
+    ok('原文区只读（readOnly）', raw && raw.props.readOnly === true);
+    // 审计那份也要能展开原文（不是只给 diff 做了）
+    byText(h.out, '开始审计').props.onClick();
+    await tick();
+    h.out = h.render();
+    const raws = h.out.nodes.filter((n) => n.type === 'button' && n.props.children === '看原文');
+    raws[raws.length - 1].props.onClick();
+    h.out = h.render();
+    const araw = byPart(h.out, 'fit-audit-raw')[0];
+    eq('审计那份也能展开可手选的原文', araw && araw.props.value, AUDIT_OK.text);
+    copy.props.onClick();
+    await tick();
+    h.out = h.render();
+    ok('点「复制报告」后给出反馈（按钮变「已复制」）', !!byText(h.out, '已复制'), h.out.text.slice(-120));
+  }
+
+  /* ── ⑧ fetch 挂了：只显示错误，绝不 throw、面板不崩 ── */
+  {
+    const h = await mountFit({ failUrl: '/lanhu/diff' });
+    await pickProjectAndDesign(h);
+    byText(h.out, '对比两个版本').props.onClick();
+    await tick();
+    h.out = h.render();
+    ok('取数失败时整棵树照常渲染（没抛错）', h.out.errors.length === 0, h.out.errors.join('; '));
+    const err = byPart(h.out, 'fit-error')[0];
+    ok('错误显示在界面上（❌ + 原话）', !!err && h.out.text.includes('❌ fetch failed'), h.out.text.slice(0, 160));
+    ok('失败后按钮回到可点（不会永远卡在「对比中…」）',
+      (byText(h.out, '对比两个版本') || {}).props?.disabled === false, h.out.text.slice(0, 160));
+    ok('失败后没有进度行残留', byPart(h.out, 'fit-running-diff').length === 0);
+    ok('失败不影响别的区块（审计区照样在）', h.out.text.includes('一致性（跨稿审计）'));
+  }
+
+  /* ── ⑨ 颜色铁律：体检 Tab 的样式里没有裸色值（全部令牌 + fallback） ── */
+  {
+    const h = await mountFit({ responses: Object.assign({}, baseResponses, { '/lanhu/diff': { ok: true, data: DIFF_UNRELIABLE }, '/lanhu/audit': { ok: true, data: AUDIT_WEAK } }) });
+    await pickProjectAndDesign(h);
+    byText(h.out, '对比两个版本').props.onClick();
+    await tick();
+    byText(h.render(), '开始审计').props.onClick();
+    await tick();
+    h.out = h.render();
+    const fitNodes = h.out.nodes.filter((n) => n.underFit);
+    ok('体检 Tab 确实渲染了大量节点（颜色检查不是空跑）', fitNodes.length >= 40, String(fitNodes.length));
+    // 把 var(--token, fallback) 整段挖掉（含嵌套括号）—— 剩下的文本里**再出现**颜色字面量就是写死的。
+    // ⚠️ 只判"整串是不是色值"会漏掉 `1px solid #d97706` 这种简写（实测漏过一次），所以这里按子串判。
+    const stripVars = (v) => {
+      let out = ''; let i = 0;
+      for (;;) {
+        const at = v.indexOf('var(', i);
+        if (at < 0) { out += v.slice(i); return out; }
+        out += v.slice(i, at);
+        let depth = 0; let j = at + 3;
+        for (; j < v.length; j += 1) {
+          if (v[j] === '(') depth += 1;
+          else if (v[j] === ')') { depth -= 1; if (depth === 0) { j += 1; break; } }
+        }
+        i = j;
+      }
+    };
+    const bad = [];
+    let styled = 0;
+    for (const n of fitNodes) {
+      for (const [k, v] of Object.entries(n.props.style || {})) {
+        if (typeof v !== 'string') continue;
+        styled += 1;
+        if (v.includes('var(') && !/var\(--[\w-]+,\s*[^)]+\)/.test(v)) bad.push(k + '=令牌缺 fallback:' + v);
+        const rest = stripVars(v);
+        if (/#[0-9a-fA-F]{3,8}\b|rgba?\(/.test(rest)) bad.push(k + '=' + v);
+      }
+    }
+    ok('体检 Tab 的颜色全部走令牌 + fallback（没有裸色值）', bad.length === 0, bad.join(', '));
+    ok('确实检查到了体检节点的样式', styled >= 20, `检查了 ${styled} 条样式值`);
+  }
+  {
+    const seg = clientSrc.slice(clientSrc.indexOf('12. 体检：变更 diff'), clientSrc.indexOf('13. 面板（shell.overlay）'));
+    const hit = seg.match(/#[0-9a-fA-F]{3,8}\b|rgba?\(/);
+    ok('体检源码段里也没有裸色值（渲染检查 + 源码检查两道）', !hit && seg.length > 4000, hit ? hit[0] : `长度 ${seg.length}`);
+  }
+
+  /* ── ⑩ Host 侧：四条新路由都在同一条 /lanhu 前缀下 ── */
+  {
+    eq('仍然只有一条 /lanhu 路由（体检没另开通道）', (idxSrc.match(/path:\s*'\/lanhu'/g) ?? []).length, 1);
+    const routes = ['designs', 'versions', 'diff', 'audit'];
+    ok('四条新路由都挂在 /lanhu 前缀的子路径上',
+      routes.every((r) => new RegExp("route === '/lanhu/" + r + "'").test(idxSrc)),
+      routes.filter((r) => !new RegExp("route === '/lanhu/" + r + "'").test(idxSrc)).join(',') || '全都在');
+    ok('客户端只能通过 API 常量取数（新代码也守这条）', (() => {
+      const callSites = [...clientSrc.matchAll(/\bjsonFetch\(([^,\n)]+)/g)].map((m) => m[1].trim()).filter((s) => s !== 'url');
+      return callSites.every((s) => s.startsWith('API')) || callSites.every((s) => s.startsWith('API') || s === 'token, url' || s === 'url');
+    })(), '');
+    const callSites = [...clientSrc.matchAll(/\bjsonFetch\(([^,\n)]+)/g)].map((m) => m[1].trim()).filter((s) => s !== 'url');
+    ok('（体检新代码的取数入口）jsonFetch 的首参不是裸字符串 URL',
+      callSites.every((s) => !/^['"`]/.test(s)), callSites.filter((s) => /^['"`]/.test(s)).join(' | '));
+  }
+  {
+    const mkReq = (url, method = 'GET', body = null, addr = '127.0.0.1') => ({
+      url, method, headers: {}, socket: { remoteAddress: addr },
+      [Symbol.asyncIterator]: async function* () { if (body !== null) yield Buffer.from(JSON.stringify(body), 'utf8'); },
+    });
+    const call = async (handler, req) => {
+      const out = { status: 0, body: null, threw: undefined };
+      const resp = { writeHead(s) { out.status = s; }, end(t) { out.body = JSON.parse(t); } };
+      try { await handler(req, resp); } catch (e) { out.threw = e; }
+      return out;
+    };
+    let sawDiffArgs = null;
+    let sawAuditArgs = null;
+    const handler = makeLanhuHandler({
+      checkAuth: async () => ({ ok: true, account: 'acme', teamCount: 1 }),
+      pickAccount: async () => ({ alias: 'quanzi', by: 'index' }),
+      listImages: async () => ({ projectName: '小程序', images: [{ imageId: IID, name: '人才详情', width: 187.5, height: 666.5 }] }),
+      imageVersions: async () => ({ name: '人才详情', versions: [{ id: V5, createTime: AT5, info: '版本5', hasLayoutData: true }] }),
+      diffDesign: async (args) => { sawDiffArgs = args; return DIFF_OK; },
+      auditProject: async (args) => {
+        sawAuditArgs = args;
+        if (args.limit === 7) throw new Error('审计炸了（桩）');
+        return AUDIT_OK;
+      },
+    });
+
+    const designs = await call(handler, mkReq('/lanhu/designs?pid=' + PID));
+    eq('GET /lanhu/designs → 200', designs.status, 200);
+    eq('designs 回项目名 + 稿列表', designs.body?.data?.images?.[0]?.name, '人才详情');
+    eq('designs 缺参数 → 400（不静默给空列表）', (await call(handler, mkReq('/lanhu/designs'))).status, 400);
+    const designsUrl = await call(handler, mkReq('/lanhu/designs?url=' + encodeURIComponent('https://lanhuapp.com/web/#/item/project/detailDetach?pid=' + PID + '&image_id=' + IID)));
+    eq('designs 也认整条链接（自动解析 pid）', designsUrl.body?.data?.projectId, PID);
+    eq('链接里带 image_id → 回给面板自动选中那张稿', designsUrl.body?.data?.imageId, IID);
+
+    const versions = await call(handler, mkReq('/lanhu/versions?pid=' + PID + '&iid=' + IID));
+    eq('GET /lanhu/versions → 200 且带版本列表', versions.body?.data?.versions?.[0]?.id, V5);
+    eq('versions 缺参数 → 400', (await call(handler, mkReq('/lanhu/versions?pid=' + PID))).status, 400);
+
+    const noFrom = await call(handler, mkReq('/lanhu/diff', 'POST', { projectId: PID, imageId: IID }));
+    eq('POST /lanhu/diff 缺 from → 400', noFrom.status, 400);
+    ok('缺 from 时给的是"下一步"而不是干巴巴的报错',
+      /必填/.test(noFrom.body?.error || '') && /versions/.test(noFrom.body?.hint || ''), JSON.stringify(noFrom.body));
+    const d = await call(handler, mkReq('/lanhu/diff', 'POST', { projectId: PID, imageId: IID, from: V4, to: V5 }));
+    eq('POST /lanhu/diff → 200 且把参数透传下去', d.status, 200);
+    eq('diff 收到的 from 就是面板传的', sawDiffArgs?.from, V4);
+    eq('diff 收到的 to 就是面板传的', sawDiffArgs?.to, V5);
+    eq('diff 结果按 {ok,data} 信封回（与既有路由一致）', d.body?.ok, true);
+
+    const a1 = await call(handler, mkReq('/lanhu/audit', 'POST', { projectId: PID, limit: 3 }));
+    eq('POST /lanhu/audit → 200', a1.status, 200);
+    eq('张数照传', sawAuditArgs?.limit, 3);
+    const a2 = await call(handler, mkReq('/lanhu/audit', 'POST', { projectId: PID, limit: 5000 }));
+    eq('张数在 Host 侧再夹一次（5000 → 200）', sawAuditArgs?.limit, 200);
+    await call(handler, mkReq('/lanhu/audit', 'POST', { projectId: PID }));
+    eq('不传张数 → 传 undefined（用后端自己的默认值，口径一致）', sawAuditArgs?.limit, undefined);
+
+    // ⭐ 隔离性：一次审计炸了，不许影响别的端点（尤其 status）
+    const boom = await call(handler, mkReq('/lanhu/audit', 'POST', { projectId: PID, limit: 7 }));
+    ok('审计抛错时 handler 自己不抛（收敛成 {ok:false}）', boom.threw === undefined, boom.threw ? String(boom.threw.message) : '');
+    eq('审计抛错回的是 JSON 信封而不是 500', boom.status, 200);
+    ok('审计抛错带上了原话', /审计炸了/.test(boom.body?.error || ''), JSON.stringify(boom.body));
+    const afterStatus = await call(handler, mkReq('/lanhu/status'));
+    eq('审计炸过之后 /lanhu/status 照样 200（互不牵连）', afterStatus.status, 200);
+    eq('status 的字段没被审计污染', afterStatus.body?.data?.account, 'acme');
+    const afterPreview = await call(handler, mkReq('/lanhu/preview', 'POST', {}));
+    eq('既有 /lanhu/preview 的 400 行为不变', afterPreview.status, 400);
+
+    // 守卫：新路由同样只允许本机
+    eq('非本机访问 /lanhu/audit → 403', (await call(handler, mkReq('/lanhu/audit', 'POST', { projectId: PID }, '10.0.0.9'))).status, 403);
+    eq('非本机访问 /lanhu/designs → 403', (await call(handler, mkReq('/lanhu/designs?pid=' + PID, 'GET', null, '10.0.0.9'))).status, 403);
+    eq('非本机访问 /lanhu/diff → 403', (await call(handler, mkReq('/lanhu/diff', 'POST', { from: V4 }, '10.0.0.9'))).status, 403);
+  }
 }
 
 /* ═══════════════ 汇总 ═══════════════ */

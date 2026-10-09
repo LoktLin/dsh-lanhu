@@ -32,6 +32,8 @@ node lanhu.mjs teams / projects --team <id> / designs --url "<链接>"|--project
 node lanhu.mjs search   --team <teamId> --keyword <kw>
 node lanhu.mjs read     --project <id> --image <id> [--format summary|full|tokens] [--region y0,y1] [--limit N] [--map-box … --to-box …]
 node lanhu.mjs blocks   --url "<蓝湖链接>" [--kind card,pill] [--min-width 60] [--all]
+node lanhu.mjs diff     --url "<蓝湖链接>" --from <旧版本id> [--to <版本id>] [--all]   # 两个版本比「改了什么」
+node lanhu.mjs audit    --url "<链接>"|--project <id> [--limit N] [--all] [--allow-weak-naming]   # 跨稿一致性审计（设计系统漂移）
 node lanhu.mjs slices   --project <id> --image <id> [--out ./assets/lanhu]
 node lanhu.mjs verify   --project <id> --image <id> --page http://localhost:5173/
 node lanhu.mjs who      --url "<蓝湖链接>"
@@ -67,12 +69,16 @@ node lanhu.mjs cookie --clipboard --dry-run  # 只看解析结果，不写入
 ## 本地自检
 
 ```bash
-node test/selfcheck.mjs          # 676 项，纯离线、秒级
+node test/selfcheck.mjs          # 1230 项，纯离线、秒级
 node test/selfcheck.mjs --json   # 机器可读
 ```
 
 覆盖最**容易静默坏掉**的地方：链接解析（hash 路由）、工具参数校验、块级模型分类、工具定义形状、
-lossless JSON、CLI 入口守卫、图片元信息、字体族判定、坐标映射、输出完整性。
+lossless JSON、CLI 入口守卫、图片元信息、字体族判定、坐标映射、输出完整性、
+设计变更 diff（匹配可靠度）、设计系统审计（组件识别判据、三类漂移、命名不可靠时拒绝出明细、成本上限）、
+**Sketch 插件格式（`type: sketchPlugin`）**（能解析的必须解析出块、取不出图层的必须明示而非静默）、
+**面板「体检」Tab**（用最小 React 替身把整棵面板树真渲染一遍：tab 真的挂上了、运行中按钮禁用且有进度、
+不可靠结论在界面上可见、颜色全走令牌、fetch 挂了只显示错误不抛）。
 它跑在临时数据目录（`LANHU_HOME`），**绝不碰你的真实账号与 Cookie**。
 
 > 自检里对每项能力都配了**正反例**（例如"父组可见 → 子层进表"和"父组隐藏 → 子层不进表"同时断言）——

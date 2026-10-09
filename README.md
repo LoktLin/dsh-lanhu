@@ -21,7 +21,7 @@
 > **有了它**：设计稿的真实数值直接进上下文 —— 等于把「设计标注」喂给模型；还能反过来拿它**自动验收**页面还原度。
 
 **版本 `0.5.4`**（见 [发布说明](https://github.com/LoktLin/dsh-lanhu/releases)） · MIT · 已发布到 npm：[`dsh-lanhu`](https://www.npmjs.com/package/dsh-lanhu)
-适用于 [DeepSeek Harness](https://github.com/deepseek-ai)（DSH）Web GUI，需要 **Node ≥ 20**。自带 15 个原生工具 + 侧边面板 + CLI。
+适用于 [DeepSeek Harness](https://github.com/deepseek-ai)（DSH）Web GUI，需要 **Node ≥ 20**。自带 17 个原生工具 + 侧边面板 + CLI。
 
 > ⚠️ **免责与数据说明**
 >
@@ -36,14 +36,17 @@
 
 | 能力 | 说明 |
 |---|---|
-| **15 个原生工具** | 参数带 schema 校验；不用拼 shell 命令调脚本 |
+| **17 个原生工具** | 参数带 schema 校验；不用拼 shell 命令调脚本 |
 | **贴链接就行** | 不用手拆 `tid/pid/image_id`，**也不用知道稿子属于哪个账号**（自动判定，零请求优先） |
 | **块级清单** | 把几百个图层收敛成「人一眼能核对」的块：六项属性 + **字体族** + **行高·字距** + **多段渐变全 stop** |
+| **两种稿件格式都读** | **Sketch 插件导出**（`type: sketchPlugin`：图层平铺在 `info[]` 里、没有 `artboard`，实测某项目占一半以上）与 Figma/Sketch 常规稿走**同一条**解析链；认不出的树**明说**（`unsupported: true` + `sourceFormat`），绝不静默给一个空结果 |
 | **区域抠图 + 坐标映射** | 按 `y` 区间取值；能把设计稿坐标**直接映射**到你自己 SVG 的 viewBox（非等比，两套坐标系也能对） |
 | **切图导出带 alpha 报告** | 每张图给 `尺寸 / mode / alpha 范围`，**半透明当场告警**（避免整屏发灰） |
 | **两种验收** | 文本层逐字段比对 + 块级**四态报告**（含可直接抄的建议改法） |
+| **版本 diff** | 同一张稿的两个版本比「这次设计改了什么」；**报匹配可靠度**，两版大面积对不上时明说"逐块对比不可靠"、**不硬凑差异表** |
+| **跨稿一致性审计** | 扫一个项目的多张稿，报「设计系统漂移」：同一组件多种规格（圆角/高度分布 + 建议以哪个为准）· 字号阶梯 · 近重复色 · 间距尺度 · 圆角家族。判据是层名归一化后相同，工具默认名不认；命名不可靠时**判不可靠、拒绝出明细** |
 | **原型（PRD）也能读** | 页面树 + 正文业务规则；**没有设计稿、只有原型的项目**还能读原型里的色值/字号/坐标（`format:"layers"`，与设计稿同一张块级表） |
-| **侧边面板** | 块级 / 账号 / 记录，三个 Tab，不用敲命令 |
+| **侧边面板** | 块级 / 账号 / 记录 / **体检**，四个 Tab，不用敲命令；两个项目级长任务（变更 diff、跨稿审计）也能在面板上跑：**看得见跑多少、跑着什么、结论能不能信**，还能一键复制报告。标题栏带当前版本，有新版时给一个小圆点 |
 | **多账号** | 一账号一套 Cookie；贴链接自动判归属（索引命中零请求） |
 | **零运行时依赖** | 真机验收才需要 `puppeteer-core`（`optionalDependencies`，不装也能用） |
 | **离线自检** | 秒级、零网络；改完代码先跑它（另有**文档绊线** `test/readme-test.mjs`：生成块 / `docs/` 链接与孤立文件 / 版本号五处 / 发布说明格式 / 写死的数字） |
@@ -109,6 +112,8 @@
 | `lanhu_search` | 全局搜索稿子 / 项目 / PRD（不记得稿子在哪个项目时用） |
 | `lanhu_read_design` | **主工具**：图层树。`summary`（默认，紧凑文本）/ `full`（落盘 JSON）/ `tokens`（统计）；配 `region` 抠区域，配 `mapBox` + `toBox` 把坐标映射进你自己的坐标系 |
 | `lanhu_read_blocks` | **块级清单**：卡片 / 胶囊 / 文本 / 图片 / 分割线 / 容器，每块六项属性 + 不透明 + 字体族 + 行高字距。核对圆角 / 分割线 / 近似色**优先用它** |
+| `lanhu_diff_design` | **同一张稿的两个版本对比**：这次设计改了什么（尺寸/圆角·颜色·布局·文字·新增·删除，数值给「从→到」）。报**匹配可靠度**，两版大面积对不上时**明说"逐块对比不可靠"**、不硬凑差异表 |
+| `lanhu_audit_project` | **跨稿一致性审计**：扫一个项目的多张稿，报「设计系统漂移」（同组件多规格 / 字号阶梯 / 近重复色 / 间距 / 圆角）。判据 = 层名归一化后相同，工具默认名不认；命名不可靠时**拒绝出明细** |
 | `lanhu_download_slices` | 下载切图 + `mapping.json`（含尺寸 / mode / alpha 范围） |
 | `lanhu_verify_spec` | 文本层验收：`getComputedStyle` 逐字段比对（色值 / 字号 / 字重 / **字体族** / 圆角） |
 | `lanhu_verify_blocks` | **块级比对**：每个可见块比六项属性 + 字体族，输出四态报告与建议改法 |
@@ -126,7 +131,7 @@
 
 <!-- BEGIN GENERATED:tools -->
 
-**15 个工具。** 下面每一个字都来自 AI 在 schema 里看到的那份 —— 本节由 `node tools/gen-readme-tools.mjs --write` 生成，**别手改**；改了工具忘了跑生成器，`test/readme-test.mjs` 会**逐字比对**并报红。
+**17 个工具。** 下面每一个字都来自 AI 在 schema 里看到的那份 —— 本节由 `node tools/gen-readme-tools.mjs --write` 生成，**别手改**；改了工具忘了跑生成器，`test/readme-test.mjs` 会**逐字比对**并报红。
 
 #### `lanhu_check_auth`
 
@@ -198,7 +203,7 @@
 
 #### `lanhu_read_blocks`
 
-把设计稿读成「块级清单」：卡片/胶囊/文本/图片/分割线/容器，每块带齐六项属性（圆角、大小、文字色、字号、有无底色、边框/分割线），外加**图层不透明**（已累乘祖先链，与填充色 `@xx%` alpha 是两回事，两者都要还原）、**字体族**、**行高·字距**、**多段渐变的全部 stop**（`#145994@18%→#08294a@10%`）。比 lanhu_read_design 更贴近"人一眼能核对"的粒度——**设计稿里肉眼最容易漏的分割线（如 1px #E2E8F0）会单独列在"边框/分割线"段**。**直接粘贴蓝湖链接即可**：不用手动拆 id，也**不用知道它属于哪个账号**（多账号场景会自动判定，并在结果末尾写明用了哪个）。还原大块布局或核对圆角/分割线时优先用它。
+把设计稿读成「块级清单」：卡片/胶囊/文本/图片/分割线/容器，每块带齐六项属性（圆角、大小、文字色、字号、有无底色、边框/分割线），外加**图层不透明**（已累乘祖先链，与填充色 `@xx%` alpha 是两回事，两者都要还原）、**字体族**、**行高·字距**、**多段渐变的全部 stop**（`#145994@18%→#08294a@10%`）。比 lanhu_read_design 更贴近"人一眼能核对"的粒度——**设计稿里肉眼最容易漏的分割线（如 1px #E2E8F0）会单独列在"边框/分割线"段**；末尾还附**无障碍对比度**（文字色 vs 有效背景色的 WCAG 比值，**只列不达标**的并给出可直接改的色值；背景沿祖先链找、找不到画板底色就**明说算不出、不猜**）。**直接粘贴蓝湖链接即可**：不用手动拆 id，也**不用知道它属于哪个账号**（多账号场景会自动判定，并在结果末尾写明用了哪个）。还原大块布局或核对圆角/分割线时优先用它。
 
 | 参数 | 类型 | 必填 | 取值 | 说明 |
 |---|---|---|---|---|
@@ -212,6 +217,33 @@
 | `includeNoise` | `boolean` | 否 | — | 是否包含系统 UI / 图形碎片块（默认折叠） |
 | `version` | `string` | 否 | — | 版本 id（默认 latest）；与 read_design 同义。设计稿更新后要复现"当时那一版"就传它 |
 | `dualUnits` | `boolean` | 否 | — | 默认关闭。开启后「尺寸」列给双单位 `120×152px / 240×304rpx`（换算比按画板宽度算）；末尾的「间距一览」始终双单位 |
+| `account` | `string` | 否 | — | 可选：指定蓝湖账号别名（多账号场景，如 acme）。不给时会按链接里的团队 id 自动判定，再退到默认账号。先用 lanhu_accounts 看有哪些账号。 |
+
+#### `lanhu_diff_design`
+
+**同一张稿的两个版本对比** —— 回答「这次设计改了什么」。蓝湖自己不提供版本对比，而设计一改、已经写好的页面就过期了。按「人会怎么说这次改动」组织输出：尺寸/圆角、颜色、布局、文字、边框、结构、新增、删除，**每类只列有变化的**且数值给「从→到」；零变化的块只给一句汇总（"其余 N 块未变"）；两版没差异时**明说"两版一致"**（设计没改，代码可以不动）。**匹配可靠度会明确报出来**：多少块按层路径精确匹配、多少只能靠几何近似、多少对不上；两版大面积对不上时（整版重画/重排）会**明说"差异过大，逐块对比不可靠"并拒绝出明细表** —— 不会硬凑一张看起来精确的差异表。`from` 必须是真实存在的版本 id，给不存在的 id 会**报错**（不静默回退最新版）。
+
+| 参数 | 类型 | 必填 | 取值 | 说明 |
+|---|---|---|---|---|
+| `url` | `string` | 否 | — | 蓝湖设计稿链接（详情页地址整条粘贴，自动解析 tid/pid/image_id） |
+| `projectId` | `string` | 否 | — | 项目 UUID（与 imageId 搭配；给了 url 可不传） |
+| `imageId` | `string` | 否 | — | 设计稿 id（与 projectId 搭配） |
+| `from` | `string` | **是** | — | **必填**：对比的**起点**版本 id（旧的那一版）。版本 id 从 `lanhu_read_blocks` / `lanhu_read_design` 返回的 `version.id` 里取；给不存在的 id 会报错，**不会**静默回退到最新版 |
+| `to` | `string` | 否 | — | 对比的**终点**版本 id（新的那一版）。省略 = 最新版（latest） |
+| `includeNoise` | `boolean` | 否 | — | 是否把系统 UI / 图形碎片块也纳入比对（默认 false，与块级清单同一个折叠口径） |
+| `account` | `string` | 否 | — | 可选：指定蓝湖账号别名（多账号场景，如 acme）。不给时会按链接里的团队 id 自动判定，再退到默认账号。先用 lanhu_accounts 看有哪些账号。 |
+
+#### `lanhu_audit_project`
+
+**跨稿一致性审计（设计系统漂移）** —— 蓝湖完全不提供这个。扫**一个项目的多张稿**，报「同一组件在不同稿里长成了不同样子」：① 同一组件、多种规格（某组件的圆角/高度分布 + 建议以哪个为准，按多数派）② 字号阶梯失控（全项目用了 N 种字号、其中哪些只出现 1 次 → 收敛建议）③ 色值漂移（近重复色：#574af4 与 #574bf5 这种肉眼分不出的，按 RGB 距离阈值聚类）④ 间距尺度（跑出 4px 栅格的野值）⑤ 圆角家族。**「同一个组件」的判据是层名归一化后相同**，判据与覆盖率都写在输出里；`Rectangle 12` / `矩形 3` / 空名这类**工具默认名一律不认**（不硬凑）——命名不可靠时**判 unreliable 并拒绝出明细**。⚠️ 成本：**扫 N 张 = 2N 次请求**，所以默认只扫限额张数，要更多显式传 limit，但**绝不超过硬上限**；输出里写明 scanned / total / 是否被截断。
+
+| 参数 | 类型 | 必填 | 取值 | 说明 |
+|---|---|---|---|---|
+| `url` | `string` | 否 | — | 项目链接或任意一张稿的链接（整条粘贴，自动解析 tid/pid；审计的是**整个项目**） |
+| `projectId` | `string` | 否 | — | 项目 UUID（与 url 二选一）。一个项目往往有很多张稿，用它最直接 |
+| `limit` | `integer` | 否 | — | 最多扫多少张稿（默认 50；**硬上限 200**，传更大也只会扫 200）。成本 = 张数 × 2 次请求，别一上来就拉满 |
+| `includeNoise` | `boolean` | 否 | — | 是否把系统 UI / 图形碎片块也纳入统计（默认 false，与块级清单同一个折叠口径） |
+| `allowWeakNaming` | `boolean` | 否 | — | 命名不可靠时是否仍然给出**不依赖层名**的几项（字号阶梯 / 近重复色 / 间距 / 圆角）。默认 false = 一项都不出（硬凑的结论比不给更糟） |
 | `account` | `string` | 否 | — | 可选：指定蓝湖账号别名（多账号场景，如 acme）。不给时会按链接里的团队 id 自动判定，再退到默认账号。先用 lanhu_accounts 看有哪些账号。 |
 
 #### `lanhu_list_product_documents`
@@ -333,7 +365,7 @@
 # ① 装进 profile —— 两种来源任选
 dsh plugin --profile web add dsh-lanhu        # 从 npm（推荐使用者）
 dsh plugin --profile web add <plugin-dir>     # 从本仓库（要改代码时）
-# ② 重启 dsh web —— 15 个工具即对全部会话可见
+# ② 重启 dsh web —— 16 个工具即对全部会话可见
 ```
 
 > `dsh plugin add` 就是 `pnpm add`，所以也接受 npm 包名 / tarball / git 地址。
@@ -372,6 +404,8 @@ cd <plugin-dir> && npm i puppeteer-core   # 只装这一个（它是 optional �
 | 读**产品文档 / 原型（PRD）** / 原型和设计稿分不清 | [docs/产品文档.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/产品文档.md) |
 | **项目没有设计稿、只有原型**，要照着它实现 | [docs/原型样式.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/原型样式.md) |
 | 还原完要验收 / 导出切图 | [docs/验收.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/验收.md) |
+| **设计改了，要知道改了哪**（版本对比） | [docs/设计变更.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/设计变更.md) |
+| **整个项目的设计系统是不是漂了**（跨稿一致性审计） | [docs/设计系统审计.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/设计系统审计.md) |
 | 用侧边面板 / 配多账号 / Cookie 失效了 | [docs/面板与账号.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/面板与账号.md) |
 | 用命令行 / 跑自检 / 踩到限制 | [docs/CLI与开发.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/CLI与开发.md) |
 | 这一版改了什么 | [Releases](https://github.com/LoktLin/dsh-lanhu/releases)（每个版本一份中英发布说明） |
@@ -393,7 +427,7 @@ cd <plugin-dir> && npm i puppeteer-core   # 只装这一个（它是 optional �
 > exact structured data (coordinates, colours, font size/weight/family, line-height, letter-spacing,
 > corner radius, stroke, gradients, text, layer opacity) and feeds it to the coding agent, so it stops
 > guessing values from a screenshot. It can also verify a built page against the same spec.
-> **15 tools + a sidebar panel + a CLI**, MIT, macOS/Windows, DSH Web GUI, Node ≥ 20.
+> **17 tools + a sidebar panel + a CLI**, MIT, macOS/Windows, DSH Web GUI, Node ≥ 20.
 > The Chinese sections above are the full manual; this section is the one-screen entry point.
 
 **30-second quick start**
@@ -409,7 +443,7 @@ cd <plugin-dir> && npm i puppeteer-core   # 只装这一个（它是 optional �
 > page's style values (colours / font sizes / coordinates) — the only route when a project has **no design artboards**.
 > Prototype styles are typed in by hand by the designer, so **a design always wins when one exists**. See [docs/原型样式.md](https://github.com/LoktLin/dsh-lanhu/blob/main/docs/原型样式.md).
 
-**The 15 tools, one line each**
+**The 17 tools, one line each**
 
 | Tool | What it is for |
 |---|---|
@@ -421,6 +455,8 @@ cd <plugin-dir> && npm i puppeteer-core   # 只装这一个（它是 optional �
 | **`lanhu_list_product_documents`** | List the project's **PRD / prototype (Axure)** documents — separate from design artboards |
 | **`lanhu_read_product_doc`** | A prototype's page tree plus the body text of one page (business rules, fields, navigation). Add `format:"layers"` to get that page's **styles** — colours, font sizes, coordinates, borders, gradients — so a project with **no design artboards** can still be implemented from it |
 | **`lanhu_download_slices`** | Download slices plus `mapping.json` (size / mode / alpha range per image) |
+| **`lanhu_diff_design`** | Compare **two versions of one artboard** — what changed in this design round (size/radius · colour · layout · text · border · added · removed, with from→to values). Reports matching reliability and refuses a made-up table when the two versions barely line up |
+| **`lanhu_audit_project`** | **Cross-artboard consistency audit**: scan many artboards of one project for design-system drift (one component with several specs / font-size ladder / near-duplicate colours / spacing / radii). Identity = normalised layer name; template names like `Rectangle 12` are never accepted, and when naming is unreliable it **refuses to produce details** |
 | **`lanhu_verify_spec`** | Text-layer verification via `getComputedStyle` (colour / size / weight / **font family** / radius) |
 | **`lanhu_verify_blocks`** | Block-level comparison of six properties + font family, with a four-state report |
 | **`lanhu_who`** | Which account does this artboard belong to? (**index hit = zero requests**) |
@@ -429,7 +465,7 @@ cd <plugin-dir> && npm i puppeteer-core   # 只装这一个（它是 optional �
 
 **Install essentials**
 
-1. `dsh plugin --profile web add <plugin-dir>`, then **restart `dsh web`** — the 15 tools become visible to every session.
+1. `dsh plugin --profile web add <plugin-dir>`, then **restart `dsh web`** — the 17 tools become visible to every session.
 2. For development, symlink the package into the web profile's `node_modules` **and** add `"dsh-lanhu"` to `dsh.profile.bundles` — without the bundles entry the plugin is not loaded at all.
 3. `lanhu_verify_spec` needs a browser engine: `npm i puppeteer-core` (it is an optional dependency — everything else works without it). **On macOS 12 or older, always use puppeteer-core**; Playwright's Chromium cannot be installed there.
 

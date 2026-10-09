@@ -15,7 +15,7 @@
    > 漏改一处就红。以前这步是纯靠人核的。
 2. **改了工具就跑生成器**：`node tools/gen-readme-tools.mjs --write`
    （README 的「每个工具的完整说明」是从 `lib/index.js` 的 `TOOLS` 生成的，`readme-test` 逐字比对。）
-3. **跑自检**：`node test/selfcheck.mjs` —— 676 项，**纯离线、秒级**，改完代码先跑它。
+3. **跑自检**：`node test/selfcheck.mjs` —— 1230 项，**纯离线、秒级**，改完代码先跑它。
    `node test/readme-test.mjs` —— **文档绊线**（项数看它自己的输出，**别在文档里写死**）：生成块是否最新 / `docs/` 链接是否存在且无孤立文件 /
    版本号五处是否一致 / 发布说明格式与公开纪律（不含本机路径）。
    （可选）插件脚手架自检：`node <dsh-plugin-mac 技能目录>/scripts/selftest.mjs --plugin .` —— 16 项，
