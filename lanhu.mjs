@@ -86,6 +86,11 @@ export const LIMITS = Object.freeze({
   cardMinWidth: 240,        // 卡片：最小宽
   cardMinHeight: 100,       // 卡片：最小高
   // —— 输出上限 ——
+  // ⚠️ **截断规矩（全项目一条）**：凡是要截断，人读输出里就必须写清「用哪个参数取更多」，
+  //    且那个参数必须是真的取数通道（`region` / `limit` / `--limit` / `maxRows` / `pageTreeLimit` /
+  //    `offset` / 落盘路径）—— **不许指向 `format=full`**（它是**落盘留档**用的，不是取数通道，
+  //    与 lib/index.js 的 SYSTEM_HINT 同一口径）。自检里有一条**源码级扫描**钉住它：
+  //    ① 截断提示里不许出现 `format=full`；② 每条截断提示都必须点名一个取数参数。
   summaryMaxBoxes: 14,      // summary「关键容器」最多列几个
   gapsLimit: 60,            // renderGaps 默认上限
   gapDigestMaxRows: 24,     // 「间距一览」的间距行封顶（0.5.0 口径）
@@ -102,6 +107,14 @@ export const LIMITS = Object.freeze({
   // —— 生成代码（§4.10）——
   // 一张大屏稿动辄几百块，全量吐出来没人能粘贴 —— 默认封顶（用 region / limit 收窄）。
   codeMaxBlocks: 60,        // lanhu_gen_code 默认最多生成几块
+  // —— 列表接口的分页（`lanhu_list_designs` / `lanhu_search`）——
+  //    成本模型：两个工具各 **1 次请求**（列稿 / 搜索），分页只影响**输出体积**，不增加请求。
+  //    为什么要有它：实测某项目 **252 张稿**，没有上限就是一次全灌进上下文 —— 而定位一张稿
+  //    通常只需要"看前几页 + 按名字搜"。硬上限压回后，剩下的靠 offset 翻页取（**不静默少给**）。
+  listDefaultImages: 50,        // lanhu_list_designs 默认一页几张
+  listMaxImages: 500,           // **硬上限**：limit 传再大也压回它
+  searchDefaultItems: 50,       // lanhu_search 默认一页几条（**每类各一份**，直接当接口的 pageSize）
+  searchMaxItems: 500,          // **硬上限**
   // —— 设计变更 diff（§6.5）——
   diffApproxMaxCenter: 24,      // 近似匹配：两块的**中心点**偏移上限（px）
   diffApproxReachRatio: 0.25,   // 近似匹配的宽松兜底：偏移 ≤ 较大边的这个比例也算（大块天然挪得远）
@@ -132,6 +145,7 @@ export const LIMITS = Object.freeze({
   auditLadderMinCount: 3,       // 算「常用档」的最低出现次数（收敛建议的锚点）
   auditNearColorDistance: 12,   // 近重复色：RGB 欧氏距离 ≤ 它（≈ ΔE 5，肉眼看不出）
   auditMaxColors: 600,          // 参与近重复比较的色值上限（超过只取出现次数最多的那批）
+  auditMaxColorsHard: 5000,     // ↑ 的**硬上限**（`maxRows` 放宽时也不越过它：那一步是 O(n²) 两两比较）
   auditSpacingGrid: 4,          // 间距栅格（4px 制）
   auditSpacingMaxDistance: 120, // 只统计 ≤ 它的相邻间距（几百 px 的"间距"是版面留白，不是尺度 token）
   auditSpacingMaxBlocks: 500,   // 单张稿可见块超过它就不算间距（geometricGaps 是 O(N²) 的保护）
@@ -1182,6 +1196,16 @@ export async function imageDetail(projectId, imageId, opts = {}) {
 /** 全局搜索。未挂分组的稿子用这个找最稳。 */
 export const SEARCH_TYPES = ['dc_prj', 'board', 'ts_single_doc', 'folder', 'dc_prj_image', 'dc_prj_prd'];
 
+/**
+ * 全局搜索。
+ *
+ * 分页（`opts.pageNo` / `opts.pageSize`）本来就有 —— 三个工具以外的调用方（CLI）**不传**，
+ * 于是行为与以前一样（接口默认 `pageNo:1 / pageSize:20`）。工具那条链显式传，
+ * 见 `lanhu_search` 的 `limit` / `offset`。
+ *
+ * `opts.withTotals === true` 时额外返回 `totals`（接口本来就给了每类的 `total`）——
+ * 只有工具要它（"共 N 条"那句话必须有真数，不能编）。**默认不返回**，CLI 的 `--json` 输出因此逐字节不变。
+ */
 export async function search(teamId, keyword, opts = {}) {
   if (!teamId) throw new LanhuError('search 需要 teamId。');
   const { json } = await apiRequest(`${BASE}/workbench/api/workbench/abstractfile/search`, {
@@ -1215,7 +1239,19 @@ export async function search(teamId, keyword, opts = {}) {
     name: it.itemName,
     path: it.path,
   }));
-  return { images, projects, prds, keyword: keyword ?? '' };
+  const out = { images, projects, prds, keyword: keyword ?? '' };
+  if (opts.withTotals === true) {
+    // 拿不到 `total` 的形态就**不给这个键**（不编 0 —— 0 是"确实没有"，不是"没拿到"）
+    const t = (raw.dc_prj_image?.total != null) || (raw.dc_prj?.total != null) || (raw.dc_prj_prd?.total != null);
+    if (t) {
+      out.totals = {
+        images: Number(raw.dc_prj_image?.total ?? images.length),
+        projects: Number(raw.dc_prj?.total ?? projects.length),
+        prds: Number(raw.dc_prj_prd?.total ?? prds.length),
+      };
+    }
+  }
+  return out;
 }
 
 /** 拉图层树（两步走：详情拿 json_url → 取 JSON）。内置 A2：docId 失效时自动找回。 */
@@ -1949,7 +1985,7 @@ export function renderGaps(gaps, limit = LIMITS.gapsLimit, opts = {}) {
   L.push('|---|---|---|---|---|');
   const nm = (id, name) => `${name || '(无名)'}${id ? ` \`${String(id).slice(0, 18)}\`` : ''}`;
   for (const g of gaps.slice(0, limit)) L.push(`| ${nm(g.from, g.fromName)} | ${nm(g.to, g.toName)} | ${g.axis} | ${dual1(g.distance, opts.designWidth, opts)} | ${g.overlap.start}~${g.overlap.end} |`);
-  if (gaps.length > limit) L.push(`| … | | | 其余 ${gaps.length - limit} 条略 | |`);
+  if (gaps.length > limit) L.push(`| … | | | 其余 ${gaps.length - limit} 条略（调大 \`limit\`、或放宽 \`gapMaxDistance\` 能出更多；按 \`region\` 分次取也行） | |`);
   return L.join('\n');
 }
 
@@ -2129,7 +2165,7 @@ export function renderGapDigest(items, opts = {}) {
       const arrow = g.axis === 'y' ? '↕' : '↔';
       L.push(`- ${lab.byRef(g.from, g.fromName)} ${arrow} ${lab.byRef(g.to, g.toName)} = **${dual1(g.distance, designWidth, opts)}**`);
     }
-    if (gaps.length > limit) L.push(`- … 其余 ${gaps.length - limit} 条略（用 region + gapMaxDistance 收窄）`);
+    if (gaps.length > limit) L.push(`- … 其余 ${gaps.length - limit} 条略（按 \`region\` 收窄：一片区域的间距少，能全列；CLI 同 \`--region\`）`);
   }
   if (aligns.length > 0) {
     L.push('');
@@ -2137,7 +2173,7 @@ export function renderGapDigest(items, opts = {}) {
     for (const a of aligns.slice(0, limit)) {
       L.push(`- ${lab.of(a.from)} ${a.edge} ≡ ${lab.of(a.to)} ${a.edge}（${round2(a.value)}px）`);
     }
-    if (aligns.length > limit) L.push(`- … 其余 ${aligns.length - limit} 处略`);
+    if (aligns.length > limit) L.push(`- … 其余 ${aligns.length - limit} 处略（按 \`region\` 收窄：一片区域的齐平处少，能全列；CLI 同 \`--region\`）`);
   }
   return L.join('\n');
 }
@@ -2892,7 +2928,7 @@ export function renderProductDoc(result) {
   for (const p of result.pages.slice(0, Number(result.pageTreeLimit ?? 200))) {
     L.push(`| ${'  '.repeat(p.level)}${p.level} | ${p.type ?? '—'} | ${p.path} | ${p.pageId ?? '—'} |`);
   }
-  if (result.pageCount > (result.pageTreeLimit ?? 200)) L.push(`| … | | 其余 ${result.pageCount - (result.pageTreeLimit ?? 200)} 个节点略 | |`);
+  if (result.pageCount > (result.pageTreeLimit ?? 200)) L.push(`| … | | 其余 ${result.pageCount - (result.pageTreeLimit ?? 200)} 个节点略（调大 \`pageTreeLimit\` 看全；CLI 同 \`--page-tree-limit\`） | |`);
   if (result.content?.length) {
     L.push('');
     L.push(`## 正文（${result.content.length} 页）`);
@@ -4186,7 +4222,7 @@ export function renderBlocks(blocks, meta = {}, opts = {}) {
     const fam = b.font?.family ? shortFamily(b.font.family) : '—';
     L.push(`| ${i + 1} | ${BLOCK_KINDS[b.kind] ?? b.kind} | ${b.name ?? ''} | ${b.x},${b.y} | ${opts.dualUnits ? dualUnits(b.w, b.h, meta.width, opts) : `${b.w}×${b.h}`} | ${r} | ${bg} | ${op} | ${bd} | ${(b.text ?? '').slice(0, 18)} | ${f} | ${fam} | ${metricsText(b.font)} |`);
   });
-  if (main.length > limit) L.push(`| … | 其余 ${main.length - limit} 块略（可用 --region / --limit 收窄） | | | | | | | | | |`);
+  if (main.length > limit) L.push(`| … | 其余 ${main.length - limit} 块略（调大 \`limit\` 看更多；CLI 同 \`--limit\`；或按 \`region\` 分次取） | | | | | | | | | | |`);
 
   // 边框总览：案例 2「分割线整条丢失」的直接答案
   const withBorder = main.filter((b) => b.border);
@@ -4196,7 +4232,7 @@ export function renderBlocks(blocks, meta = {}, opts = {}) {
     for (const b of withBorder.slice(0, LIMITS.flushMaxRows)) {
       L.push(`- ${b.name}：${b.border.color ?? '(蓝湖未给颜色)'} **${b.border.width}px**，${b.border.sides.join('+')}${b.border.single ? ' ← 单边，即分割线' : ''}`);
     }
-    if (withBorder.length > LIMITS.flushMaxRows) L.push(`- … 其余 ${withBorder.length - LIMITS.flushMaxRows} 处略`);
+    if (withBorder.length > LIMITS.flushMaxRows) L.push(`- … 其余 ${withBorder.length - LIMITS.flushMaxRows} 处略（按 \`region\` 分次取：一片区域的分割线少，能全列；CLI 同 \`--region\`）`);
   }
 
   // 间距一览（§4.2）：块与块"差多少"直接给出来，省掉拿坐标手算。
@@ -4225,7 +4261,7 @@ export function renderBlocks(blocks, meta = {}, opts = {}) {
   // 评论（§4.9）：同样"段内容由 readBlocks 算好传进来"，位置在「对比度」之后、尾注之前。
   // ⚠️ 没有评论 / 没传 `opts.comments` → `renderComments` 返回空串 → **一个字都不加**，输出逐字节不变。
   if (opts.comments) {
-    const seg = renderComments(opts.comments, { designWidth: meta.width, designHeight: meta.height });
+    const seg = renderComments(opts.comments, { designWidth: meta.width, designHeight: meta.height, maxReplies: opts.maxReplies });
     if (seg) {
       L.push('');
       L.push(seg);
@@ -4588,7 +4624,7 @@ export function renderContrastDigest(audit, opts = {}) {
       ].filter(Boolean).join('；');
       L.push(`- ${lab.of(r, i)} ｜ \`${r.glyphHex}\` / \`${r.bgHex}\`${r.baseIsArtboard ? '（画板）' : ''} ｜ **${fmtRatio(r.ratio)}:1**（需 ${r.required}:1） ｜ 差 **${r.delta}** ｜ ${r.suggestion}${note ? ` ｜ _${note}_` : ''}`);
     }
-    if (fail.length > limit) L.push(`- … 其余 ${fail.length - limit} 个不达标的略（用 region 收紧再看）`);
+    if (fail.length > limit) L.push(`- … 其余 ${fail.length - limit} 个不达标的略（按 \`region\` 收窄：一片区域的不达标项少，能全列；CLI 同 \`--region\`）`);
   }
   if (unknown.length > 0) {
     L.push('');
@@ -4596,7 +4632,7 @@ export function renderContrastDigest(audit, opts = {}) {
     for (const [i, r] of unknown.slice(0, limit).entries()) {
       L.push(`- ${lab.of(r, fail.length + i)} ｜ 文字色 ${r.fg ? `\`${r.fg}\`` : '（未给）'} ｜ ${CONTRAST_UNKNOWN_TEXT[r.reason] ?? r.reason}`);
     }
-    if (unknown.length > limit) L.push(`- … 其余 ${unknown.length - limit} 个略`);
+    if (unknown.length > limit) L.push(`- … 其余 ${unknown.length - limit} 个略（按 \`region\` 收窄：一片区域的文本层少，能全列；CLI 同 \`--region\`）`);
   }
   return L.join('\n');
 }
@@ -4925,6 +4961,9 @@ function commentContentText(content) {
  */
 export function renderComments(result, opts = {}) {
   if (!result) return '';
+  // 每条评论最多列几条回复：默认 `LIMITS.commentsMaxReplies`；工具 `commentMaxReplies` / CLI `--comment-max-replies` 可放宽。
+  const replyCap = Number.isFinite(Number(opts.maxReplies)) && Number(opts.maxReplies) > 0
+    ? Math.floor(Number(opts.maxReplies)) : LIMITS.commentsMaxReplies;
   const L = [];
   if (result.error) {
     L.push('## 评论（**读取失败**）');
@@ -4965,11 +5004,11 @@ export function renderComments(result, opts = {}) {
     } else {
       L.push(`  - ↳ **未落在任何块上**（落点 (${a.x}, ${a.y}) ${a.reason === 'no-blocks' ? '；这张稿一个可见块都没有' : '处没有块'}）`);
     }
-    for (const rep of (it.replies ?? []).slice(0, LIMITS.commentsMaxReplies)) {
+    for (const rep of (it.replies ?? []).slice(0, replyCap)) {
       L.push(`  - ↳ 回复 ${commentUserText(rep.user)}：「${commentContentText(rep.content)}」`);
     }
-    if ((it.replies ?? []).length > LIMITS.commentsMaxReplies) {
-      L.push(`  - ↳ … 另有 ${(it.replies ?? []).length - LIMITS.commentsMaxReplies} 条回复略`);
+    if ((it.replies ?? []).length > replyCap) {
+      L.push(`  - ↳ … 另有 ${(it.replies ?? []).length - replyCap} 条回复略（传更大的 \`commentMaxReplies\` 看全；CLI 同 \`--comment-max-replies\`）`);
     }
   }
   return L.join('\n');
@@ -5182,7 +5221,7 @@ export function renderTokens(tokens, meta = {}) {
   L.push('| 色值 | rgb | 出现次数 |');
   L.push('|---|---|---|');
   for (const c of tokens.colors.slice(0, 40)) L.push(`| \`${c.hex}\`${c.alpha < 1 ? ` (α${Math.round(c.alpha * 100)}%)` : ''} | ${c.rgb} | ${c.count} |`);
-  if (tokens.colors.length > 40) L.push(`| … | 其余 ${tokens.colors.length - 40} 个略 | |`);
+  if (tokens.colors.length > 40) L.push(`| … | 其余 ${tokens.colors.length - 40} 个略（按 \`region\` 分次取色板，或 \`lanhu_read_blocks\` 逐块看；本表按出现次数排序，前 40 已是主色） | |`);
   L.push('');
   L.push(`## 字号（${tokens.fontSizes.length} 种）`);
   L.push(tokens.fontSizes.map((f) => `${f.size}px×${f.count}`).join('  '));
@@ -5243,7 +5282,7 @@ export function renderSummary({ detail, layers, tokens, meta, maxTextLayers = 36
     }${translucent.length > 6 ? ' …' : ''}`);
     L.push('');
   }
-  L.push(`## 关键容器（${boxes.length} 个${boxes.length > maxBoxes ? `，只列前 ${maxBoxes}` : ''}）`);
+  L.push(`## 关键容器（${boxes.length} 个${boxes.length > maxBoxes ? `，只列前 ${maxBoxes} —— 其余按 \`region\` 分区取` : ''}）`);
   L.push('| 名称 | 位置(x,y) | 尺寸 | 圆角 | 填充 | 不透明 | 内边距(左/上/右/下) |');
   L.push('|---|---|---|---|---|---|---|');
   for (const b of boxes.slice(0, maxBoxes)) {
@@ -5258,13 +5297,13 @@ export function renderSummary({ detail, layers, tokens, meta, maxTextLayers = 36
     const bop = bopRaw < 1 ? String(bopRaw) : '—';
     L.push(`| ${bnm} | ${b.x},${b.y} | ${dualOn ? dualUnits(b.w, b.h, meta.width) : `${b.w}×${b.h}`} | ${b.radius ? `${b.radius.max}px` : '—'} | ${bfill} | ${bop} | ${bins} |`);
   }
-  if (boxes.length > maxBoxes) L.push(`| … | 其余 ${boxes.length - maxBoxes} 个容器略（用 --region 按区域精确取） | | | | |`);
+  if (boxes.length > maxBoxes) L.push(`| … | 其余 ${boxes.length - maxBoxes} 个容器略（按 \`region\` 分区精确取；CLI 同 \`--region\`） | | | | |`);
   L.push('');
 
   const texts = layers
     .filter((l) => l.text && l.visible)
     .sort((a, b) => (a.y - b.y) || (a.x - b.x));
-  L.push(`## 文本层（${texts.length} 个${texts.length > maxTextLayers ? `，只列前 ${maxTextLayers}` : ''}）`);
+  L.push(`## 文本层（${texts.length} 个${texts.length > maxTextLayers ? `，只列前 ${maxTextLayers} —— 其余按 \`region\` 分区取，或用 \`lanhu_read_blocks\` 的块表` : ''}）`);
   L.push('| 文本 | 位置(x,y) | 尺寸 | 字号/字重 | 字体 | 行高·字距 | 颜色 |');
   L.push('|---|---|---|---|---|---|---|');
   for (const t of texts.slice(0, maxTextLayers)) {
@@ -5273,7 +5312,7 @@ export function renderSummary({ detail, layers, tokens, meta, maxTextLayers = 36
     const fam = t.font?.family ? shortFamily(t.font.family) : '—';
     L.push(`| ${txt} | ${t.x},${t.y} | ${dualOn ? dualUnits(t.w, t.h, meta.width) : `${t.w}×${t.h}`} | ${t.font?.size ?? '?'}px/${t.font?.weight ?? '?'} | ${fam} | ${metricsText(t.font)} | ${c ? rgbHex(c) : '—'} |`);
   }
-  if (texts.length > maxTextLayers) L.push(`| … | 其余 ${texts.length - maxTextLayers} 个文本层略（用 format=full 取全量） | | | |`);
+  if (texts.length > maxTextLayers) L.push(`| … | 其余 ${texts.length - maxTextLayers} 个文本层略（按 \`region\` 分区精确取；要看全量文本层用 \`lanhu_read_blocks\` 的块表） | | | | |`);
 
   // 间距一览（§4.2）：容器与文本层**放在一起**算 —— 跨容器的关系（如「说明块底 ≡ 头像底」）才出得来；
   // 只算同容器内的兄弟块，恰恰漏掉实测里最难手算的那几个（还要跨容器比 y）。
@@ -6039,6 +6078,10 @@ export function renderGenCode(items, meta, opts = {}) {
 /**
  * 工具入口：给一张稿（或指定块）→ 可直接粘贴的 CSS / WXSS。
  * **只读**：只调既有的读稿接口（GET），从不写任何东西。
+ *
+ * `args.structured === true` 时才在返回值里带上 `codes[]`（机器可读的逐块属性行）；
+ * **默认不带** —— 它与 `text` 同源、80% 重复，而 `text` 才是要粘贴的那份。
+ * 注意 `text` 在任何情况下都**逐字节不变**（`structured` 只加键、不动文本）。
  */
 export async function genCode(args = {}) {
   const target = ['web', 'mini', 'both'].includes(args.target) ? args.target : 'both';
@@ -6081,6 +6124,17 @@ export async function genCode(args = {}) {
   const kindCounts = {};
   for (const b of shown) kindCounts[b.kind] = (kindCounts[b.kind] ?? 0) + 1;
 
+  // ⭐ **机器可读的逐块属性行（`codes`）默认不给**（`structured: true` 才给）。
+  //    为什么：它与 `text` 是**同一次生成**、80% 重复 —— 而 `text` 才是"要粘贴的那份"。
+  //    实测（稿 d11572f8「人才详情」）：text 23,925 字符 + codes 24,450 字符 —— 默认返回体
+  //    51,140 → 26,681 字符。⚠️ **量的是返回值**：宿主只把 `output.render`（就是 `text`）送给模型，
+  //    所以这里是省**返回值的体积**（宿主留档 / replay / 程序化消费），**不是**模型上下文。
+  //    两条硬约束：
+  //      · `text` **逐字节不变**（它是给人/AI 粘贴的出口）；`codes` 是**可选**出口，不是删掉 ——
+  //        程序化消费方（面板 / 将来的批处理）传 `structured: true` 照样拿得到。
+  //      · 这一项**不在人读文本里**（否则就破坏了上面那条）—— 所以"怎么要更多"写在工具描述与 docs 里。
+  const structured = args.structured === true;
+
   return {
     ok: true,
     format: 'code',
@@ -6096,15 +6150,19 @@ export async function genCode(args = {}) {
     noiseCount: blocks.filter((b) => b.noise).length,
     kindCounts,
     codeClassNames: items.map((it) => it.className),
-    codes: items.map((it) => ({
-      index: it.index,
-      name: it.name,
-      kind: it.kind,
-      className: it.className,
-      selector: `.${it.className}`,
-      web: it.web,
-      mini: it.mini,
-    })),
+    // **默认不给** —— 只有 `structured: true` 才带上（见上面的长注释）。
+    // 键在 `text` **之前**插入（键序与以前一致：`structured:true` 时这一大块与旧输出逐字节相同）。
+    ...(structured ? {
+      codes: items.map((it) => ({
+        index: it.index,
+        name: it.name,
+        kind: it.kind,
+        className: it.className,
+        selector: `.${it.className}`,
+        web: it.web,
+        mini: it.mini,
+      })),
+    } : {}),
     layerCount: layers.length,
     teamId,
     projectId: tgt?.projectId ?? null,
@@ -6233,6 +6291,7 @@ export async function readBlocks(args = {}) {
   }
   let text = renderBlocks(blocks, meta, {
     limit: args.limit, includeNoise: args.includeNoise, dualUnits: Boolean(args.dualUnits), contrast: contrastAudit,
+    maxReplies: args.commentMaxReplies,
     sourceNote: sourceFormat === 'sketchPlugin' ? SKETCH_SOURCE_NOTE : null,
     // 无评论 / 读取失败时 `commentNoteText` 给 null → 标题行**逐字节不变**
     commentNote: commentNoteText(commentsResult),
@@ -6656,8 +6715,13 @@ function diffRow(entry, dupLabels) {
  *
  * `reliable === false` 时**不出明细表** —— 那是本功能最重要的一条纪律：
  * 硬凑出来的"精确差异表"会被 AI 当成事实去改代码。
+ *
+ * `opts.maxRows` = **每类最多列几行**（默认 `LIMITS.diffMaxRowsPerCategory`；工具 `limit` / CLI `--limit`）。
+ * 截断时**必须**在那一行写明"传更大的 `limit` 看全" —— 见 LIMITS 上方的截断规矩。
  */
-export function renderDiff(d) {
+export function renderDiff(d, opts = {}) {
+  const maxRows = Number.isFinite(Number(opts.maxRows)) && Number(opts.maxRows) > 0
+    ? Math.floor(Number(opts.maxRows)) : LIMITS.diffMaxRowsPerCategory;
   const L = [];
   const f = d.from ?? {};
   const t = d.to ?? {};
@@ -6726,15 +6790,20 @@ export function renderDiff(d) {
   for (const cat of DIFF_CATEGORIES) {
     const rows = d.changes[cat] ?? [];
     if (rows.length === 0) continue;
-    const shown = rows.slice(0, LIMITS.diffMaxRowsPerCategory);
+    const shown = rows.slice(0, maxRows);
     L.push(`· ${DIFF_CATEGORY_LABEL[cat]}：`);
     for (const e of shown) L.push(`  - ${diffRow(e, dupLabels)}`);
-    if (rows.length > shown.length) L.push(`  - …还有 ${rows.length - shown.length} 处（同类，已截断）`);
+    if (rows.length > shown.length) L.push(`  - …还有 ${rows.length - shown.length} 处（同类，已截断；传更大的 \`limit\`（CLI 同 \`--limit\`）看全）`);
   }
   if (d.counts.added > 0 || d.counts.removed > 0) {
     L.push(`· ${d.counts.added > 0 ? `新增 ${d.counts.added} 块` : ''}${d.counts.added > 0 && d.counts.removed > 0 ? '；' : ''}${d.counts.removed > 0 ? `删除 ${d.counts.removed} 块` : ''}：`);
-    for (const e of (d.added ?? []).slice(0, LIMITS.diffMaxRowsPerCategory)) L.push(`  - ＋ ${e.where}（${diffKindLabel(e.kind)} ${diffVal(e.w)}×${diffVal(e.h)}）`);
-    for (const e of (d.removed ?? []).slice(0, LIMITS.diffMaxRowsPerCategory)) L.push(`  - － ${e.where}（${diffKindLabel(e.kind)} ${diffVal(e.w)}×${diffVal(e.h)}）`);
+    const added = d.added ?? [];
+    const removed = d.removed ?? [];
+    for (const e of added.slice(0, maxRows)) L.push(`  - ＋ ${e.where}（${diffKindLabel(e.kind)} ${diffVal(e.w)}×${diffVal(e.h)}）`);
+    for (const e of removed.slice(0, maxRows)) L.push(`  - － ${e.where}（${diffKindLabel(e.kind)} ${diffVal(e.w)}×${diffVal(e.h)}）`);
+    // ⚠️ 这两份原先**静默**截断（列到 maxRows 就停，一个字都不说）—— 按截断规矩必须明说 + 给出取更多的那条路。
+    const moreRows = Math.max(0, added.length - maxRows) + Math.max(0, removed.length - maxRows);
+    if (moreRows > 0) L.push(`· …还有 ${moreRows} 处新增/删除（已截断；传更大的 \`limit\`（CLI 同 \`--limit\`）看全）`);
   }
   L.push(`· 未变：其余 ${d.counts.unchanged} 块`);
   for (const n of d.notes ?? []) L.push(`注：${n}`);
@@ -6950,7 +7019,7 @@ export async function diffDesign(args = {}) {
     account: acct ?? null,
     accountBy: picked.by ?? null,
   };
-  d.text = renderDiff(d);
+  d.text = renderDiff(d, { maxRows: args.limit });
   d.textBytes = Buffer.byteLength(d.text, 'utf8');
   return d;
 }
@@ -7060,8 +7129,24 @@ function spreadRow(e) {
   };
 }
 
+/**
+ * 审计的「每类上限」—— 截断规矩（见 `LIMITS` 上方）的落点。
+ *
+ * `maxRows` 把**三个上限一起放宽到至少它**：每类最多列几条发现（默认 `auditMaxFindings`）、
+ * 一个组件最多列几种取值（默认 `auditMaxSpecValues`）、参与近重复比较的色值上限
+ * （默认 `auditMaxColors`，**硬上限 `auditMaxColorsHard`** —— 那一步是 O(n²) 的两两比较）。
+ * 不传 = 全部维持现值 → **默认输出逐字节不变**。
+ * @param {object} args 工具/CLI 参数
+ * @returns {number|null} 放宽后的上限；没传就是 null（各路用各自的默认值）
+ */
+function auditRowCap(args = {}) {
+  const n = Number(args.maxRows);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : null;
+}
+
 /** 取值分布 → 计数 + 多数派（**"建议以哪个为准"的判据就是它**：并列时明说无法判定，不硬挑一个）。 */
-function auditValueSpread(map) {
+function auditValueSpread(map, maxRows = null) {
+  const cap = Math.max(LIMITS.auditMaxSpecValues, maxRows ?? 0);
   const list = [...map.values()].sort((a, b) => b.count - a.count || a.value - b.value);
   const total = list.reduce((n, e) => n + e.count, 0);
   if (list.length === 0) return { distinct: 0, total: 0, values: [], truncatedValues: 0, majority: null, majorityCount: null, tie: false };
@@ -7070,8 +7155,8 @@ function auditValueSpread(map) {
   return {
     distinct: list.length,
     total,
-    values: list.slice(0, LIMITS.auditMaxSpecValues).map(spreadRow),
-    truncatedValues: Math.max(0, list.length - LIMITS.auditMaxSpecValues),
+    values: list.slice(0, cap).map(spreadRow),
+    truncatedValues: Math.max(0, list.length - cap),
     majority: tie ? null : top.value,
     majorityCount: tie ? null : top.count,
     tie,
@@ -7143,7 +7228,8 @@ const AUDIT_SPEC_DIMS = Object.freeze([
  * 只对**参与进来**（`collectAuditComponents` 的 `participated`）的组件名算；某维度只有 ≤1 个取值
  * 就不算发现（"只有一种" 不是漂移）。
  */
-export function auditComponentSpecs(components) {
+export function auditComponentSpecs(components, opts = {}) {
+  const maxRows = auditRowCap(opts);
   const findings = [];
   let converged = 0;
   for (const g of components ?? []) {
@@ -7160,7 +7246,7 @@ export function auditComponentSpecs(components) {
         e.images.set(b.imageId, b.imageName ?? null);
       }
       if (map.size < 2) continue;
-      dims.push({ dim: d.key, label: d.label, ...auditValueSpread(map) });
+      dims.push({ dim: d.key, label: d.label, ...auditValueSpread(map, maxRows) });
     }
     if (dims.length === 0) { converged += 1; continue; }
     findings.push({ name: g.name, blocks: g.blocks.length, images: g.images.size, kinds: [...g.kinds].sort(), dims });
@@ -7174,7 +7260,8 @@ export function auditComponentSpecs(components) {
  * ② 字号阶梯 —— 只看块里的 `font.size`（**不看层名**，所以命名不可靠时它仍然可用）。
  * 报两件事：整条阶梯，以及"只出现一次"的野值（它们是最该收敛掉的）。
  */
-export function auditFontScale(scans) {
+export function auditFontScale(scans, opts = {}) {
+  const maxRows = auditRowCap(opts);
   const map = new Map();
   for (const s of scans ?? []) {
     for (const b of s.blocks ?? []) {
@@ -7189,7 +7276,7 @@ export function auditFontScale(scans) {
     }
   }
   const asc = [...map.values()].sort((a, b) => a.value - b.value);
-  const spread = auditValueSpread(map);
+  const spread = auditValueSpread(map, maxRows);
   const ladder = asc.filter((e) => e.count >= LIMITS.auditLadderMinCount).map((e) => e.value);
   const oneOffs = asc.filter((e) => e.count <= LIMITS.auditOneOffMaxCount).map((e) => ({
     value: e.value,
@@ -7295,7 +7382,8 @@ export function nearColorClusters(entries, threshold = LIMITS.auditNearColorDist
 }
 
 /** ④ 间距尺度 —— 拿 `geometricGaps` 收集**所有**几何间距，看有没有跑出 4px 栅格的野值。 */
-export function auditSpacing(scans) {
+export function auditSpacing(scans, opts = {}) {
+  const cap = Math.max(LIMITS.auditMaxSpecValues, auditRowCap(opts) ?? 0);
   const map = new Map();
   let skippedImages = 0;
   for (const s of scans ?? []) {
@@ -7323,8 +7411,8 @@ export function auditSpacing(scans) {
     total: all.reduce((n, e) => n + e.count, 0),
     grid: LIMITS.auditSpacingGrid,
     maxDistance: LIMITS.auditSpacingMaxDistance,
-    top: all.slice(0, LIMITS.auditMaxSpecValues).map(spreadRow),
-    offGrid: offGrid.slice(0, LIMITS.auditMaxSpecValues).map(spreadRow),
+    top: all.slice(0, cap).map(spreadRow),
+    offGrid: offGrid.slice(0, cap).map(spreadRow),
     offGridCount: offGrid.length,
     skippedImages,
     drift: offGrid.length >= LIMITS.auditOffGridMinValues,
@@ -7332,7 +7420,8 @@ export function auditSpacing(scans) {
 }
 
 /** ⑤ 圆角家族（**参考项**）—— 值分布 + 不在常见刻度上的特例。 */
-export function auditRadiusFamily(scans) {
+export function auditRadiusFamily(scans, opts = {}) {
+  const cap = Math.max(LIMITS.auditMaxSpecValues, auditRowCap(opts) ?? 0);
   const map = new Map();
   for (const s of scans ?? []) {
     for (const b of s.blocks ?? []) {
@@ -7353,8 +7442,8 @@ export function auditRadiusFamily(scans) {
     distinct: all.length,
     total: all.reduce((n, e) => n + e.count, 0),
     scale: [...LIMITS.auditRadiusScale],
-    top: all.slice(0, LIMITS.auditMaxSpecValues).map(spreadRow),
-    offScale: offScale.slice(0, LIMITS.auditMaxSpecValues).map(spreadRow),
+    top: all.slice(0, cap).map(spreadRow),
+    offScale: offScale.slice(0, cap).map(spreadRow),
     offScaleCount: offScale.length,
     drift: offScale.length >= LIMITS.auditOffScaleMinValues,
   };
@@ -7520,16 +7609,22 @@ export async function auditProject(args = {}) {
   const suppressed = reliable ? [] : (allowWeak ? [...AUDIT_NAME_DEPENDENT] : [...AUDIT_CATEGORIES]);
   const show = (cat) => !suppressed.includes(cat);
   const suppressedPayload = () => ({ suppressed: true, drift: false, reason: reliability.reasons.join(' ') });
+  // 截断规矩（见 `LIMITS` 上方）：`maxRows` 把审计的**每类上限**一起放宽到至少它；
+  // **不传 = 全部维持现值** → 默认输出逐字节不变。
+  const maxRows = auditRowCap(args);
+  const findingCap = Math.max(LIMITS.auditMaxFindings, maxRows ?? 0);
 
   const { findings: specFindings, converged } = show('componentSpec')
-    ? auditComponentSpecs(comp.participated) : { findings: [], converged: null };
-  const font = show('fontScale') ? auditFontScale(scans) : null;
+    ? auditComponentSpecs(comp.participated, { maxRows }) : { findings: [], converged: null };
+  const font = show('fontScale') ? auditFontScale(scans, { maxRows }) : null;
   const colorMap = show('colorDrift') ? collectAuditColors(scans) : new Map();
   const colorEntries = [...colorMap.values()].sort((a, b) => b.count - a.count);
-  const colorKept = colorEntries.slice(0, LIMITS.auditMaxColors);
+  // 色值比较上限：`maxRows` 一起放宽，但**不越过硬上限**（这一步是 O(n²) 两两比较）
+  const colorCap = Math.min(Math.max(LIMITS.auditMaxColors, maxRows ?? 0), LIMITS.auditMaxColorsHard);
+  const colorKept = colorEntries.slice(0, colorCap);
   const clusters = show('colorDrift') ? nearColorClusters(colorKept) : [];
-  const spacing = show('spacingScale') ? auditSpacing(scans) : null;
-  const radius = show('radiusFamily') ? auditRadiusFamily(scans) : null;
+  const spacing = show('spacingScale') ? auditSpacing(scans, { maxRows }) : null;
+  const radius = show('radiusFamily') ? auditRadiusFamily(scans, { maxRows }) : null;
 
   const findings = {
     componentSpec: show('componentSpec') ? {
@@ -7538,9 +7633,9 @@ export async function auditProject(args = {}) {
       // **判据写进结果**：读者不必猜"你说的同一个组件是什么意思"
       basis: '层名归一化后相同（NFKC + 折叠空白 + 转小写）',
       basisExcludes: '工具默认名（Rectangle 12 / 矩形 3 / Path 3×8）、空名、归一化后 < 2 字的层名',
-      findings: specFindings.slice(0, LIMITS.auditMaxFindings),
+      findings: specFindings.slice(0, findingCap),
       findingCount: specFindings.length,
-      truncatedFindings: Math.max(0, specFindings.length - LIMITS.auditMaxFindings),
+      truncatedFindings: Math.max(0, specFindings.length - findingCap),
       converged,
       participatedNames: comp.participated.length,
       participatedBlocks: comp.participatedBlocks,
@@ -7557,7 +7652,7 @@ export async function auditProject(args = {}) {
       distinct: colorEntries.length,
       compared: colorKept.length,
       truncatedColors: Math.max(0, colorEntries.length - colorKept.length),
-      clusters: clusters.slice(0, LIMITS.auditMaxFindings),
+      clusters: clusters.slice(0, findingCap),
       clusterCount: clusters.length,
     } : suppressedPayload(),
     spacingScale: spacing ? { suppressed: false, ...spacing } : suppressedPayload(),
@@ -7678,7 +7773,7 @@ export function auditSectionLines(a, cat) {
   if (cat === 'componentSpec') {
     for (const e of f.findings ?? []) {
       for (const d of e.dims) {
-        L.push(`· **${e.name}** ${d.label}：${spreadText(d.values)}${d.truncatedValues > 0 ? ` · …还有 ${d.truncatedValues} 种` : ''}`);
+        L.push(`· **${e.name}** ${d.label}：${spreadText(d.values)}${d.truncatedValues > 0 ? ` · …还有 ${d.truncatedValues} 种（传更大的 \`maxRows\` 看全；CLI 同 \`--max-rows\`）` : ''}`);
         L.push(d.tie
           ? `  → 各取值出现次数并列，**无法判定多数派** —— 需人工确认（共 ${d.total} 块）`
           : `  → 建议以 **${d.majority}px** 为准（多数派 ${d.majorityCount}/${d.total} 块）`);
@@ -7688,7 +7783,7 @@ export function auditSectionLines(a, cat) {
       }
     }
     if ((f.findings ?? []).length === 0) L.push(`· **未发现漂移**：${f.participatedNames ?? 0} 个参与组件名的圆角与高度各自收敛。`);
-    if (f.truncatedFindings > 0) L.push(`· …还有 ${f.truncatedFindings} 条同类发现（已达每条上限，只给计数）`);
+    if (f.truncatedFindings > 0) L.push(`· …还有 ${f.truncatedFindings} 条同类发现（已达每条上限，只给计数；传更大的 \`maxRows\` 看全，CLI 同 \`--max-rows\`）`);
     L.push(`· 参与：${f.participatedNames ?? 0} 个组件名 / ${f.participatedBlocks ?? 0} 块；`
       + `未参与：工具默认名 ${f.notParticipating?.autoName ?? 0} 块 · 空名 ${f.notParticipating?.emptyName ?? 0} 块 · 单张稿或样本太少 ${f.notParticipating?.thin ?? 0} 块`);
     return L;
@@ -7700,7 +7795,7 @@ export function auditSectionLines(a, cat) {
       L.push(`· 阶梯：${spreadTextPlain(f.sizes, 'px')}`);
       return L;
     }
-    L.push(`· 全项目 **${f.distinct}** 种字号（共 ${f.total} 处）：${spreadTextPlain(f.sizes, 'px')}${f.truncatedValues > 0 ? ` · …还有 ${f.truncatedValues} 种` : ''}`);
+    L.push(`· 全项目 **${f.distinct}** 种字号（共 ${f.total} 处）：${spreadTextPlain(f.sizes, 'px')}${f.truncatedValues > 0 ? ` · …还有 ${f.truncatedValues} 种（传更大的 \`maxRows\` 看全；CLI 同 \`--max-rows\`）` : ''}`);
     if (f.oneOffCount > 0) {
       L.push(`· 只出现 ${LIMITS.auditOneOffMaxCount} 次的 **${f.oneOffCount}** 种：${f.oneOffs.map((o) => o.value).join(' / ')}`);
       const sug = f.oneOffs.filter((o) => o.nearest !== null);
@@ -7730,8 +7825,8 @@ export function auditSectionLines(a, cat) {
       const minor = c.members.filter((m) => m.key !== c.majority).slice(0, LIMITS.auditMaxExamples);
       for (const m of minor) L.push(`  · 例：${m.key} → ${(m.examples ?? []).join('、')}`);
     }
-    if (f.clusterCount > f.clusters.length) L.push(`· …还有 ${f.clusterCount - f.clusters.length} 簇（已达上限，只给计数）`);
-    L.push(`· 色板：${f.distinct} 个色值${f.truncatedColors > 0 ? `（只比了出现最多的 ${f.compared} 个）` : ''}`);
+    if (f.clusterCount > f.clusters.length) L.push(`· …还有 ${f.clusterCount - f.clusters.length} 簇（已达上限，只给计数；传更大的 \`maxRows\` 看全，CLI 同 \`--max-rows\`）`);
+    L.push(`· 色板：${f.distinct} 个色值${f.truncatedColors > 0 ? `（只比了出现最多的 ${f.compared} 个 —— 传更大的 \`maxRows\` 可比更多，硬上限 ${LIMITS.auditMaxColorsHard}）` : ''}`);
     return L;
   }
   if (cat === 'spacingScale') {
@@ -9337,7 +9432,7 @@ export function renderBlockReport(result) {
   for (const r of bad.slice(0, 60)) {
     L.push(`| ${r.blockName ?? ''} | ${r.kind ?? ''} | ${r.field} | ${r.expected} | ${r.actual} | ${r.suggestion ?? ''} |`);
   }
-  if (bad.length > 60) L.push(`| … | | | | | 其余 ${bad.length - 60} 项略 |`);
+  if (bad.length > 60) L.push(`| … | | | | | 其余 ${bad.length - 60} 项略（按 \`kind\` 只比某几类块，分开几次就能全列） |`);
   L.push('');
 
   if (unmapped.length > 0) {
@@ -9347,7 +9442,7 @@ export function renderBlockReport(result) {
     for (const r of unmapped.slice(0, 30)) {
       L.push(`| ${blockLabel(r.block)} | ${r.block.kind} | ${Math.round(r.block.w)}×${Math.round(r.block.h)} | 页面上找不到对应元素 |`);
     }
-    if (unmapped.length > 30) L.push(`| … | | | 其余 ${unmapped.length - 30} 块略 |`);
+    if (unmapped.length > 30) L.push(`| … | | | 其余 ${unmapped.length - 30} 块略（按 \`kind\` 只比某几类块，分开几次就能全列） |`);
     L.push('');
   }
 
@@ -9746,6 +9841,7 @@ async function cmdBlocks({ args, cookie }) {
     //    为的是"既有 CLI 输出逐字节不变"（这个仓库的命令输出有黄金输出兜着）。
     //    要评论就显式 `--comments`。
     comments: Boolean(args.comments),
+    commentMaxReplies: args['comment-max-replies'] === undefined ? undefined : Number(args['comment-max-replies']),
   });
   if (args.json) printJson(r);
   else {
@@ -9763,6 +9859,7 @@ async function cmdDiff({ args, cookie }) {
   const r = await diffDesign({
     projectId: args.project, imageId: args.image, url: args.url,
     from: args.from, to: args.to,
+    limit: args.limit === undefined ? undefined : Number(args.limit),
     includeNoise: Boolean(args.all),
     cookie, account: args.account,
   });
@@ -9782,6 +9879,7 @@ async function cmdAudit({ args, cookie }) {
   const r = await auditProject({
     projectId: args.project, url: args.url,
     limit: args.limit === undefined ? undefined : Number(args.limit),
+    maxRows: args['max-rows'] === undefined ? undefined : Number(args['max-rows']),
     includeNoise: Boolean(args.all),
     allowWeakNaming: Boolean(args['allow-weak-naming']),
     cookie, account: args.account,
@@ -9846,6 +9944,7 @@ async function cmdProductDoc({ args, cookie }) {
     pageId: args['page-id'] ?? args.page, pageName: args['page-name'],
     version: args.version,
     limit: args.limit === undefined ? 1 : Number(args.limit),
+    pageTreeLimit: args['page-tree-limit'] === undefined ? undefined : Number(args['page-tree-limit']),
     format: args.format,
     layerLimit: args['layer-limit'] === undefined ? undefined : Number(args['layer-limit']),
     includeNoise: Boolean(args.all),
@@ -10063,16 +10162,18 @@ const USAGE = `dsh-lanhu —— 蓝湖设计稿读取
            把设计稿坐标映射到目标坐标系（如本地 SVG 的 viewBox），输出多两列「映射 x,y / 映射 w×h」
            （x/y 各自独立缩放，**非等比** —— 长宽比不同的两个坐标系也能对上）
   blocks   [--url "<蓝湖链接>" | --project <id> --image <id>] [--region y0,y1] [--kind card,pill] [--min-width N] [--all]
+           [--comments] [--comment-max-replies N]
            块级清单：卡片/胶囊/文本/图片/分割线，每块六项属性（圆角·大小·文字色·字号·底色·边框）
            --comments 额外读这张稿的**评论 / 标注**（人类留的需求，如「要个png的图片」，独立接口），
            末尾多一段「评论」并把每条**映射回它落在哪个块**（归一化坐标 × 画板尺寸后匹配，命中不了就明说）。
            ⚠️ CLI **默认不读**（不给 --comments 就不多发那次请求）；工具 lanhu_read_blocks 默认**读**。
-  diff     [--url "<蓝湖链接>" | --project <id> --image <id>] --from <版本id> [--to <版本id>] [--all]
+  diff     [--url "<蓝湖链接>" | --project <id> --image <id>] --from <版本id> [--to <版本id>] [--all] [--limit N]
            **同一张稿的两个版本**对比（--to 省略 = 最新版 latest）：尺寸/圆角·颜色·布局·文字·边框·结构·新增·删除，
            每类只列**有变化的**、数值给「从→到」；零变化只给一句汇总，两版无差异时**明说"两版一致"**。
            --from 给不存在的版本 id 会**报错**（不静默回退 latest）。输出里报**匹配可靠度**
            （精确/近似/无法匹配）；两版大面积对不上时**明说"逐块对比不可靠"**、不出明细表。
-   audit    [--url "<蓝湖链接>" | --project <id>] [--limit N] [--all] [--allow-weak-naming]
+           --limit = **每类最多列几行**（默认 40）；被截断时那一行会写明用更大的 --limit 看全。
+   audit    [--url "<蓝湖链接>" | --project <id>] [--limit N] [--max-rows N] [--all] [--allow-weak-naming]
             **跨稿一致性审计**（蓝湖不提供）：扫一个项目的多张稿，报「设计系统漂移」——
             ① 同一组件多种规格（圆角/高度分布 + 建议以哪个为准）② 字号阶梯（含只出现 1 次的野值）
             ③ 近重复色（RGB 距离阈值）④ 间距尺度 ⑤ 圆角家族。
@@ -10080,10 +10181,11 @@ const USAGE = `dsh-lanhu —— 蓝湖设计稿读取
             ⚠️ 成本：**扫 N 张 = 2N 次请求** → 默认只扫限额张数，--limit 可加但**不超过硬上限**；
             输出里写明 scanned / total / 是否被截断。命名不可靠时**判不可靠、不出明细**
             （--allow-weak-naming 只放开不看层名的那几项）。
+            --max-rows = 把「其余 N 种/N 条」的**每类上限**一起放宽（默认 12 / 8 / 色值 600）。
   product-docs --url "<原型链接>" | --project <pid> --team <tid>
            列**产品文档（Axure 原型 / PRD）**——不是设计稿。含 docId / 最新版本 / 版本数 / 更新时间
   product-doc  --url "<原型链接>" [--page-id <id>] [--page-name <名>] [--limit N] [--version <id>]
-               [--format layers] [--layer-limit N] [--all]   # layers = 该页的样式图层/块级清单
+               [--format layers] [--layer-limit N] [--page-tree-limit N] [--all]   # layers = 该页的样式图层/块级清单
                                                             #   —— 项目只有原型、没有设计稿时靠它照着实现
            读原型的页面树 + 命中页正文（**先不带 --page-id 看树**，一份原型常有上百个节点）
            --page-id 跨版本稳定，推荐；正文取自页面 HTML（data.js 里常为空）

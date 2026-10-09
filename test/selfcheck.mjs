@@ -96,6 +96,8 @@ const {
   listAccounts,
   removeAccount,
   setDefaultAccount,
+  // —— ⑰ 列表分页（B）：核心函数**必须能取全量**（工具层的分页不许把它带走）——
+  listImages,
   whoIsIt,
   resolveCookie,
   loadAccounts,
@@ -168,7 +170,7 @@ const {
   mapCommentsToBlocks,
   unixToIso,
 } = await import('../lanhu.mjs');
-const { TOOLS, validateJsonSchemaValue, ToolArgsError, toLossless, apply: applyHostPlugin } = await import('../lib/index.js');
+const { TOOLS, validateJsonSchemaValue, ToolArgsError, toLossless, apply: applyHostPlugin, makeLanhuHandler } = await import('../lib/index.js');
 
 const results = [];
 let currentGroup = '';
@@ -6131,6 +6133,376 @@ group('⑯ 生成代码（lanhu_gen_code，§4.10）');
       err ? `抛错：${err.message}` : `ok=${r && r.ok} blockCount=${r && r.blockCount}/${A.items.length}`);
     ok('L3 端到端带版本与账号透明度', Boolean(r) && 'version' in r && 'account' in r, r ? Object.keys(r).join(',') : '');
   }
+}
+
+/* ═══════════════ ⑰ 本轮修复：生成代码出口 / 列表分页 / 截断口径 ═══════════════
+ *
+ * 三件事各配**正反例**：
+ *   A1 · `lanhu_gen_code` 的 `codes` 按需（默认不给，`structured:true` 才给）+ `text` 逐字节不变
+ *   A2 · 截断提示的口径：源码级扫描（① 不许指向 `format=full` ② 每条都要点名一个真取数参数）
+ *   B  · `list_designs` / `lanhu_search` 分页：默认生效 / 硬上限压回 / 游标不重不漏 /
+ *        ★ 内部调用方（核心函数 / `/lanhu/designs` / `/lanhu/versions-count`）拿到的**是全量**
+ */
+const ROOT_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+
+/** 一次性把 globalThis.fetch 换成桩，跑完必还原（自检不许污染进程）。 */
+async function withStubFetch(handler, fn) {
+  const real = globalThis.fetch;
+  globalThis.fetch = handler;
+  try { return await fn(); } finally { globalThis.fetch = real; }
+}
+
+/** 桩 fetch 的响应形态 —— 与既有几处保持一致（apiRequest 读 arrayBuffer）。 */
+function stubResponse(payload, status = 200) {
+  const buf = Buffer.from(JSON.stringify(payload), 'utf8');
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: { get: () => 'application/json' },
+    arrayBuffer: async () => buf.buffer.slice(buf.byteOffset, buf.byteOffset + buf.byteLength),
+  };
+}
+
+group('⑰ A1：gen_code 出口（codes 按需，text 不变）');
+{
+  const C = (r, g, b, a = 1) => ({ r: r / 255, g: g / 255, b: b / 255, a });
+  const A1_TREE = {
+    artboard: {
+      name: '出口夹具',
+      frame: { left: 0, top: 0, width: 375, height: 800 },
+      layers: [
+        { name: '主按钮', type: 'frame', frame: { left: 32, top: 100, width: 311, height: 42 },
+          style: { fills: [{ type: 'color', isEnabled: true, color: C(87, 74, 244) }], borders: [], shadows: [], blurs: [] },
+          paths: [{ type: 'rect', radius: { topLeft: 8, topRight: 8, bottomRight: 8, bottomLeft: 8 } }], layers: [] },
+        { name: '标题', type: 'textLayer', frame: { left: 32, top: 160, width: 200, height: 24 },
+          style: { fills: [], borders: [], shadows: [], blurs: [] }, paths: [], layers: [],
+          text: { value: '标题', style: { content: '标题', font: { name: 'Inter', size: 16, fontWeight: 600, align: 'left' }, color: C(17, 17, 17) } } },
+      ],
+    },
+  };
+  const stub = async (url) => {
+    const u = String(url);
+    return stubResponse(u.includes('mock.example')
+      ? { artboard: A1_TREE.artboard, assets: [], meta: {} }
+      : { code: 0, data: { id: 'iid', name: '出口夹具', width: 375, height: 800, versions: [{ id: 'v1', json_url: 'https://mock.example/t.json' }] } });
+  };
+  const gen = TOOLS.find((t) => t.name === 'lanhu_gen_code');
+  const A1_ARGS = { projectId: '00000002-0000-4000-8000-000000000002', imageId: '00000003-0000-4000-8000-000000000003', target: 'web' };
+  const envCookie = process.env.LANHU_COOKIE;
+  process.env.LANHU_COOKIE = 'PASSPORT=x; user_token=y';
+  let plain = null; let struct = null;
+  try {
+    plain = await withStubFetch(stub, () => gen.execute({ ...A1_ARGS }));
+    struct = await withStubFetch(stub, () => gen.execute({ ...A1_ARGS, structured: true }));
+  } finally {
+    if (envCookie === undefined) delete process.env.LANHU_COOKIE; else process.env.LANHU_COOKIE = envCookie;
+  }
+  ok('A1-0 桩链路真的跑通了（不是拿失败对象在比）',
+    plain?.ok === true && struct?.ok === true, JSON.stringify(plain)?.slice(0, 160));
+  ok('A1-1 ★ 默认（不传 structured）返回体里**没有** `codes` 键', !('codes' in plain), Object.keys(plain ?? {}).join(','));
+  ok('A1-2 `structured:true` 才带 `codes`（不是被删掉）',
+    Array.isArray(struct?.codes) && struct.codes.length === plain?.blockCount, `codes=${struct?.codes?.length} / blockCount=${plain?.blockCount}`);
+  ok('A1-3 `codes` 每项字段齐（程序化消费要的那几个）',
+    (struct?.codes ?? []).every((c) => 'index' in c && 'className' in c && 'selector' in c && 'web' in c && 'mini' in c),
+    JSON.stringify(struct?.codes?.[0] ?? null));
+  ok('A1-4 ★★ 两种取法下 `text` **逐字节相同**（structured 不动人读出口）',
+    typeof plain?.text === 'string' && plain.text === struct?.text, `长度 ${plain?.text?.length} vs ${struct?.text?.length}`);
+  ok('A1-5 `text` 仍是一整段可粘贴的 CSS（没被 codes 顶掉）', /^\.\S+ \{/m.test(plain?.text ?? ''));
+  const plainChars = JSON.stringify(plain).length;
+  const structChars = JSON.stringify(struct).length;
+  ok('A1-6 默认返回体明显更小（codes 基本是重复内容）',
+    structChars - plainChars > 100, `默认 ${plainChars} / structured ${structChars}（多 ${structChars - plainChars} 字符）`);
+  ok('A1-7 schema 里写明 structured 默认 false（模型读得到）',
+    /默认 false/.test(gen.parameters.properties.structured?.description ?? ''), gen.parameters.properties.structured?.description);
+  ok('A1-8 output.schema 里**仍声明** codes（只是默认不给，不是把这个能力删掉）',
+    'codes' in (gen.output.schema.properties ?? {}), Object.keys(gen.output.schema.properties ?? {}).join(','));
+}
+
+group('⑰ A2：截断提示的口径（源码级扫描）');
+{
+  /* 规矩：**凡是要截断，人读输出里就必须写清"用哪个参数取更多"，且那个参数是真的取数通道**；
+     不许指向 `format=full`（它是落盘留档，不是取数通道 —— 与 SYSTEM_HINT 同一口径）。
+
+     做法：把源码里的**字符串字面量**抽出来（注释里的话不算输出），
+     筛出"省略/截断"那几类，再逐条查 ① 有没有 `format=full` ② 有没有点名取数参数。 */
+  // ⚠️ `略` 要排除 缩略 / 忽略 / 省略（那三处不是截断提示）—— 不加负向环视会误报一堆。
+  const TRUNC_RE = /(?<![忽略缩省])略|已截断|只列前|只给计数|只比了|…还有/;
+  // 真取数通道：`region` / `limit` / `offset` / `maxRows` / `pageTreeLimit` / `commentMaxReplies` /
+  // 过滤类（`kind` / `minWidth` / `gapMaxDistance`）
+  const CHANNEL_RE = /region|limit|offset|maxRows|max-rows|pageTreeLimit|page-tree-limit|commentMaxReplies|comment-max-replies|gapMaxDistance|minWidth|kind/;
+  const FORBIDDEN_RE = /format\s*[=:]\s*['"`]?full/;
+
+  /**
+   * 取一条字面量里**人真正读到的那些字**：
+   *   · `${…}` 里的**表达式**不算（变量名叫 `limit` 不等于话里点了 `limit`）；
+   *   · 但 `${…}` 里**嵌的字符串/模板**要算（截断提示常写成 `cond ? \`…用 limit 取\` : ''`，
+   *     整段丢掉就会把"点了参数"当成"没点"—— 实测踩过）。
+   */
+  const visibleText = (s) => {
+    const collectInterp = (i) => {            // i 指向 `{` 之后；返回拼进来的字符串内容 + 结束位置
+      let text = ''; let depth = 1;
+      while (i < s.length && depth > 0) {
+        const c = s[i];
+        if (c === '\\') { i += 2; continue; }
+        if (c === "'" || c === '"' || c === '`') { const r = collectQuote(i); text += ` ${r.text}`; i = r.next; continue; }
+        if (c === '{') depth += 1;
+        else if (c === '}') { depth -= 1; if (depth === 0) return { text, next: i + 1 }; }
+        i += 1;
+      }
+      return { text, next: i };
+    };
+    const collectQuote = (i) => {             // i 指向开引号；返回内容（不含引号）与结束位置
+      const q = s[i]; let text = ''; i += 1;
+      while (i < s.length) {
+        const c = s[i];
+        if (c === '\\') { text += s[i + 1] ?? ''; i += 2; continue; }
+        if (q === '`' && c === '$' && s[i + 1] === '{') { const r = collectInterp(i + 2); text += ` ${r.text}`; i = r.next; continue; }
+        if (c === q) return { text, next: i + 1 };
+        if (c === '\n' && q !== '`') return { text, next: i };
+        text += c; i += 1;
+      }
+      return { text, next: i };
+    };
+    let out = ''; let i = 0;
+    while (i < s.length) {
+      if (s[i] === '$' && s[i + 1] === '{') { const r = collectInterp(i + 2); out += ` ${r.text}`; i = r.next; continue; }
+      out += s[i]; i += 1;
+    }
+    return out;
+  };
+
+  /** 判一条截断提示合不合规矩（纯函数 —— 下面拿它做**扫描器自证**）。 */
+  const judgeTruncHint = (literalText) => {
+    const text = visibleText(String(literalText));
+    return {
+      text,
+      forbidden: FORBIDDEN_RE.test(text),
+      channel: (text.match(CHANNEL_RE) ?? [null])[0],
+    };
+  };
+
+  const literalsOf = (src) => {
+    // 单遍扫描：**注释整段跳过**（注释里的引号/反引号会把配对带偏 —— 实测踩过），
+    // 模板串里的 `${…}` 按**代码**继续扫（里面可以再嵌模板串，如 `a${f(`b${c}`)}` —— 不处理会把字面量切碎）。
+    const out = [];
+    const n = src.length;
+    const st = { line: 1 };
+    const readInterp = (i) => {          // 从 `{` 之后开始，返回匹配 `}` 之后的位置
+      let depth = 1;
+      while (i < n) {
+        const c = src[i];
+        if (c === '\\') { i += 2; continue; }
+        if (c === '\n') { st.line += 1; i += 1; continue; }
+        if (c === '/' && src[i + 1] === '/') { while (i < n && src[i] !== '\n') i += 1; continue; }
+        if (c === "'" || c === '"' || c === '`') { i = readQuoted(i); continue; }
+        if (c === '{') depth += 1;
+        else if (c === '}') { depth -= 1; if (depth === 0) return i + 1; }
+        i += 1;
+      }
+      return i;
+    };
+    const readQuoted = (i) => {          // 从引号本身开始，返回闭合引号之后的位置
+      const quote = src[i];
+      i += 1;
+      while (i < n) {
+        const c = src[i];
+        if (c === '\\') { if (src[i + 1] === '\n') st.line += 1; i += 2; continue; }
+        if (c === '\n') { if (quote !== '`') return i; st.line += 1; i += 1; continue; }
+        if (quote === '`' && c === '$' && src[i + 1] === '{') { i = readInterp(i + 2); continue; }
+        if (c === quote) return i + 1;
+        i += 1;
+      }
+      return i;
+    };
+    let i = 0;
+    while (i < n) {
+      const ch = src[i];
+      if (ch === '\n') { st.line += 1; i += 1; continue; }
+      if (ch === '/' && src[i + 1] === '/') { while (i < n && src[i] !== '\n') i += 1; continue; }
+      if (ch === '/' && src[i + 1] === '*') {
+        i += 2;
+        while (i < n && !(src[i] === '*' && src[i + 1] === '/')) { if (src[i] === '\n') st.line += 1; i += 1; }
+        i += 2;
+        continue;
+      }
+      if (ch === "'" || ch === '"' || ch === '`') {
+        const start = i; const startLine = st.line;
+        i = readQuoted(i);
+        out.push({ line: startLine, raw: src.slice(start, i) });
+        continue;
+      }
+      i += 1;
+    }
+    return out;
+  };
+
+  const hits = [];
+  for (const f of ['lanhu.mjs', 'lib/index.js']) {
+    const src = fs.readFileSync(path.join(ROOT_DIR, f), 'utf8');
+    for (const lit of literalsOf(src)) {
+      if (!TRUNC_RE.test(lit.raw)) continue;
+      hits.push({ f, line: lit.line, ...judgeTruncHint(lit.raw) });
+    }
+  }
+  ok('A2-0 扫描确实命中了"截断/省略"提示（不是空跑）', hits.length >= 14, `命中 ${hits.length} 条`);
+  // ① 不许把 `format=full` 当取数建议
+  const bad = hits.filter((h) => h.forbidden);
+  ok('A2-1 ★ 没有任何一条截断提示指向 `format=full`（源码级扫）',
+    bad.length === 0, bad.map((h) => `${h.f}:${h.line} ${h.text.trim()}`).join(' ｜ '));
+  // ② 每条都要点名一个取数参数
+  const noChannel = hits.filter((h) => !h.channel);
+  ok('A2-2 ★ 每条截断提示都点名了一个取数参数',
+    noChannel.length === 0, noChannel.map((h) => `${h.f}:${h.line} ${h.text.trim()}`).join(' ｜ '));
+  // 扫描器的**自证**：喂一条老写法的假提示，必须判红（否则上面两条可能是"瞎绿"）
+  const fakeBad = judgeTruncHint('| … | 其余 3 个文本层略（用 format=full 取全量） |');
+  ok('A2-3 扫描器自证：假提示（指向 format=full 且没点参数）会被判红',
+    fakeBad.forbidden === true && fakeBad.channel === null, JSON.stringify(fakeBad));
+  const fakeGood = judgeTruncHint('| … | 其余 3 个文本层略（按 `region` 分区精确取） |');
+  ok('A2-4 扫描器自证：合规提示（点名 region）不会被误判',
+    fakeGood.forbidden === false && fakeGood.channel === 'region', JSON.stringify(fakeGood));
+  // 定点回归：**本次修的那一处** —— summary 的文本层截断
+  const summaryTextHint = hits.find((h) => /个文本层略/.test(h.text));
+  ok('A2-5 定点：summary「文本层」截断行已改成指 `region`（不再是 format=full）',
+    Boolean(summaryTextHint) && /region/.test(summaryTextHint.text) && !summaryTextHint.forbidden,
+    summaryTextHint ? summaryTextHint.text.trim() : '（没扫到这一行 —— 断言失效）');
+  // SYSTEM_HINT 那两处口径也在（"full 是落盘留档，不是取数通道"）
+  const hostSrc = fs.readFileSync(path.join(ROOT_DIR, 'lib', 'index.js'), 'utf8');
+  ok('A2-6 SYSTEM_HINT 的取数口径没被改坏（region 是真通道 / full 是落盘留档）',
+    /full 是\*\*落盘留档\*\*用的，不是取数通道/.test(hostSrc)
+    && /别拿 `format=full` 的 JSON 自己写脚本解析/.test(fs.readFileSync(path.join(ROOT_DIR, 'lanhu.mjs'), 'utf8')));
+}
+
+group('⑰ B：列表分页（list_designs / search）');
+{
+  const PID_X = '00000002-0000-4000-8000-0000000000aa';
+  const TID_X = '00000001-0000-4000-8000-0000000000bb';
+  const N_ALL = 600;
+  const mkImages = (n) => Array.from({ length: n }, (_, i) => ({
+    id: 'img-' + String(i).padStart(3, '0'), name: '稿' + (i + 1),
+    width: 375, height: 800, group: [{ name: i % 2 ? '甲' : '乙' }], update_time: '2026-01-01',
+  }));
+  const ALL = mkImages(N_ALL);
+  /** list_images 的桩（每次调用都记下 URL，便于断言"核心函数没有被分页参数影响"）。 */
+  const imgsStub = (seen) => async (url) => {
+    const u = String(url);
+    seen.push(u);
+    return stubResponse({ code: 0, data: { name: '大项目', images: ALL } });
+  };
+  const ld = TOOLS.find((t) => t.name === 'lanhu_list_designs');
+
+  const ids = (r) => (r.images ?? []).map((i) => i.imageId);
+
+  const seen1 = [];
+  const p1 = await withStubFetch(imgsStub(seen1), () => ld.execute({ projectId: PID_X }));
+  ok('B1 默认一页 50 张（252 张那种项目不再一次倒出来）', ids(p1).length === 50, `本页 ${ids(p1).length}`);
+  ok('B2 回包里写明总张数与本页张数', p1.totalImages === N_ALL && p1.pageImages === 50, `total=${p1.totalImages} page=${p1.pageImages}`);
+  ok('B3 ★ 人读文本写明「共 N / 本页 M / 下一页传 offset=X」（截断不静默）',
+    p1.text.includes(`共 ${N_ALL}`) && p1.text.includes('本页 50') && p1.text.includes('offset=50'), p1.text.split('\n').slice(-1)[0]);
+  ok('B4 确实是前 50 张（不是随机切）', ids(p1)[0] === 'img-000' && ids(p1)[49] === 'img-049');
+
+  const seen2 = [];
+  const p2 = await withStubFetch(imgsStub(seen2), () => ld.execute({ projectId: PID_X, offset: 50 }));
+  ok('B5 ★ 游标分页**不重不漏**：第二页接着第一页，且两页无交集',
+    ids(p2)[0] === 'img-050' && ids(p2).length === 50 && !ids(p2).some((x) => ids(p1).includes(x)),
+    `${ids(p2)[0]} … ${ids(p2)[49]}`);
+  ok('B6 第二页写明下一页的 offset（100）', p2.text.includes('offset=100'), p2.text.split('\n').slice(-1)[0]);
+
+  const p3 = await withStubFetch(imgsStub([]), () => ld.execute({ projectId: PID_X, offset: 600 }));
+  ok('B7 越过末页 → 空页 + 明说"已到末页"（不静默给空表）',
+    ids(p3).length === 0 && /已到末页/.test(p3.text), p3.text.split('\n').slice(-1)[0]);
+
+  const p4 = await withStubFetch(imgsStub([]), () => ld.execute({ projectId: PID_X, limit: 9999 }));
+  ok('B8 ★ 硬上限：limit 传 9999 被压回 500（不靠调用方自觉）',
+    p4.limit === LIMITS.listMaxImages && ids(p4).length === LIMITS.listMaxImages, `limit=${p4.limit} 本页 ${ids(p4).length}`);
+  ok('B9 被压回时文本照样写明总数（不假装只有 500 张）', p4.totalImages === N_ALL, String(p4.totalImages));
+
+  const p5 = await withStubFetch(imgsStub([]), () => ld.execute({ projectId: PID_X, limit: 0, offset: -3 }));
+  ok('B10 越界/无意义的值回落默认（limit:0→50、offset:-3→0），不炸也不无限',
+    p5.limit === LIMITS.listDefaultImages && p5.offset === 0, `limit=${p5.limit} offset=${p5.offset}`);
+  const p5b = await withStubFetch(imgsStub([]), () => ld.execute({ projectId: PID_X, limit: 'abc' }));
+  ok('B10b 类型不对由 schema 拦下（进不了业务层，不花请求）', p5b.failed === true, String(p5b.text).split('\n')[0]);
+
+  const p6 = await withStubFetch(imgsStub([]), () => ld.execute({ projectId: PID_X, sector: '甲' }));
+  ok('B11 sector 是客户端过滤：先过滤再分页（"共 N"跟着过滤后的集合走）',
+    p6.totalImages === N_ALL && ids(p6).every((x) => Number(x.slice(4)) % 2 === 1) && p6.pageImages === 50,
+    `page=${p6.pageImages} 首张=${ids(p6)[0]}`);
+  ok('B11b 给了分组时标题写明"过滤后几张"（避免与页脚两个"共 N"打架）',
+    p6.text.includes('分组「甲」300 张') && p6.text.includes('共 300 张设计稿'), p6.text.split('\n')[0]);
+
+  /* ── ★ 最重要的一条：**内部调用方拿到的是全量** ── */
+  const coreSeen = [];
+  // 用自检早先存下的 `demo` 账号（TMP_HOME）—— 核心函数走真实 cookie 解析链，不额外注入
+  const core = await withStubFetch(imgsStub(coreSeen), () => listImages(PID_X, { account: 'demo' }));
+  ok('B12 ★★ 核心函数 `listImages` 不分页（内部调用方的数据源）',
+    core.images.length === N_ALL && coreSeen.length === 1, `拿到 ${core.images.length} 张 / ${coreSeen.length} 次请求`);
+
+  const mkReq = (url, method = 'GET', body = null, addr = '127.0.0.1') => ({
+    url, method, headers: {}, socket: { remoteAddress: addr },
+    [Symbol.asyncIterator]: async function* () { if (body !== null) yield Buffer.from(JSON.stringify(body), 'utf8'); },
+  });
+  const call = async (handler, req) => {
+    const out = { status: 0, body: null, threw: undefined };
+    const resp = { writeHead(s) { out.status = s; }, end(t) { out.body = JSON.parse(t); } };
+    try { await handler(req, resp); } catch (e) { out.threw = e; }
+    return out;
+  };
+  const handler = makeLanhuHandler({
+    checkAuth: async () => ({ ok: true, account: 'acme', teamCount: 1 }),
+    pickAccount: async () => ({ alias: 'demo', by: 'index' }),
+    // ⚠️ **不注入 listImages** —— 走的就是真实核心函数，这样才验得到"内部调用方没被默认 limit 带走"
+    imageVersions: async (pid, iid) => ({ name: iid, versions: [{ id: 'v1' }] }),
+  });
+  const stubAll = async (url) => {
+    const u = String(url);
+    if (u.includes('/api/project/images')) return stubResponse({ code: 0, data: { name: '大项目', images: ALL } });
+    return stubResponse({ code: 0, data: { id: 'iid', name: '稿', width: 375, height: 800, versions: [{ id: 'v1', json_url: null }] } });
+  };
+  const routeDesigns = await withStubFetch(stubAll, () => call(handler, mkReq('/lanhu/designs?pid=' + PID_X)));
+  ok('B13 ★★ 面板「稿」下拉端点 /lanhu/designs 拿到的仍是**全量** 600 张',
+    routeDesigns.status === 200 && (routeDesigns.body?.data?.images ?? []).length === N_ALL,
+    `${routeDesigns.status} / ${(routeDesigns.body?.data?.images ?? []).length}`);
+  const routeVC = await withStubFetch(stubAll, () => call(handler, mkReq('/lanhu/versions-count?pid=' + PID_X)));
+  ok('B14 ★★ /lanhu/versions-count 的 total 是全量算出来的（分页工具不能把它带偏）',
+    routeVC.body?.data?.total === N_ALL, String(routeVC.body?.data?.total));
+
+  /* ── search：接口是 pageNo/pageSize 制，工具给 limit/offset ── */
+  const sr = TOOLS.find((t) => t.name === 'lanhu_search');
+  const searchSeen = [];
+  const searchStub = async (url, init = {}) => {
+    const body = JSON.parse(String(init.body ?? '{}'));
+    searchSeen.push(body);
+    const size = Number(body.pageSize) || 20;
+    const page = Number(body.pageNo) || 1;
+    const all = Array.from({ length: 120 }, (_, i) => ({ itemId: 's-' + String(i).padStart(3, '0'), sourceId: PID_X, itemName: '结果' + (i + 1), sourceName: '项目', path: '/', itemUrl: null }));
+    const items = all.slice((page - 1) * size, page * size);
+    return stubResponse({ code: 0, data: {
+      dc_prj_image: { total: all.length, items },
+      dc_prj: { total: 0, items: [] },
+      dc_prj_prd: { total: 0, items: [] },
+    } });
+  };
+  const s1 = await withStubFetch(searchStub, () => sr.execute({ teamId: TID_X, keyword: '结果' }));
+  ok('B15 ★ search 默认 limit=50 **真的传给了接口**（pageSize=50，不是接口默认的 20）',
+    searchSeen[0]?.pageSize === 50 && searchSeen[0]?.pageNo === 1, JSON.stringify(searchSeen[0]));
+  ok('B16 search 默认一页 50 条，且文本写明总数与下一页 offset',
+    s1.images.length === 50 && s1.text.includes('共 120 条') && s1.text.includes('offset=50'), s1.text.split('\n').slice(-1)[0]);
+  const s2 = await withStubFetch(searchStub, () => sr.execute({ teamId: TID_X, keyword: '结果', offset: 50 }));
+  ok('B17 ★ search 游标分页不重不漏（第二页从第 51 条起，页码换算正确）',
+    s2.images[0]?.imageId === 's-050' && !s2.images.some((x) => s1.images.includes(x)),
+    `${s2.images[0]?.imageId} / pageNo=${searchSeen[0]?.pageNo}`);
+  ok('B18 search 末页明说"已到末页"', await (async () => {
+    const s3 = await withStubFetch(searchStub, () => sr.execute({ teamId: TID_X, keyword: '结果', offset: 100 }));
+    return s3.images.length === 20 && /已到末页/.test(s3.text);
+  })(), 'offset=100 → 本页 20 条（120 的尾页）');
+  ok('B19 search 空结果时那句老话逐字不变（没匹配上不许换个说法）', await (async () => {
+    const emptyStub = async () => stubResponse({ code: 0, data: { dc_prj_image: { total: 0, items: [] }, dc_prj: { total: 0, items: [] }, dc_prj_prd: { total: 0, items: [] } } });
+    const s4 = await withStubFetch(emptyStub, () => sr.execute({ teamId: TID_X, keyword: '没有这个' }));
+    return s4.text === '没有匹配「没有这个」的结果。';
+  })());
+  ok('B20 两个列表工具的 output schema 都声明了分页字段（能力不藏着）',
+    ['totalImages', 'pageImages', 'offset', 'limit', 'hasMore'].every((k) => k in (ld.output.schema.properties ?? {}))
+    && ['totals', 'offset', 'limit', 'hasMore'].every((k) => k in (sr.output.schema.properties ?? {})),
+    Object.keys(ld.output.schema.properties ?? {}).join(','));
 }
 
 /* ═══════════════ 汇总 ═══════════════ */

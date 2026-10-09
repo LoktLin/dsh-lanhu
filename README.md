@@ -161,23 +161,27 @@
 
 #### `lanhu_list_designs`
 
-列出某个项目下的全部设计稿（稿名 / 尺寸 / imageId）。⚠️ **尺寸是缩略图预览尺寸**，不是画板真实尺寸（常见 ¼）——算 rpx 请用读稿标题行里的画板宽。**可以直接贴蓝湖链接**（里面的 tid/pid 自动解析，不用手拆）；也可以给 projectId。要看**产品文档/原型**请用 lanhu_list_product_documents。
+列出某个项目下的设计稿（稿名 / 尺寸 / imageId）。⚠️ **尺寸是缩略图预览尺寸**，不是画板真实尺寸（常见 ¼）——算 rpx 请用读稿标题行里的画板宽。**可以直接贴蓝湖链接**（里面的 tid/pid 自动解析，不用手拆）；也可以给 projectId。（分页：默认 50 张/页）要看**产品文档/原型**请用 lanhu_list_product_documents。
 
 | 参数 | 类型 | 必填 | 取值 | 说明 |
 |---|---|---|---|---|
 | `url` | `string` | 否 | — | 蓝湖链接（整条粘贴即可 —— 里面的 tid/pid 会自动解析，不用手拆） |
 | `projectId` | `string` | 否 | — | 项目 UUID（与 url 二选一；**两个都给时以 projectId 为准**） |
 | `sector` | `string` | 否 | — | 分组名（可选；实测未分组项目也能列出全部稿子，无需此参数） |
+| `limit` | `integer` | 否 | — | 本页几张（默认 50/上限 500） |
+| `offset` | `integer` | 否 | — | 从第几张开始（默认 0） |
 | `account` | `string` | 否 | — | 可选：蓝湖账号别名（多账号时用）。不给则按链接里的团队 id 自动判定，再退到默认账号；有哪些账号看 lanhu_accounts。 |
 
 #### `lanhu_search`
 
-在蓝湖团队里全局搜索设计稿 / 项目 / PRD（按名称关键词）。当不知道稿子在哪个项目、或只记得名字时用这个。
+在蓝湖团队里全局搜索设计稿 / 项目 / PRD（按名称关键词）。当不知道稿子在哪个项目、或只记得名字时用这个。（分页：默认每类 50 条/页）
 
 | 参数 | 类型 | 必填 | 取值 | 说明 |
 |---|---|---|---|---|
 | `teamId` | `string` | **是** | — | 团队 UUID |
 | `keyword` | `string` | **是** | — | 搜索关键词（稿名的一部分） |
+| `limit` | `integer` | 否 | — | 每类各几条（默认 50/上限 500） |
+| `offset` | `integer` | 否 | — | 从第几条开始（默认 0） |
 | `account` | `string` | 否 | — | 可选：蓝湖账号别名（多账号时用）。不给则按链接里的团队 id 自动判定，再退到默认账号；有哪些账号看 lanhu_accounts。 |
 
 #### `lanhu_read_design`
@@ -193,7 +197,7 @@
 | `outDir` | `string` | 否 | — | 仅 format=full 时生效：落盘目录 |
 | `region` | `string` | 否 | — | 按区域过滤：如 "95,215" 取 y∈[95,215]，或 "x0,y0,x1,y1"。直接输出可用图层表（含相对父容器的内边距），替代手写抠图脚本 |
 | `minWidth` | `integer` | 否 | — | 配合 region：只保留宽度 ≥ 该值的层 |
-| `limit` | `integer` | 否 | — | 配合 region：最多列多少层（默认 80）。层数多的稿子会被截断，要看全量就传大一点（如 900），表头会标注是否截断 |
+| `limit` | `integer` | 否 | — | 配合 region：最多列多少层（默认 80；表头会标注，调大它看全） |
 | `mapBox` | `string` | 否 | — | 配合 region：设计稿参照框 "x0,y0,x1,y1"（如地图区域总 bbox）。与 toBox 同时给时，输出增加映射后的坐标列 |
 | `toBox` | `string` | 否 | — | 配合 region：目标参照框 "X0,Y0,X1,Y1"（如本地自绘 SVG 的内容 bbox）。x/y 各自独立缩放（非等比），长宽比不同也能对 |
 | `version` | `string` | 否 | — | 版本 id（默认 latest）。给了具体 id 就**必须命中** —— 命中不了明确报错，**不静默回退最新版**；结果里的 version 字段会写明实际用了哪一版、是否最新 |
@@ -219,6 +223,7 @@
 | `version` | `string` | 否 | — | 版本 id（默认 latest）；与 read_design 同义。设计稿更新后要复现"当时那一版"就传它 |
 | `dualUnits` | `boolean` | 否 | — | 默认关闭。开启后「尺寸」列给双单位 `120×152px / 240×304rpx`（换算比按画板宽度算）；末尾的「间距一览」始终双单位 |
 | `comments` | `boolean` | 否 | — | 默认 `true`：读这张稿的**评论 / 标注**（人类留的需求；图层树里没有）。⚠️ 它是**独立接口** → **多 1~N 次请求**（没开就 2 次，开了 3 次）；只要图层时传 `false` 跳过。只读：从不改 / 删评论，也不标记已读 |
+| `commentMaxReplies` | `number` | 否 | — | 每条评论最多列几条回复（默认 5） |
 | `account` | `string` | 否 | — | 可选：蓝湖账号别名（多账号时用）。不给则按链接里的团队 id 自动判定，再退到默认账号；有哪些账号看 lanhu_accounts。 |
 
 #### `lanhu_diff_design`
@@ -232,6 +237,7 @@
 | `imageId` | `string` | 否 | — | 设计稿 id（与 projectId 搭配） |
 | `from` | `string` | **是** | — | 对比的**起点**版本 id（旧的那一版）。版本 id 从 `lanhu_read_blocks` / `lanhu_read_design` 返回的 `version.id` 里取；给不存在的 id 会报错，**不会**静默回退到最新版 |
 | `to` | `string` | 否 | — | 对比的**终点**版本 id（新的那一版）。省略 = 最新版（latest） |
+| `limit` | `integer` | 否 | — | 每类最多几行（默认 40；超出只计数并写明调大它） |
 | `includeNoise` | `boolean` | 否 | — | 是否把系统 UI / 图形碎片块也纳入比对（默认 false，与块级清单同一个折叠口径） |
 | `account` | `string` | 否 | — | 可选：蓝湖账号别名（多账号时用）。不给则按链接里的团队 id 自动判定，再退到默认账号；有哪些账号看 lanhu_accounts。 |
 
@@ -244,6 +250,7 @@
 | `url` | `string` | 否 | — | 项目链接或任意一张稿的链接（整条粘贴，自动解析 tid/pid；审计的是**整个项目**） |
 | `projectId` | `string` | 否 | — | 项目 UUID（与 url 二选一）。一个项目往往有很多张稿，用它最直接 |
 | `limit` | `integer` | 否 | — | 最多扫多少张稿（默认 50；**硬上限 200**，传更大也只会扫 200）。别一上来就拉满 —— 成本见工具说明 |
+| `maxRows` | `integer` | 否 | — | 放宽「其余 N 种/N 条」的每类上限（默认 12/8/600） |
 | `includeNoise` | `boolean` | 否 | — | 是否把系统 UI / 图形碎片块也纳入统计（默认 false，与块级清单同一个折叠口径） |
 | `allowWeakNaming` | `boolean` | 否 | — | 命名不可靠时是否仍然给出**不依赖层名**的几项（字号阶梯 / 近重复色 / 间距 / 圆角）。默认 false = 一项都不出（硬凑的结论比不给更糟） |
 | `account` | `string` | 否 | — | 可选：蓝湖账号别名（多账号时用）。不给则按链接里的团队 id 自动判定，再退到默认账号；有哪些账号看 lanhu_accounts。 |
@@ -275,6 +282,7 @@
 | `version` | `string` | 否 | — | 版本 id（默认 latest）。原型也会更新，要复现"当时那一版"就传它 |
 | `limit` | `integer` | 否 | — | 最多读几页正文（默认 1，避免一次拉爆） |
 | `textLimit` | `integer` | 否 | — | 每页最多取多少条正文文本（默认 120） |
+| `pageTreeLimit` | `integer` | 否 | — | 页面树最多几个节点（默认 200） |
 | `format` | `string` | 否 | `doc` / `layers` | doc（默认）= 页面树 + 正文文本（业务规则、字段、跳转）。layers = **该页的样式图层/块级清单**（坐标·色值·字号·字重·字体族·圆角·描边·渐变·透明度·切图），与 lanhu_read_blocks 输出**同一张表**。**什么时候用 layers**：项目里**没有设计稿、只有原型**时（`lanhu_list_designs` 返回 0 张）—— 那时 lanhu_read_design / lanhu_read_blocks 一点数据都拿不到，靠它才能照着实现。⚠️ 原型是交互稿，颜色/字号是设计者随手填的，**不等于最终视觉稿**；有设计稿时仍以设计稿为准。 |
 | `layerLimit` | `integer` | 否 | — | format=layers 时最多列多少块（默认 60） |
 | `includeNoise` | `boolean` | 否 | — | format=layers 时是否包含系统 UI / 图形碎片块（默认折叠） |
@@ -360,9 +368,10 @@
 | `region` | `string` | 否 | — | 可选：只生成某区域的块，"y0,y1" 或 "x0,y0,x1,y1"（大屏稿动辄几百块，用它收窄） |
 | `kind` | `string` | 否 | — | 可选：只生成某几类块，逗号分隔（card/container/pill/text/image/divider） |
 | `minWidth` | `number` | 否 | — | 可选：只生成宽度 ≥ 该值的块 |
-| `limit` | `number` | 否 | — | 最多生成几块（默认 60）。生成器**故意有上限**：一张大屏稿几百块全吐出来没人粘贴得了；被截断时 truncated:true |
+| `limit` | `number` | 否 | — | 最多生成几块（默认 60；截断时 truncated:true，调大它看全） |
 | `includeNoise` | `boolean` | 否 | — | 是否把系统 UI / 图形碎片块也生成（默认 false，与 lanhu_read_blocks 同一个折叠口径） |
 | `version` | `string` | 否 | — | 版本 id（默认 latest）。设计稿会更新，要复现"当初那一版"就传它；给了具体 id 必须命中，命中不了会报错、不静默回退 |
+| `structured` | `boolean` | 否 | — | 是否额外返回机器可读的 `codes[]`（默认 false） |
 | `account` | `string` | 否 | — | 可选：蓝湖账号别名（多账号时用）。不给则按链接里的团队 id 自动判定，再退到默认账号；有哪些账号看 lanhu_accounts。 |
 
 #### `lanhu_cookie_set`
