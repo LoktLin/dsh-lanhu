@@ -3433,6 +3433,14 @@ function sketchLayerOf(node, children, isArtboard) {
     // 实测 Sketch 的 opacity 是 **0..100**（Figma 稿是 0..1），必须换算；不换算会把 80% 当 80 倍。
     opacity: typeof node.opacity === 'number' ? clamp01(node.opacity / 100) : 1,
     visible: node.isVisible !== false,
+    /**
+     * 旋转：与 Figma 侧**同一个出口**（`rotationOf`），两条链口径一致。
+     * 实测依据：某 Sketch 稿 `info[]` **119 项里 118 项带 `rotation`**、其中 **6 项非零**
+     *   （如标注面板显示的 `旋转 180°`）。
+     * ⚠️ 诚实标注：**旋转的正方向（顺时针/逆时针）尚未与标注面板逐值核对过** ——
+     *   这一条对 Figma 侧同样未核（见生成代码处的同名注释）。方向若反了，改动点只有一处。
+     */
+    rotation: rotationOf(node),
     radius,
     paths: shape ? [{ type: shape, frame, radius }] : null,
     style: {
