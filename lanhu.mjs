@@ -3396,6 +3396,34 @@ function sketchTextOf(node) {
         letterSpacing: { value: round2(f.kerning ?? 0), unit: 'pixels' },
       },
       color: f.color ?? f.styles?.[0]?.color ?? null,
+      /**
+       * 富文本 runs（Sketch 三处缺口之②）：把 `font.styles[]` 迁成与 Figma 侧**同形**的
+       * `styles[]`，好让 `textRunsOf()` / 生成器的 `<span>` 分段对这类稿也生效。
+       *
+       * ⚠️ 诚实标注：
+       *   · `content` 与 `color` 两个字段名是**已被本函数既有代码使用**的（`f.styles?.[0].content`
+       *     / `.color`），不是猜的；per-run 的字体字段名**未经多段样本确认** —— 所以这里**只做
+       *     容忍读取**（有就填、没有就给 null），读不到就退化成图层主样式，不会编。
+       *   · 真机样本 `styles.length` **恒为 1**（某 Sketch 稿实测），即多段实例**尚未遇到过**；
+       *     但单段时 `textRunsOf()` 返回 null（≥2 才返回），所以**老样本的输出逐字节不变**。
+       */
+      styles: Array.isArray(f.styles) ? f.styles.map((s) => {
+        if (!s || typeof s !== 'object') return null;
+        const sf = (s.font && typeof s.font === 'object') ? s.font : {};
+        return {
+          from: typeof s.from === 'number' ? s.from : null,
+          to: typeof s.to === 'number' ? s.to : null,
+          content: typeof s.content === 'string' ? s.content : '',
+          font: {
+            name: sketchFamilyOf(sf.font ?? sf.name) ?? null,
+            size: typeof sf.size === 'number' ? round2(sf.size) : null,
+            fontWeight: typeof sf.weight === 'number' ? sf.weight : null,
+            lineHeight: { value: typeof sf.line === 'number' ? round2(sf.line) : null },
+            letterSpacing: { value: typeof sf.kerning === 'number' ? round2(sf.kerning) : null },
+          },
+          color: s.color ?? null,
+        };
+      }).filter(Boolean) : null,
     },
     value: content,
   };
