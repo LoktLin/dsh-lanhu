@@ -19,7 +19,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { execFileSync } from 'node:child_process';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (p) => fs.readFileSync(path.join(ROOT, p), 'utf8');
@@ -174,13 +173,39 @@ group('⑤ 写死的数字');
   ok('README 至少写了一处工具数', claims.length + enClaims.length > 0);
 
   // 自检项数：README / docs / 发布清单里写死的数字必须是**真跑出来的那个**。
+  // ⚠️ 这里**故意用一个"读得慢"的消费者**（每收到一块就 pause、4ms 后再 resume）：
+  //    selfcheck 的 stdout 有 170KB+，**远超管道缓冲（64KB）**。它若用 `process.exit()` 收尾，
+  //    Node 会在写管道完成之前退出 → stdout 被截断、末尾的「合计」行整个丢掉 → 上游解析到 null
+  //    （表现成"偶发假红"：退出码 0，却读不到项数）。慢读把这条**竞态变成必现**，
+  //    所以下面那条"末行必须是「合计」行"才真的守得住 —— 它就是这个 bug 的回归断言。
   let actual = null;
+  let selfOut = '';
   try {
-    const out = execFileSync(process.execPath, ['test/selfcheck.mjs'], { cwd: ROOT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] });
-    const m = out.match(/合计：(\d+) 项/);
-    actual = m ? Number(m[1]) : null;
+    const { spawn } = await import('node:child_process');
+    let code = 1;
+    selfOut = await new Promise((resolve, reject) => {
+      const child = spawn(process.execPath, ['test/selfcheck.mjs'], { cwd: ROOT, stdio: ['ignore', 'pipe', 'ignore'] });
+      let buf = '';
+      let closed = false;
+      child.stdout.on('data', (d) => {
+        buf += d;
+        if (closed) return;
+        child.stdout.pause();
+        setTimeout(() => { if (!closed) child.stdout.resume(); }, 4);
+      });
+      child.on('error', reject);
+      child.on('close', (c) => { closed = true; code = c; resolve(buf); });
+    });
+    const m = selfOut.match(/合计：(\d+) 项/);
+    actual = code === 0 && m ? Number(m[1]) : null;
   } catch (e) { actual = null; }
   ok('能跑通 selfcheck 并解析出项数', actual !== null, '解析结果 ' + actual);
+  // ★ 与上一条的区别：上一条查"有没有项数"，这条查"**结尾**还在不在"——专治 stdout 被截断。
+  ok('selfcheck 的完整 stdout 在慢消费者背压下不被截断（末行仍是「合计」行）',
+    /(^|\n)\s*合计：\d+ 项 ✅ \/ \d+ 项 ❌\s*$/.test(selfOut),
+    actual === null
+      ? `没解析到项数（只读到 ${Buffer.byteLength(selfOut, 'utf8')} B，末尾 ${JSON.stringify(selfOut.slice(-60))}）`
+      : `读到 ${Buffer.byteLength(selfOut, 'utf8')} B`);
   if (actual !== null) {
     const files = ['README.md', 'docs/CLI与开发.md', '.github/release-notes/README.md'];
     let checked = 0;

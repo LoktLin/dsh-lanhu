@@ -4548,6 +4548,63 @@ group('⑩ 面板版本自述（Client）');
       callSites.length >= 4 && callSites.every((s) => s.startsWith('API')),
       callSites.join(' | '));
   }
+
+  /* ── 颜色铁律：**浮层面板根节点**的投影/底色/描边也全走令牌（写死 rgba/hex 必红） ── */
+  {
+    // 浮层面板根节点是一整棵面板树的根：投影、底色、描边都在它身上，是"写死颜色"最容易漏的一处
+    // （实测就漏过：`boxShadow: '0 10px 32px rgba(0,0,0,0.22)'` —— 唯一的裸色值，且没人守）。
+    // 这里**按渲染结果查**（不是读源码）：能同时证明"令牌真的进了 DOM"和"渲染没崩"。
+    const stripTokenVars = (v) => {
+      let out = ''; let i = 0;
+      for (;;) {
+        const at = v.indexOf('var(', i);
+        if (at < 0) { out += v.slice(i); return out; }
+        out += v.slice(i, at);
+        let depth = 0; let j = at + 3;
+        for (; j < v.length; j += 1) {
+          if (v[j] === '(') depth += 1;
+          else if (v[j] === ')') { depth -= 1; if (depth === 0) { j += 1; break; } }
+        }
+        i = j;
+      }
+    };
+    // 每个 var() 都要带 fallback —— 逐个 `var(`（**含嵌套的那些**）走括号配对，
+    // 要求它自己的第 1 层里出现逗号。只查"整串有一个 var(--x, y)"会放过 `var(--a, var(--b))` 这种。
+    const varsAllHaveFallback = (v) => {
+      for (let p = v.indexOf('var('); p >= 0; p = v.indexOf('var(', p + 1)) {
+        let depth = 0; let comma = false; let end = -1;
+        for (let j = p + 3; j < v.length; j += 1) {
+          const ch = v[j];
+          if (ch === '(') depth += 1;
+          else if (ch === ')') { depth -= 1; if (depth === 0) { end = j; break; } }
+          else if (ch === ',' && depth === 1) comma = true;
+        }
+        if (!comma || end < 0) return false;
+      }
+      return true;
+    };
+    const roots = noUpdate.nodes.filter((n) => n.props && n.props['data-dsh-part'] === 'panel');
+    ok('浮层面板根节点确实渲染出来了（下面的颜色检查不是空跑）', roots.length === 1, String(roots.length));
+    const rootStyle = (roots[0] && roots[0].props.style) || {};
+    const shadow = String(rootStyle.boxShadow || '');
+    // ⚠️ 别用 `/var\(--dsw-[\w-]+,\s*[^)]+\)/` 这种简单正则判"有没有 fallback"：
+    //    fallback 自己可能含 `)`（`0 10px 32px rgba(0,0,0,0.22)` 就是），`[^)]+` 会匹配失败 → 假红。
+    ok('面板浮层根节点的投影走令牌 + 原值 fallback（不是裸 rgba）',
+      /^var\(--dsw-[\w-]+,\s*.+\)$/.test(shadow) && varsAllHaveFallback(shadow)
+        && shadow.includes('0 10px 32px rgba(0,0,0,0.22)'),
+      shadow);
+    ok('面板浮层根节点没有裸色值（stripVars 之后不剩颜色字面量）',
+      Object.entries(rootStyle).every(([, v]) => typeof v !== 'string' || !/#[0-9a-fA-F]{3,8}\b|rgba?\(/.test(stripTokenVars(v))),
+      Object.entries(rootStyle).filter(([, v]) => typeof v === 'string' && /#|rgb/.test(stripTokenVars(v)))
+        .map(([k, v]) => k + '=' + v).join(', '));
+    ok('面板浮层根节点每个 var() 都带 fallback（用户皮肤下不会变成透明/看不清）',
+      Object.entries(rootStyle).every(([, v]) => typeof v !== 'string' || varsAllHaveFallback(v)),
+      Object.entries(rootStyle).filter(([, v]) => typeof v === 'string' && !varsAllHaveFallback(v))
+        .map(([k, v]) => k + '=' + v).join(', '));
+    ok('确实检查到了根节点的样式（不是空跑）',
+      Object.keys(rootStyle).filter((k) => typeof rootStyle[k] === 'string').length >= 6,
+      String(Object.keys(rootStyle).length));
+  }
 }
 
 /* ═══════════════ ⑪ 面板「体检」Tab（Client 真渲染 + Host 新路由） ═══════════════ */
@@ -6521,4 +6578,13 @@ if (AS_JSON) {
   console.log(`\n合计：${passed} 项 ✅ / ${failed} 项 ❌`);
 }
 cleanupTmp();
-process.exit(failed === 0 ? 0 : 1);
+// ⚠️ 这里必须是 `process.exitCode`，**不能**是 `process.exit()`：stdout 接管道时 Node 的写是异步的，
+//    本文件的输出有 170KB+、**远超管道缓冲（64KB）**，`process.exit()` 会在写完之前就退出 →
+//    stdout 被截断、末尾的「合计」行整个丢掉。后果分两种，都很坏：
+//      · 上游（readme-test 用"读得慢的消费者"接 stdout）解析不到项数 → 表现成"偶发假红"；
+//      · 更坏的：只看末尾几行的人以为跑完了 —— **一个会撒谎的自检比没有自检更糟**。
+//    实测（每 4KB 睡 4ms 的慢消费者）：改前只读到 69,675 B / 173,599 B；改后**读到全文**。
+//    `process.exitCode` 只登记退出码，Node 会等 stdout flush 干净再自然退出。
+//    守护这条的断言在 test/readme-test.mjs（"慢消费者背压下…末行必须是「合计」行"）——
+//    把这里改回 `process.exit()`，readme-test 立刻红 2 条（解析出项数 = null + 末行不是「合计」）。
+process.exitCode = failed === 0 ? 0 : 1;
