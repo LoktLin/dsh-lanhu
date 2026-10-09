@@ -139,8 +139,11 @@ const {
   axureFontFamily,
   extractAxureObjects,
   ddsSchema,
+  // —— 「示例与真值同源」（⑫）：色值示例唯一出口 ——
+  rgbaString,
+  bgText,
 } = await import('../lanhu.mjs');
-const { TOOLS, validateJsonSchemaValue, ToolArgsError, toLossless } = await import('../lib/index.js');
+const { TOOLS, validateJsonSchemaValue, ToolArgsError, toLossless, apply: applyHostPlugin } = await import('../lib/index.js');
 
 const results = [];
 let currentGroup = '';
@@ -4562,6 +4565,214 @@ group('⑪ 面板「体检」Tab');
     eq('非本机访问 /lanhu/audit → 403', (await call(handler, mkReq('/lanhu/audit', 'POST', { projectId: PID }, '10.0.0.9'))).status, 403);
     eq('非本机访问 /lanhu/designs → 403', (await call(handler, mkReq('/lanhu/designs?pid=' + PID, 'GET', null, '10.0.0.9'))).status, 403);
     eq('非本机访问 /lanhu/diff → 403', (await call(handler, mkReq('/lanhu/diff', 'POST', { from: V4 }, '10.0.0.9'))).status, 403);
+  }
+}
+
+/* ═══════════════ ⑫ 提示示例与真值同源 + 块类型徽标令牌化 ═══════════════ */
+group('⑫ 提示示例同源 / 徽标令牌化');
+{
+  const _root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const idxSrc = fs.readFileSync(path.join(_root, 'lib', 'index.js'), 'utf8');
+  const clientSrc = fs.readFileSync(path.join(_root, 'lib', 'client.js'), 'utf8');
+
+  /* ── ① 给模型看的示例，必须等于实现产出（改了文案、或改了实现，都要红） ── */
+  const REAL_RGBA = rgbaString({ r: 87, g: 74, b: 244, a: 0.1 });
+  const REAL_SAMPLE = bgText({ hex: '#574af4', alpha: 0.1 });
+  eq('rgbaString() 的半透明形态就是「逗号后带空格 + alpha 带前导 0」', REAL_RGBA, 'rgba(87, 74, 244, 0.1)');
+
+  // 取**模型真正读到的那份**提示：从源码里抠出来的是拼接表达式，验不出真值。
+  let hint = null;
+  applyHostPlugin({
+    inject: (_svcs, fn) => fn({
+      effect: (f) => { const d = f(); return typeof d === 'function' ? d : () => {}; },
+      get: (n) => (n === 'systemPrompt'
+        ? { section: (s) => { hint = s.text; return () => {}; } }
+        : { register: () => () => {} }),
+    }),
+  });
+  ok('拿到模型真正读到的那份 SYSTEM_HINT（不是源码里的拼接表达式）',
+    typeof hint === 'string' && hint.length > 500, `长度 ${hint ? hint.length : 0}`);
+  const inHint = /rgba\([^)]*\)/.exec(hint || '');
+  eq('提示里的 rgba 示例 === rgbaString() 对同一输入的真实产出',
+    inHint ? inHint[0] : '(提示里一个 rgba 示例都没有)', REAL_RGBA);
+  ok('提示里的整段色值示例 === bgText() 的真实渲染（连 `#hex@NN%` 一起）',
+    (hint || '').includes(REAL_SAMPLE), `示例应为 ${REAL_SAMPLE}`);
+  {
+    const seg = idxSrc.slice(idxSrc.indexOf('const SYSTEM_HINT = ['), idxSrc.indexOf('].join('));
+    ok('SYSTEM_HINT 的数组里没有手抄的 rgba 字面量（示例是从实现派生的）',
+      !/rgba\(/.test(seg), '写死的话，实现一改提示就漂移，且没人会收到通知');
+  }
+  {
+    // 全项目扫一遍：**文档 / 提示 / 源码注释**里出现的"具体 rgba 示例"都必须是实现产出的形态。
+    // 只认反引号里的 inline code（示例都这么写），且只认带具体数值的（`rgba(…)`/`rgba(${r}, …)` 占位不算）。
+    // test/ 是夹具（Figma 输入本身就是无空格形态）、.github/release-notes/ 是历史发布说明，都不扫。
+    const SKIP = /^(node_modules|\.git|test|\.github\/release-notes)$/;
+    const files = [];
+    (function walk(dir, rel) {
+      for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+        const r = rel ? rel + '/' + e.name : e.name;
+        if (SKIP.test(r)) continue;
+        if (e.isDirectory()) walk(path.join(dir, e.name), r);
+        else if (/\.(js|mjs|md)$/.test(e.name)) files.push(r);
+      }
+    })(_root, '');
+    const bad = [];
+    let seen = 0;
+    for (const rel of files) {
+      const src = fs.readFileSync(path.join(_root, rel), 'utf8');
+      for (const m of src.matchAll(/`([^`\n]*)`/g)) {
+        for (const c of (m[1].match(/rgba\(\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*\d{1,3}\s*,\s*[0-9.]+\s*\)/g) ?? [])) {
+          seen += 1;
+          if (!/^rgba\(\d{1,3}, \d{1,3}, \d{1,3}, (?:0|1)(?:\.\d+)?\)$/.test(c)) bad.push(rel + ':' + c);
+        }
+      }
+    }
+    ok('全项目「示例里的具体 rgba」都是实现产出的形态（文档 / 提示 / 源码注释一起管）',
+      bad.length === 0, bad.join(' | '));
+    ok('确实扫到了示例（不是空跑）', seen >= 3, `扫到 ${seen} 处`);
+  }
+
+  /* ── ② 块类型徽标：一律令牌 + fallback（写死 hex / 丢 fallback 都要红） ── */
+  const stripVars = (v) => {
+    let out = ''; let i = 0;
+    for (;;) {
+      const at = v.indexOf('var(', i);
+      if (at < 0) { out += v.slice(i); return out; }
+      out += v.slice(i, at);
+      let depth = 0; let j = at + 3;
+      for (; j < v.length; j += 1) {
+        if (v[j] === '(') depth += 1;
+        else if (v[j] === ')') { depth -= 1; if (depth === 0) { j += 1; break; } }
+      }
+      i = j;
+    }
+  };
+  const TOKEN_OK = /^var\(--dsw-[\w-]+,\s*[^)]+\)$/;
+  const KS = clientSrc.slice(clientSrc.indexOf('const KIND_STYLE'), clientSrc.indexOf('function KindBadge'));
+  const entries = [...KS.matchAll(/(\w+):\s*\{\s*label:\s*'[^']*',\s*color:\s*'([^']+)'\s*\}/g)]
+    .map((m) => ({ kind: m[1], color: m[2] }));
+  eq('KIND_STYLE 仍是 7 类（画板/卡片/容器/胶囊/文本/图片/分割线）', entries.length, 7);
+  ok('KIND_STYLE 每个颜色都是 var(--dsw-*, 兜底)',
+    entries.every((e) => TOKEN_OK.test(e.color)),
+    entries.filter((e) => !TOKEN_OK.test(e.color)).map((e) => e.kind + '=' + e.color).join(', '));
+  ok('KIND_STYLE 里没有裸色值（stripVars 之后不剩颜色字面量）',
+    entries.every((e) => !/#[0-9a-fA-F]{3,8}\b|rgba?\(/.test(stripVars(e.color))),
+    entries.map((e) => e.kind + '=' + stripVars(e.color)).filter((s) => /#|rgb/.test(s)).join(', '));
+  eq('7 类取 7 个互不相同的令牌（互相可区分）', new Set(entries.map((e) => e.color)).size, 7);
+
+  /* ── ②-渲染：离屏把块级 tab 整棵树跑一遍（徽标是真渲染出来的，不是读源码） ── */
+  const KINDS = ['artboard', 'card', 'container', 'pill', 'text', 'image', 'divider'];
+  const KLABEL = { artboard: '画板', card: '卡片', container: '容器', pill: '胶囊', text: '文本', image: '图片', divider: '分割线' };
+  const blocksPayload = {
+    ok: true,
+    data: {
+      name: '徽标夹具', viewport: { width: 375, height: 800 },
+      layerCount: 7, blockCount: 7, noiseCount: 0,
+      kindCounts: { artboard: 1, card: 1, container: 1, pill: 1, text: 1, image: 1, divider: 1 },
+      blocks: KINDS.map((kind, i) => ({
+        uid: kind, kind, name: 'B' + (i + 1), x: 0, y: i * 40, w: 120, h: 32,
+        radius: null, bg: null, border: null, text: null, font: null, color: null,
+        childCount: 0, path: 'Root/' + kind, noise: false,
+      })),
+    },
+  };
+
+  /** 最小 React 替身（与 ⑩/⑪ 同一套做法）：组件、状态机、渲染规则都是真代码。 */
+  function loadBadgePanel() {
+    const calls = [];
+    const fetchImpl = async (url) => {
+      const u = String(url);
+      calls.push(u);
+      return { status: 200, json: async () => (u.startsWith('/lanhu/preview') ? blocksPayload : { ok: true, data: {} }) };
+    };
+    class Component { constructor(props) { this.props = props || {}; this.state = {}; } }
+    const createElement = (type, props, ...children) => {
+      const p = Object.assign({}, props || {});
+      if (children.length === 1) p.children = children[0];
+      else if (children.length > 1) p.children = children;
+      return { type, props: p };
+    };
+    const React = {
+      createElement, Component, Fragment: 'Fragment',
+      useState: (init) => [typeof init === 'function' ? init() : init, () => {}],
+      useEffect: () => {}, useRef: (v) => ({ current: v === undefined ? null : v }),
+    };
+    let loaded = null;
+    const win = { __ModuleLoader__: { load: (m) => { loaded = m; } } };
+    new Function('window', 'console', 'fetch', clientSrc)(win, console, fetchImpl);
+    const exports = loaded.factory((id) => {
+      if (id === 'react') return React;
+      throw new Error('未提供的模块：' + id);
+    });
+    const captured = {};
+    exports.apply({
+      effect: (fn) => { const d = fn(); return typeof d === 'function' ? d : () => {}; },
+      slots: {
+        inject: (name, fn) => { fn(); return () => {}; },
+        register: (meta, comp) => { captured[meta.id] = comp; return () => {}; },
+      },
+    });
+    return { captured, calls };
+  }
+  function collectPanel(node, out, depth = 0) {
+    if (node === null || node === undefined || typeof node === 'boolean' || depth > 40) return;
+    if (Array.isArray(node)) { for (const n of node) collectPanel(n, out, depth + 1); return; }
+    if (typeof node === 'string' || typeof node === 'number') { out.text.push(String(node)); return; }
+    if (typeof node !== 'object') return;
+    const { type, props = {} } = node;
+    out.nodes.push({ type: typeof type === 'function' ? (type.name || 'anon') : String(type), props });
+    if (typeof type === 'function') {
+      let rendered;
+      try {
+        rendered = (type.prototype && typeof type.prototype.render === 'function')
+          ? new type(props).render() : type(props);
+      } catch (e) { out.errors.push((type.name || 'anon') + ': ' + String((e && e.message) || e)); return; }
+      collectPanel(rendered, out, depth + 1);
+      return;
+    }
+    collectPanel(props.children, out, depth + 1);
+  }
+  {
+    const p = loadBadgePanel();
+    const overlay = p.captured['lanhu-panel'];
+    const entry = p.captured['lanhu'];
+    ok('入口与面板都注册上了（渲染检查的前提）', typeof entry === 'function' && typeof overlay === 'function');
+    const render = () => {
+      const o = { text: [], nodes: [], errors: [] };
+      collectPanel(overlay({}), o);
+      o.text = o.text.join(' ');
+      return o;
+    };
+    // 和用户同一条路径：开面板 → 填链接 → 点「读取块级清单」（不直接改 state）
+    entry({ wide: true }).props.onClick();
+    await new Promise((r) => setTimeout(r, 15));
+    let out = render();
+    const ta = out.nodes.find((n) => n.props['data-dsh-part'] === 'url-input');
+    ok('面板上有链接输入框（先填链接才谈得上读稿）', !!ta);
+    ta.props.onChange({ target: { value: 'https://lanhuapp.com/web/#/item/project/detailDetach?pid=P&image_id=I' } });
+    await new Promise((r) => setTimeout(r, 15));
+    out = render();
+    const read = out.nodes.find((n) => n.type === 'button' && n.props.children === '读取块级清单');
+    ok('面板上有「读取块级清单」按钮', !!read);
+    read.props.onClick();
+    await new Promise((r) => setTimeout(r, 15));
+    out = render();
+    ok('块级 tab 真的渲染出了块（徽标检查不是空跑）', out.text.includes('B1'), out.text.slice(0, 120));
+    ok('面板整棵树渲染无异常（客户端绝不 throw）', out.errors.length === 0, out.errors.join('; '));
+
+    const badge = out.nodes.filter((n) => n.type === 'span'
+      && Object.values(KLABEL).includes(n.props.children)
+      && typeof (n.props.style || {}).border === 'string'
+      && n.props.style.border.startsWith('1px solid '));
+    eq('7 类徽标各渲染了一次', badge.length, 7);
+    ok('徽标的文字色与边框色用同一个令牌、且都带 fallback',
+      badge.every((b) => TOKEN_OK.test(b.props.style.color) && b.props.style.border === '1px solid ' + b.props.style.color),
+      badge.map((b) => b.props.style.color).join(' , '));
+    ok('徽标渲染出来的样式里没有裸色值',
+      badge.every((b) => !/#[0-9a-fA-F]{3,8}\b|rgba?\(/.test(stripVars(b.props.style.color + ';' + b.props.style.border))),
+      badge.map((b) => stripVars(b.props.style.border)).join(' , '));
+    eq('7 类徽标渲染出 7 个互不相同的颜色（互相可区分）',
+      new Set(badge.map((b) => b.props.style.color)).size, 7);
   }
 }
 

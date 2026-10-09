@@ -4387,9 +4387,13 @@ function shortFamily(name) {
  *
  * 两侧输入形状不同（图层给 `colors[]`（带 r/g/b/a），区块给 `bg {hex, alpha, stops[]}`），
  * 所以函数是两个；但**半透明色的 rgba 后缀只走 `rgbaSuffix()` 一处** —— hex→rgb 复用 `parseColor()`。
- * 这样 `#574af4@10% (rgba(87,74,244,.1))` 这个格式在 summary / blocks / region 三张表里必然一致。
+ * 这样 summary / blocks / region 三张表里的半透明色写法（形如 `` `#574af4@10% (rgba(87, 74, 244, 0.1))` ``）必然一致。
+ *
+ * **导出**：`lib/index.js` 的模型提示（`SYSTEM_HINT`）里那个"半透明色值长什么样"的示范**也取这个函数的
+ * 返回值**，不再手抄 —— 手抄过一次就和真值漂移了（提示里曾写成逗号后无空格、alpha 少前导 0 的形态，
+ * 而真实产出是 `rgba(87, 74, 244, 0.1)`；模型会照着错的示例去匹配）。
  */
-function bgText(bg) {
+export function bgText(bg) {
   if (!bg) return '无';
   const one = (hex, alpha) => {
     if (typeof alpha !== 'number' || alpha >= 1) return hex;
@@ -4411,7 +4415,7 @@ function fillText(colors) {
 }
 
 /**
- * 半透明色值的「可粘贴形式」后缀 —— ` (rgba(87,74,244,.1))`；不透明给空串。
+ * 半透明色值的「可粘贴形式」后缀 —— 形如 `` ` (rgba(87, 74, 244, 0.1))` ``；不透明给空串。
  *
  * ⚠️ **复用 `rgbaString()`**（verify 的颜色解析用它把 getComputedStyle 的值解析回来）——
  * 不要再写一个 rgba 转换：两份实现必然漂移，而这类"看着差不多"的漂移正是假 ❌ 的来源。
