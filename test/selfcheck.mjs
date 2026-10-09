@@ -360,6 +360,144 @@ for (const [tname, keywords] of Object.entries(DESC_MUST)) {
   }
 }
 
+/* ═══════════ ④.4b 模型面：同一事实只说一次（agent-experience 第 10 条） ═══════════ */
+group('④.4b 模型面（防重复事实）');
+
+/**
+ * 模型真正读到的那一面 = `SYSTEM_HINT`（系统提示段）+ 每个工具的 `{name, description, parameters}`。
+ *
+ * ⚠️ `output.schema` **不在**首轮提示里 —— 宿主的 `dsh-tools` 只按 `schemaOf()` 投影
+ *    `name / description / parameters` 三个字段（DeepSeek 适配器再映射成 `input_schema`），
+ *    所以"给 AI 省上下文"要改的是这三样，往 `output.schema` 里写字对模型**零影响**。
+ *
+ * ⚠️ 为什么要有这一组：**工具定义全都在同一个提示里**，所以「把细节留给工具自己的 description」
+ *    对模型来说**不额外花钱**（不用多跑一次工具、不用再读一个文件）—— 这与"延迟加载文档"不同，
+ *    重复一遍是**纯浪费**。反过来说：精简时**不许把事实删掉**，只许搬到它该在的那一面（下面有反向守卫）。
+ */
+const _hintText = (() => {
+  let t = null;
+  applyHostPlugin({
+    inject: (_svcs, fn) => fn({
+      effect: (f) => { const d = f(); return typeof d === 'function' ? d : () => {}; },
+      get: (n) => (n === 'systemPrompt'
+        ? { section: (s) => { t = s.text; return () => {}; } }
+        : { register: () => () => {} }),
+    }),
+  });
+  return t;
+})();
+const _byName = Object.fromEntries(TOOLS.map((t) => [t.name, t]));
+const _propDesc = (toolName, key) => String(_byName[toolName]?.parameters?.properties?.[key]?.description ?? '');
+/** 模型面全文（提示 + 全部描述/参数说明）—— 用来数"同一件事被说了几次"。 */
+const _modelSurface = () => [
+  _hintText,
+  ...TOOLS.flatMap((t) => [
+    String(t.description ?? ''),
+    ...Object.values(t.parameters?.properties ?? {}).map((p) => String(p?.description ?? '')),
+  ]),
+].join('\n');
+
+ok('拿到模型真正读到的那份 SYSTEM_HINT（不是源码里的拼接表达式）',
+  typeof _hintText === 'string' && _hintText.length > 500, `长度 ${_hintText ? _hintText.length : 0}`);
+
+/* —— ① 决策树只回答「选哪个」，不再复述工具产出清单（产出归工具自己的 description） —— */
+{
+  const OWNED_ELSEWHERE = [
+    '多做的三件事',        // → lanhu_gen_code.description
+    '渐变文字补',          // → lanhu_gen_code.description
+    '四态报告',            // → lanhu_verify_blocks.description
+    '末尾还附「间距一览」',  // → lanhu_read_blocks.description
+    '命中不了就明说',       // → lanhu_read_blocks.description / comments 参数
+    '从 2 次请求变 3 次',   // → comments 参数
+    '判据 = 层名归一化',    // → lanhu_audit_project.description
+    '不静默回退到最新版',    // → version / from 参数
+  ];
+  const back = OWNED_ELSEWHERE.filter((s) => _hintText.includes(s));
+  ok('决策树不复述工具产出清单（哪条又写回 SYSTEM_HINT 就红）', back.length === 0,
+    back.length ? `又写回去了：${back.join('、')}` : `${OWNED_ELSEWHERE.length} 条都没写回去`);
+  // 反向守卫：**搬走 ≠ 删掉**。这些事实必须还在它该在的那一面（否则就是"精简"成了"丢信息"）。
+  for (const [cond, label] of [
+    [String(_byName.lanhu_gen_code.description).includes('background-clip'), '三处代码差异仍在 lanhu_gen_code 描述里'],
+    [String(_byName.lanhu_read_blocks.description).includes('间距一览'), '「间距一览」仍在 lanhu_read_blocks 描述里'],
+    [String(_byName.lanhu_diff_design.description).includes('逐块对比不可靠'), 'diff 的可靠度判据仍在 lanhu_diff_design 描述里'],
+    [String(_byName.lanhu_audit_project.description).includes('拒绝出明细'), 'audit 的「拒绝出明细」仍在 lanhu_audit_project 描述里'],
+  ]) ok(`搬走不是删掉：${label}`, cond);
+}
+
+/* —— ② 参数级规则写在参数上，别写进工具描述（第 9 条） —— */
+{
+  const cdesc = _propDesc('lanhu_read_blocks', 'comments');
+  ok('comments 的开/关与成本只在 comments 参数上（read_blocks 描述里不再提）',
+    !String(_byName.lanhu_read_blocks.description).includes('comments:false')
+    && !String(_byName.lanhu_read_blocks.description).includes('不需要评论时')
+    && /默认/.test(cdesc) && /多 1~N 次请求/.test(cdesc) && /只读/.test(cdesc),
+    cdesc.slice(0, 60));
+  const alimit = _propDesc('lanhu_audit_project', 'limit');
+  ok('audit 的成本只说一次（工具描述里说，limit 参数只留默认值/硬上限）',
+    !/2 次请求|2N|两次请求/.test(alimit) && /硬上限/.test(alimit)
+    && /2N 次请求/.test(String(_byName.lanhu_audit_project.description)),
+    alimit);
+  ok('「不静默回退」的规则只在 version / from 参数上（decription 里不再复述）',
+    !/静默回退/.test(String(_byName.lanhu_diff_design.description))
+    && /静默回退/.test(_propDesc('lanhu_diff_design', 'from'))
+    && /静默回退/.test(_propDesc('lanhu_read_design', 'version')));
+  ok('read_product_doc 的两步读法写在 pageId 参数上，不在工具描述里',
+    !String(_byName.lanhu_read_product_doc.description).includes('先不带 pageId')
+    && /先不带它调一次/.test(_propDesc('lanhu_read_product_doc', 'pageId')));
+  ok('verify_spec 不再描述内部引擎（puppeteer / Playwright / getComputedStyle）',
+    !/puppeteer|Playwright|getComputedStyle/i.test(String(_byName.lanhu_verify_spec.description)));
+}
+
+/* —— ③ rpx 换算公式只有一处（系统提示的【换算】），参数只指路 —— */
+{
+  const FORMULA = 'rpx = px × 750 ÷ 画板宽';
+  const hits = _modelSurface().split(FORMULA).length - 1;
+  ok(`换算公式在模型面里只出现一次（现在 ${hits} 处；参数里再抄一遍就红）`, hits === 1, `出现 ${hits} 处`);
+  ok('那一处就在【换算】段', _hintText.includes(FORMULA));
+  ok('gen_code.target 指路而不是再抄一遍公式',
+    /换算基准见系统提示【换算】/.test(_propDesc('lanhu_gen_code', 'target')));
+}
+
+/* —— ④ 「整条贴链接」的便利只在系统提示 + url 参数上说，工具描述不再各抄一遍 —— */
+{
+  const dup = TOOLS.filter((t) => String(t.description).includes('直接粘贴蓝湖链接即可')).map((t) => t.name);
+  ok('工具描述里不再重复「直接粘贴蓝湖链接即可」', dup.length === 0, dup.join('、'));
+  ok('搬走不是删掉：url 参数与系统提示都还留着它',
+    /整条粘贴/.test(_propDesc('lanhu_read_blocks', 'url')) && _hintText.includes('贴整条蓝湖链接最省事'));
+}
+
+/* —— ⑤ 删掉「评论段的读法」那段的依据：这几件事**结果文本自己**就说了 —— */
+{
+  ok('读不到评论时，结果文本自己说明「不等于没有评论」',
+    /这不代表"没人留评论"/.test(renderComments({ error: 'boom' })),
+    renderComments({ error: 'boom' }).slice(0, 50));
+  const loose = renderComments({
+    items: [{
+      id: 'c1', content: 'x', unread: false, user: { name: 'u' },
+      anchor: { reason: 'blank', x: 1, y: 2, block: { label: '卡片', w: 10, h: 10 }, distance: 12 },
+    }],
+  });
+  ok('落在空白处时，结果文本自己说明「只是线索，不是命中」', /只是线索，不是命中/.test(loose), loose.slice(0, 80));
+  ok('提示里不再复述这些（复述=与每次都会读到的结果文本重复）',
+    !_hintText.includes('线索不是命中') && !_hintText.includes('评论段的读法'));
+}
+
+/* —— ⑥ 反向守卫：精简不许退化成删空 —— */
+{
+  const thin = TOOLS.filter((t) => String(t.description ?? '').trim().length < 20).map((t) => t.name);
+  ok('每个工具都还有像样的 description（没被删空）', thin.length === 0, thin.join('、'));
+  const bullets = (_hintText.match(/^· /gm) ?? []).length;
+  ok('决策树仍然逐条回答「什么时候用哪个」（≥8 条）', bullets >= 8, `${bullets} 条`);
+}
+
+/* —— ⑦ 预算闸门：这是**棘轮**，故意抬它必须是一次有意识的改动 —— */
+{
+  ok(`SYSTEM_HINT 不超预算（现 ${_hintText.length} / 预算 2400 字符）`, _hintText.length <= 2400, `现 ${_hintText.length}`);
+  const chars = _hintText.length + TOOLS.reduce((a, t) => a
+    + JSON.stringify({ name: t.name, description: t.description, parameters: t.parameters }).length, 0);
+  ok(`模型面首轮提示不超预算（现 ${chars} / 预算 19800 字符）`, chars <= 19800, `现 ${chars}`);
+}
+
 /* ═══════════════ ④.5 lossless JSON（宿主会拒收整个结果） ═══════════════ */
 group('④.5 lossless JSON');
 

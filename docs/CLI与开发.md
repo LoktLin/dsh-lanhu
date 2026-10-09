@@ -69,9 +69,28 @@ node lanhu.mjs cookie --clipboard --dry-run  # 只看解析结果，不写入
 ## 本地自检
 
 ```bash
-node test/selfcheck.mjs          # 1509 项，纯离线、秒级
+node test/selfcheck.mjs          # 1532 项，纯离线、秒级
 node test/selfcheck.mjs --json   # 机器可读
 ```
+
+### 量「模型面」有多大
+
+改 `description` / 参数说明 / `SYSTEM_HINT` 就是**改首轮提示**，而它的代价没有任何东西会报错。
+所以量一下（同一口径，改前改后各跑一次）：
+
+```bash
+node tools/measure-model-surface.mjs            # 当前工作树
+node tools/measure-model-surface.mjs --rev HEAD # 改前基线（从 git 里取那份 lib/index.js）
+node tools/measure-model-surface.mjs --detail   # 逐个工具
+```
+
+口径有两项，**别只看第一项**：① **宿主口径** —— 与 `@deepseek-ai/dsh-token-meter/estimate` 同一个公式
+（`ceil(chars / 4) + 4`），这是宿主给上下文计价的数（脚本会尝试导入真实模块对拍）；
+② **CJK 口径** —— `中文字数 × 1 + 其余/4`，更接近真实分词。本插件的提示与描述几乎全是中文，
+**宿主口径会低估 3~4 倍**，所以省中文的收益比它显示的大。
+
+⚠️ `output.schema` **不在模型面里**：宿主的 `dsh-tools` 只把 `name / description / parameters`
+投影给模型（DeepSeek 适配器再映射成 `input_schema`），所以往 `output.schema` 里写说明**对模型零影响**。
 
 覆盖最**容易静默坏掉**的地方：链接解析（hash 路由）、工具参数校验、块级模型分类、工具定义形状、
 lossless JSON、CLI 入口守卫、图片元信息、字体族判定、坐标映射、输出完整性、
@@ -89,7 +108,10 @@ Client 侧：下拉里带「N 版」、只有 1 版的置灰并写明原因、�
 加载中有进度行、开面板**不**探、点「继续加载」只探下一批（offset 不重复）、探数失败不崩）、
 **模型提示里的示例与实现同源**（色值示例直接取 `bgText()` 的返回值，源码里不存第二个字面量；全项目的
 `rgba(…)` 示例都必须等于实现产出的形态）、**块类型徽标令牌化**（7 类各取一个互不相同的令牌 + fallback，
-源码与离屏真渲染两道都查裸色值）。
+源码与离屏真渲染两道都查裸色值）、
+**模型面不许同一件事说两遍**（决策树不复述工具产出清单、参数级规则不许写进工具描述、
+`rpx` 换算公式全模型面只出现一次、预算闸门 —— 同时用**反向守卫**钉住"搬走≠删掉"：
+被精简掉的事实必须还在它该在的那一面；这几条都做过变异测试，写回去就红）。
 它跑在临时数据目录（`LANHU_HOME`），**绝不碰你的真实账号与 Cookie**。
 
 > 自检里对每项能力都配了**正反例**（例如"父组可见 → 子层进表"和"父组隐藏 → 子层不进表"同时断言）——
