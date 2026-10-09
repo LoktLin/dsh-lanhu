@@ -136,6 +136,13 @@ export const LIMITS = Object.freeze({
   auditRadiusScale: Object.freeze([0, 2, 4, 6, 8, 10, 12, 14, 16, 20, 24, 28, 32, 40, 48, 64, 9999]),
   auditOffScaleMinValues: 3,    // 不在刻度上的圆角值达到这么多个 → 报「圆角特例」（参考项）
   auditEpsilon: 0.01,           // 浮点容差（判"落没落在栅格/刻度上"）
+  // —— 面板「稿」下拉的版本数（§6.7，批量探版本数）——
+  //    成本模型：**一张稿 = 1 次请求**（只读 image 元信息里的 versions，不拉图层树）。
+  //    一个项目动辄两三百张，所以面板是**分批按需**探（选中项目 / 贴链接之后才探第一批），
+  //    默认值 = 面板一批探多少张；硬上限 = "不许无限拉取"这条铁律的落点。
+  versionsCountDefault: 30,     // 默认一批探多少张稿（面板不传 limit 时用它）
+  versionsCountMax: 100,        // **硬上限**：limit 传再大也不超过它
+  versionsCountConcurrency: 4,  // 同时在飞的最大请求数（与审计同口径：提速，同时对接口礼貌）
 });
 
 

@@ -4566,6 +4566,273 @@ group('⑪ 面板「体检」Tab');
     eq('非本机访问 /lanhu/designs → 403', (await call(handler, mkReq('/lanhu/designs?pid=' + PID, 'GET', null, '10.0.0.9'))).status, 403);
     eq('非本机访问 /lanhu/diff → 403', (await call(handler, mkReq('/lanhu/diff', 'POST', { from: V4 }, '10.0.0.9'))).status, 403);
   }
+
+  /* ── ⑪b Host：批量版本数端点 /lanhu/versions-count（面板「稿」下拉的「N 版」） ── */
+  group('⑪b Host：批量版本数端点');
+  {
+    const mkReq = (url, method = 'GET', body = null, addr = '127.0.0.1') => ({
+      url, method, headers: {}, socket: { remoteAddress: addr },
+      [Symbol.asyncIterator]: async function* () { if (body !== null) yield Buffer.from(JSON.stringify(body), 'utf8'); },
+    });
+    const call = async (handler, req) => {
+      const out = { status: 0, body: null, threw: undefined };
+      const resp = { writeHead(s) { out.status = s; }, end(t) { out.body = JSON.parse(t); } };
+      try { await handler(req, resp); } catch (e) { out.threw = e; }
+      return out;
+    };
+
+    const VC_PID = 'c0ffee00-1111-4222-8333-444455556666';
+    // 140 张：既够验证「默认 30」也够验证「硬上限 100」压回
+    const MANY = Array.from({ length: 140 }, (_, i) => ({ imageId: 'img-' + String(i).padStart(3, '0'), name: '稿' + (i + 1) }));
+    const mkHandler = (over = {}) => {
+      const seen = { calls: [], maxFly: 0, fly: 0 };
+      const h = makeLanhuHandler(Object.assign({
+        checkAuth: async () => ({ ok: true, account: 'acme', teamCount: 1 }),
+        pickAccount: async () => ({ alias: 'quanzi', by: 'index' }),
+        listImages: async () => ({ projectName: '大项目', images: MANY }),
+        imageVersions: async (pid, iid) => {
+          seen.calls.push(iid);
+          seen.fly += 1; seen.maxFly = Math.max(seen.maxFly, seen.fly);
+          await new Promise((r) => setTimeout(r, 1));
+          seen.fly -= 1;
+          if (iid === 'img-003') throw new Error('这一张炸了（桩）');
+          return { name: iid, versions: iid === 'img-004' ? [{ id: 'only' }] : [{ id: 'v2-' + iid }, { id: 'v1-' + iid }] };
+        },
+      }, over));
+      return { h, seen };
+    };
+
+    const a = mkHandler();
+    const r1 = await call(a.h, mkReq('/lanhu/versions-count?pid=' + VC_PID));
+    eq('GET /lanhu/versions-count → 200（{ok,data} 信封与既有路由一致）', r1.status, 200);
+    eq('信封是 ok:true', r1.body?.ok, true);
+    eq('默认一批只探 30 张（不传 limit 不许无限拉）', a.seen.calls.length, 30);
+    eq('回包里写明实际用的上限', r1.body?.data?.limit, 30);
+    eq('回包里带项目总张数（面板据此算"还剩多少"）', r1.body?.data?.total, 140);
+    eq('结果条数与本批一致', (r1.body?.data?.images ?? []).length, 30);
+    eq('结果顺序与稿列表一致（并发不影响输出顺序）', r1.body?.data?.images?.[0]?.imageId, 'img-000');
+    eq('latestVersionId 取版本列表第 0 条（与 /lanhu/versions 同口径）', r1.body?.data?.images?.[0]?.latestVersionId, 'v2-img-000');
+    eq('并发用满 4（快了，同时对蓝湖礼貌）', a.seen.maxFly, 4);
+    ok('并发**没有**超过 4', a.seen.maxFly <= 4, String(a.seen.maxFly));
+
+    const failed = r1.body?.data?.images?.[3];
+    eq('单张失败只标 ok:false（整条请求照样 200）', failed?.ok, false);
+    eq('失败那条的版本数是 null —— 是"没探到"，不是"0 个"', failed?.versionCount, null);
+    ok('失败那条带上原话（能排查）', /炸了/.test(failed?.error || ''), failed?.error);
+    ok('同一批里其它稿照样成功（互不牵连）',
+      (r1.body?.data?.images ?? []).slice(0, 3).every((x) => x.ok === true && x.versionCount === 2),
+      JSON.stringify((r1.body?.data?.images ?? []).slice(0, 3)));
+    eq('确实只有 1 个版本的那张：versionCount=1（面板据此置灰）', r1.body?.data?.images?.[4]?.versionCount, 1);
+
+    const b = mkHandler();
+    const r2 = await call(b.h, mkReq('/lanhu/versions-count?pid=' + VC_PID + '&limit=5000'));
+    eq('limit 传 5000 → 被硬上限 100 压回（不靠调用方自觉）', b.seen.calls.length, 100);
+    eq('回包里的 limit 也是夹过的值', r2.body?.data?.limit, 100);
+
+    const c = mkHandler();
+    const r3 = await call(c.h, mkReq('/lanhu/versions-count?pid=' + VC_PID + '&offset=30&limit=5'));
+    eq('offset 真的分页（从第 31 张开始）', r3.body?.data?.images?.[0]?.imageId, 'img-030');
+    eq('分页时只探这 5 张', c.seen.calls.length, 5);
+    eq('offset 原样回给调用方（面板据此推游标）', r3.body?.data?.offset, 30);
+
+    const d = mkHandler();
+    const r4 = await call(d.h, mkReq('/lanhu/versions-count?pid=' + VC_PID + '&offset=-3&limit=abc'));
+    eq('offset/limit 是垃圾值时回落 offset=0 / 默认 30（不炸、不无限）',
+      [r4.body?.data?.offset, r4.body?.data?.limit], [0, 30]);
+
+    const e = mkHandler();
+    const r5 = await call(e.h, mkReq('/lanhu/versions-count?url=' + encodeURIComponent('https://lanhuapp.com/web/#/item/project/detailDetach?pid=' + VC_PID)));
+    eq('也认整条链接（与 /lanhu/designs 同一个解析）', r5.body?.data?.projectId, VC_PID);
+
+    eq('缺 pid → 400（不静默给空列表）', (await call(a.h, mkReq('/lanhu/versions-count'))).status, 400);
+    eq('非本机 → 403（新路由同样守门）',
+      (await call(a.h, mkReq('/lanhu/versions-count?pid=' + VC_PID, 'GET', null, '10.0.0.9'))).status, 403);
+
+    const f = mkHandler({ listImages: async () => { throw new Error('列稿炸了（桩）'); } });
+    const r6 = await call(f.h, mkReq('/lanhu/versions-count?pid=' + VC_PID));
+    eq('列稿失败 → 收敛成 {ok:false} 信封（HTTP 仍 200，不 500）', r6.status, 200);
+    ok('列稿失败带原话', /列稿炸了/.test(r6.body?.error || ''), JSON.stringify(r6.body));
+    eq('列稿失败也不许把 handler 炸掉', r6.threw, undefined);
+
+    ok('新端点挂在 /lanhu 前缀的子路径上（没开第二条通道）',
+      /route === '\/lanhu\/versions-count'/.test(idxSrc), '');
+    eq('仍然只有一条 /lanhu 路由', (idxSrc.match(/path:\s*'\/lanhu'/g) ?? []).length, 1);
+    // 上限进 LIMITS（单一出口），不许在逻辑里裸写数字
+    const { LIMITS: L2 } = await import('../lanhu.mjs');
+    eq('LIMITS 里登记了默认上限 30', L2.versionsCountDefault, 30);
+    eq('LIMITS 里登记了硬上限 100', L2.versionsCountMax, 100);
+    eq('LIMITS 里登记了并发 4', L2.versionsCountConcurrency, 4);
+    const seg = idxSrc.slice(idxSrc.indexOf('async function imageVersionCounts'), idxSrc.indexOf('export function makeLanhuHandler'))
+      .replace(/\/\*[\s\S]*?\*\//g, '').replace(/\/\/[^\n]*/g, '');   // 注释里的"默认 30 / 硬上限 100"是说明，不算裸数字
+    ok('批量逻辑里的上限全部走 LIMITS（代码里没有裸写 30/100）',
+      /LIMITS\.versionsCount(Default|Max|Concurrency)/.test(seg) && !/\b(30|100)\b/.test(seg.replace(/LIMITS\.[A-Za-z]+/g, 'LIMITS')),
+      seg.match(/\b(30|100)\b/g)?.join(',') || '');
+  }
+
+  /* ── ⑪c Client：「稿」下拉的版本数（1 版置灰 / 未知不禁用 / 分批探） ── */
+  group('⑪c Client：稿下拉的版本数');
+  {
+    const VC_PID = 'aa11bb22-3333-4444-8555-666677778888';
+    const designs32 = Array.from({ length: 32 }, (_, k) => ({ imageId: 'vc-' + String(k + 1).padStart(2, '0'), name: '稿' + String(k + 1).padStart(2, '0') }));
+    const batch1 = designs32.slice(0, 30).map((d, i) => (i === 1
+      ? { imageId: d.imageId, versionCount: 1, latestVersionId: 'v1', ok: true }               // 只有 1 版 → 置灰
+      : (i === 4
+        ? { imageId: d.imageId, versionCount: null, latestVersionId: null, ok: false, error: '蓝湖返回空壳' }  // 探失败 → 不禁用
+        : { imageId: d.imageId, versionCount: 3, latestVersionId: 'v' + i, ok: true })));
+    const batch2 = [
+      { imageId: designs32[30].imageId, versionCount: 4, latestVersionId: 'v30', ok: true },
+      { imageId: designs32[31].imageId, versionCount: 1, latestVersionId: 'v31', ok: true },
+    ];
+    const VC_RESPONSES = Object.assign({}, baseResponses, {
+      '/lanhu/accounts': {
+        ok: true,
+        data: { default: 'acme', accounts: [{ alias: 'acme', company: '示例', isDefault: true, hasCookie: true, projects: [{ projectId: VC_PID, name: '32 张稿的项目' }] }] },
+      },
+      ['/lanhu/designs?pid=' + VC_PID]: { ok: true, data: { projectId: VC_PID, imageId: null, projectName: '32 张稿的项目', images: designs32 } },
+      ['/lanhu/versions-count?pid=' + VC_PID + '&offset=0&limit=30']: { ok: true, data: { projectId: VC_PID, total: 32, offset: 0, limit: 30, images: batch1 } },
+      ['/lanhu/versions-count?pid=' + VC_PID + '&offset=30&limit=30']: { ok: true, data: { projectId: VC_PID, total: 32, offset: 30, limit: 30, images: batch2 } },
+    });
+    const vcCalls = (p) => p.calls.filter((u) => u.startsWith('/lanhu/versions-count'));
+    const designItems = (out) => {
+      const sel = byPart(out, 'fit-design')[0];
+      if (!sel) return [];
+      return (Array.isArray(sel.props.children) ? sel.props.children : [sel.props.children])
+        .filter((c) => c && c.type === 'option')
+        .map((c) => ({ value: c.props.value, label: c.props.children, disabled: c.props.disabled === true, title: c.props.title }));
+    };
+    const at = (out, v) => designItems(out).filter((o) => o.value === v)[0] || {};
+    const moreBtn = (out) => {
+      const box = byPart(out, 'fit-vc-more')[0];
+      if (!box) return null;
+      return (Array.isArray(box.props.children) ? box.props.children : [box.props.children])[0];
+    };
+    // ⚠️ 这两个用**防御式**写法：面板被改坏时给出"断言失败"而不是让自检当场崩掉
+    //    （崩掉的话后面的断言一条都报不出来，变异测试就只能看到一句 TypeError）。
+    const pickProject = (out, value) => {
+      const sel = byPart(out, 'fit-project')[0];
+      if (!sel) return false;
+      sel.props.onChange({ target: { value: value || opts(sel)[1] } });
+      return true;
+    };
+    const clickMore = (out) => { const b = moreBtn(out); if (b) b.props.onClick(); return Boolean(b); };
+
+    /* ① 触发时机：开面板不探（一个项目 252 张稿 = 252 次请求，绝不能挂在打开动作上） */
+    const h = await mountFit({ responses: VC_RESPONSES });
+    ok('面板打开后一个 versions-count 请求都没发（触发点是「选中项目」，不是「打开面板」）',
+      vcCalls(h.p).length === 0, h.p.calls.join(', '));
+    ok('开面板也没有偷偷去列稿（没有 /lanhu/designs）',
+      !h.p.calls.some((u) => u.startsWith('/lanhu/designs')), h.p.calls.join(', '));
+    // ⚠️ 上面两条只覆盖"真的执行了"的路径；自检的 React 替身里 useEffect 是空实现，
+    //    所以再加两条**源码级**的：触发点必须长在 loadFitDesigns 里，且全项目只有这两处调用
+    //    （定义 + 触发 + 「继续加载」按钮 = 3；多一处就是在别处偷偷触发了）。
+    ok('触发点就长在 loadFitDesigns 里（选中项目 / 贴链接之后）',
+      /probeFitVersionCounts\(\);/.test(clientSrc.slice(clientSrc.indexOf('function loadFitDesigns'), clientSrc.indexOf('function loadFitVersions'))), '');
+    eq('probeFitVersionCounts 全项目只有 3 处出现（定义 + loadFitDesigns 触发 + 继续加载按钮）',
+      (clientSrc.match(/probeFitVersionCounts\(/g) ?? []).length, 3);
+
+    /* ② 选中项目 → 才探第一批 */
+    const proj = byPart(h.out, 'fit-project')[0];
+    ok('选中项目之前版本数就是空的（没什么可探）', vcCalls(h.p).length === 0, vcCalls(h.p).join(', '));
+    if (proj) proj.props.onChange({ target: { value: opts(proj)[1] } });
+    await tick(); await tick();
+    h.out = h.render();
+    eq('选中项目之后才探第一批（1 次）', vcCalls(h.p).length, 1);
+    eq('第一批 offset=0、limit=30（面板也守着"一批 30 张"）',
+      vcCalls(h.p)[0], '/lanhu/versions-count?pid=' + VC_PID + '&offset=0&limit=30');
+
+    /* ③ 下拉里带版本数 / 1 版置灰 / 探失败不禁用 */
+    eq('32 张稿一条都没被藏起来（置灰 ≠ 消失）', designItems(h.out).length, 33);
+    eq('多版本的稿标出确切版本数', at(h.out, 'vc-01').label, '稿01（3 版）');
+    eq('1 个版本的稿也标出来', at(h.out, 'vc-02').label, '稿02（1 版）');
+    eq('只有 1 个版本 → 置灰不可选（没有可对比的）', at(h.out, 'vc-02').disabled, true);
+    ok('1 版那条顺手给出原因（鼠标停上去就看得到）',
+      String(at(h.out, 'vc-02').title || '').includes('只有 1 个版本，没有可对比的'), String(at(h.out, 'vc-02').title));
+    eq('多版本的稿**不**置灰（能点的照常能点）', at(h.out, 'vc-01').disabled, false);
+    eq('探失败的稿标成「版本数未知」', at(h.out, 'vc-05').label, '稿05（版本数未知）');
+    eq('探失败的稿**照常可选**（拿不准时不要误伤）', at(h.out, 'vc-05').disabled, false);
+
+    const hint = (byPart(h.out, 'fit-vc-hint')[0] || {}).props;
+    ok('界面说清了「1 版为什么不能点」',
+      !!hint && String(hint.children).includes('1 张只有 1 个版本，已置灰（没有可对比的）'), hint ? String(hint.children) : '没有');
+    ok('界面也说清了「探不到的照常可选」',
+      !!hint && String(hint.children).includes('1 张版本数未知（照常可选，不误伤）'), hint ? String(hint.children) : '没有');
+
+    /* ④ 继续加载：只探没探过的 */
+    ok('还有没探的稿 → 给出「继续加载」入口', !!moreBtn(h.out), JSON.stringify(byPart(h.out, 'fit-vc-more').length));
+    ok('「继续加载」写明还剩多少张 + 成本口径',
+      String(moreBtn(h.out).props.label).includes('还剩 2 张')
+        && String(moreBtn(h.out).props.title).includes('没探过'),
+      String(moreBtn(h.out).props.label) + ' / ' + String(moreBtn(h.out).props.title));
+    ok('点得动「继续加载」', clickMore(h.out));
+    await tick(); await tick();
+    h.out = h.render();
+    eq('点「继续加载」才发第二批（一开始只探了 30 张，没有全量探）', vcCalls(h.p).length, 2);
+    eq('第二批从 offset=30 起（**探过的绝不重探**）',
+      vcCalls(h.p)[1], '/lanhu/versions-count?pid=' + VC_PID + '&offset=30&limit=30');
+    eq('两批的 offset 互不相同（没有原地重复探）',
+      new Set(vcCalls(h.p).map((u) => /offset=(\d+)/.exec(u)[1])).size, 2);
+    eq('探完之后：31 张有「N 版」（32 张里 1 张探失败）',
+      designItems(h.out).filter((o) => /（\d+ 版）$/.test(String(o.label))).length, 31);
+    eq('第二批里的 1 版稿同样置灰', at(h.out, 'vc-32').disabled, true);
+    eq('都探完了 → 「继续加载」自己消失', byPart(h.out, 'fit-vc-more').length, 0);
+
+    /* ⑤ 加载中：必须有明确状态（不能让人以为卡死） */
+    const h2 = await mountFit({ responses: VC_RESPONSES, hangUrl: '/lanhu/versions-count' });
+    pickProject(h2.out);
+    await tick(); await tick();
+    h2.out = h2.render();
+    const prog = (byPart(h2.out, 'fit-vc-progress')[0] || {}).props;
+    ok('正在探版本数时有一行明确进度', !!prog, JSON.stringify(byPart(h2.out, 'fit-vc-progress').length));
+    ok('进度写明探到哪 / 共多少 / 本次几张',
+      !!prog && String(prog.children).includes('正在读取版本数（0/32，本次 30 张）'), prog ? String(prog.children) : '');
+    eq('还没探到的稿在选项里后缀「…」（下拉本身也看得出在加载）', at(h2.out, 'vc-01').label, '稿01（…）');
+    eq('加载中不给「继续加载」（防重复点）', byPart(h2.out, 'fit-vc-more').length, 0);
+    ok('加载中整棵树照常渲染（没抛错）', h2.out.errors.length === 0, h2.out.errors.join('; '));
+
+    /* ⑥ fetch 挂了：只显示错误，绝不 throw，也不禁用 */
+    const h3 = await mountFit({ responses: VC_RESPONSES, failUrl: '/lanhu/versions-count' });
+    pickProject(h3.out);
+    await tick(); await tick();
+    h3.out = h3.render();
+    ok('版本数取数失败时整棵树照常渲染（没抛错）', h3.out.errors.length === 0, h3.out.errors.join('; '));
+    const err = (byPart(h3.out, 'fit-vc-error')[0] || {}).props;
+    ok('失败显示在界面上（❌ + 原话 + "照常可选"）',
+      !!err && /❌ fetch failed/.test(String(err.children)) && /照常可选/.test(String(err.children)), err ? String(err.children) : '没有');
+    ok('这一批的稿全都标成「版本数未知」', designItems(h3.out).slice(1, 31).every((o) => /（版本数未知）$/.test(String(o.label))),
+      designItems(h3.out).slice(1, 3).map((o) => o.label).join(' , '));
+    ok('探失败的稿**一个都没被禁用**（别因为拿不准就误伤）',
+      designItems(h3.out).every((o) => o.disabled === false), JSON.stringify(designItems(h3.out).filter((o) => o.disabled).map((o) => o.label)));
+    ok('失败后还能重试（「继续加载」还在）', !!moreBtn(h3.out));
+    ok('点得动「继续加载」（重试入口）', clickMore(h3.out));
+    await tick(); await tick();
+    h3.out = h3.render();
+    eq('重试仍从 offset=0 起 —— 失败的那批本来就没探成，这是「重试」不是「重复探已探过的」',
+      vcCalls(h3.p)[1], '/lanhu/versions-count?pid=' + VC_PID + '&offset=0&limit=30');
+
+    /* ⑦ 颜色铁律：新节点的样式全走令牌 + fallback（无裸色值） */
+    const stripVars = (v) => {
+      let out = ''; let i = 0;
+      for (;;) {
+        const i2 = v.indexOf('var(', i);
+        if (i2 < 0) { out += v.slice(i); return out; }
+        out += v.slice(i, i2);
+        let depth = 0; let j = i2 + 3;
+        for (; j < v.length; j += 1) {
+          if (v[j] === '(') depth += 1;
+          else if (v[j] === ')') { depth -= 1; if (depth === 0) { j += 1; break; } }
+        }
+        i = j;
+      }
+    };
+    const vcStyles = h3.out.nodes
+      .filter((n) => /^fit-vc-/.test(String(n.props['data-dsh-part'] || '')) || n.props['data-dsh-part'] === 'fit-design')
+      .flatMap((n) => Object.values(n.props.style || {}).filter((v) => typeof v === 'string'));
+    const bare = vcStyles.filter((v) => /#[0-9a-fA-F]{3,8}\b|rgba?\(/.test(stripVars(v)));
+    const noFallback = vcStyles.filter((v) => v.includes('var(') && !/var\(--[\w-]+,\s*[^)]+\)/.test(v));
+    ok('确实检查到了新节点的样式（不是空跑）', vcStyles.length >= 5, String(vcStyles.length));
+    ok('「N 版」那几行的颜色全走令牌（没有裸色值）', bare.length === 0, bare.join(' | '));
+    ok('令牌都带 fallback（用户皮肤下不会变成透明/看不清）', noFallback.length === 0, noFallback.join(' | '));
+  }
 }
 
 /* ═══════════════ ⑫ 提示示例与真值同源 + 块类型徽标令牌化 ═══════════════ */
