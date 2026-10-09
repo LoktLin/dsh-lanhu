@@ -1495,6 +1495,63 @@ group('⑥.15b Sketch 插件格式（type: sketchPlugin）');
     ok('★ read_design 同样不多键、不加来源段',
       !Object.prototype.hasOwnProperty.call(d, 'sourceFormat') && !d.text.includes('Sketch 插件导出'));
   }
+
+  /* ⑩ 阴影 / 模糊的**字段名按来源格式分两套**（生成代码那条链的实测缺陷）
+   *
+   * `sketchLayerOf()` 把 `info[]` 的 `shadow` / `blur` **原样**塞进 `style.shadows` / `style.blurs`
+   * （只迁了 fills/borders 的字段名），所以 Sketch 用的名字必须在这里也认：
+   *   · 阴影：`blurRadius` / `offsetX` / `offsetY` / `type: 外阴影|内阴影`（Figma 是 `blur`/`x`/`y`/`inset`）
+   *   · 模糊：类型给**中文** `背景模糊`（Figma 是 `Background`）
+   * 只认 Figma 那套的后果**实测于稿 `71a30d33`（资源库）**：
+   *   发光按钮 → `box-shadow: 0px 0px 0px 0px #5cc93b`（发光整条丢掉、数值却完全合法）；
+   *   毛玻璃 → `filter: blur(10px)`（模糊的是元素自己，不是背后的内容）。
+   * 这一组走**真链路**：sketchPlugin 的 `info[]` → 归一化 → rich 摊平 → 生成 CSS。
+   */
+  {
+    const sp = {
+      type: 'sketchPlugin', ArtboardID: 'AB', pageName: '发光',
+      info: [
+        { id: 'AB', name: '画板', ddsType: 'artboard-group', left: 0, top: 0, width: 375, height: 400 },
+        // 发光按钮：Sketch 的名字 `blurRadius` / `offsetX` / `offsetY` / `type: 外阴影`
+        { id: 'GLOW', name: '找机构', type: 'shape', ddsType: 'rectangle', parentID: 'AB',
+          left: 20, top: 40, width: 112, height: 44, isVisible: true, opacity: 100, radius: [22],
+          fills: [{ type: 'color', color: { value: 'rgba(92,201,59,1)' } }],
+          shadow: [{ isEnabled: true, type: '外阴影', blurRadius: 30, offsetX: 0, offsetY: 0, spread: 0,
+            color: { value: 'rgba(92,201,59,1)' } }] },
+        // 毛玻璃：模糊类型是**中文** `背景模糊` → 必须走 backdrop-filter
+        { id: 'GLASS', name: '毛玻璃', type: 'shape', ddsType: 'rectangle', parentID: 'AB',
+          left: 20, top: 120, width: 120, height: 90, isVisible: true, opacity: 100, radius: [4],
+          fills: [{ type: 'color', color: { value: 'rgba(245,255,241,1)' } }],
+          blur: { isEnabled: true, type: '背景模糊', radius: 10, blurType: 3 } },
+        // 内阴影：Sketch 用 `type: 内阴影`（没有 Figma 的 `inset` 布尔）
+        { id: 'INNER', name: '内阴影块', type: 'shape', ddsType: 'rectangle', parentID: 'AB',
+          left: 20, top: 240, width: 100, height: 40, isVisible: true, opacity: 100,
+          fills: [{ type: 'color', color: { value: 'rgba(255,255,255,1)' } }],
+          shadow: [{ isEnabled: true, type: '内阴影', blurRadius: 8, offsetX: 0, offsetY: 2, spread: 0,
+            color: { value: 'rgba(0,0,0,0.2)' } }] },
+      ],
+    };
+    const norm = normalizeSketchPluginTree(sp);
+    const ls = flattenArtboard(norm.artboard, { rich: true });
+    const bs = buildBlocks(ls);
+    const meta = { name: '发光', width: 375, height: 400, origin: { x: 0, y: 0 } };
+    const built = buildCodeItems(bs, ls, meta, { target: 'web' });
+    const lines = (label) => (built.items.find((it) => it.label === label)?.web) ?? [];
+    const glow = lines('找机构');
+    const glass = lines('毛玻璃');
+    const inner = lines('内阴影块');
+    ok('★ Sketch 的 `blurRadius` / `offsetX` / `offsetY` 要认（只认 Figma 的 blur/x/y 会把发光抹成 0px）',
+      glow.includes('box-shadow: 0px 0px 30px 0px #5cc93b;'), glow.join(' '));
+    ok('★ Sketch 的模糊类型 `背景模糊` 要认（认不出会错写成 filter：模糊元素自己而不是背后的内容）',
+      glass.includes('backdrop-filter: blur(10px);') && !glass.some((l) => l.startsWith('filter:')), glass.join(' '));
+    ok('★ Sketch 的 `type: 内阴影` → inset（Figma 才有 inset 布尔，Sketch 用中文类型名）',
+      inner.includes('box-shadow: inset 0px 2px 8px 0px rgba(0, 0, 0, 0.2);'), inner.join(' '));
+    ok('★ Figma 那套字段名照旧、且 `?? ` 不许让 offsetX 顶掉 x=0（两套键互不干扰）',
+      richInfoOf({ style: { shadows: [{ isEnabled: true, x: 0, y: 4, blur: 2, spread: 3, color: { value: 'rgba(0,0,0,0.5)' } }] } }).shadows[0].x === 0
+      && richInfoOf({ style: { blurs: [{ isEnabled: true, type: 'Background', radius: 6 }] } }).blurs[0].type === 'Background'
+      && richInfoOf({ style: { blurs: [{ isEnabled: true, type: 'Gaussian', radius: 6 }] } }).blurs[0].type === 'Gaussian',
+      JSON.stringify(richInfoOf({ style: { shadows: [{ isEnabled: true, x: 0, y: 4, blur: 2, spread: 3, color: { value: 'rgba(0,0,0,0.5)' } }] } }).shadows));
+  }
 }
 
 /* ═══════════════ ⑥.15d 评论 / 标注（§4.9） ═══════════════

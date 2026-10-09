@@ -3532,7 +3532,22 @@ export function normalizeSketchPluginTree(tree) {
  *                        与蓝湖 ObjC 模板的 NSMakeRange 逐段对得上）。
  * ========================================================================== */
 
-/** 阴影规范化：只保留真正画得出来的（enabled 且颜色 alpha>0）。 */
+/**
+ * 阴影规范化：只保留真正画得出来的（enabled 且颜色 alpha>0）。
+ *
+ * ⚠️ **字段名按来源格式分两套**（这是实测踩出来的，不是兼容洁癖）：
+ *   · Figma 稿（`origin: figma`）      → `x` / `y` / `blur` / `spread` / `inset`（布尔）
+ *   · Sketch 插件稿（`type: sketchPlugin`）→ `offsetX` / `offsetY` / `blurRadius` / `spread`
+ *                                      / `type: '外阴影' | '内阴影'`
+ *   `sketchLayerOf()` 是把 `info[]` 元素**原样**塞进 `style.shadows` 的（只迁了 fills/borders
+ *   的字段名），所以这里必须认两套名字。只认 Figma 那套的后果实测于稿
+ *   `71a30d33`（资源库）：发光按钮的 `box-shadow` 出成 `0px 0px 0px 0px #5cc93b`
+ *   —— **数值合法、发光整条丢掉**，肉眼只看生成结果根本发现不了。
+ *   （`?? ` 而不是 `||`：Figma 的 `x: 0` 是 0，不能被 `offsetX` 顶掉。）
+ *
+ * `内阴影` 是 Sketch 里 `外阴影` 的对偶名（实测样本只出现 `外阴影`，这里按 Sketch 的既定
+ * 词汇表映射；Figma 侧没有 `type` 字符串，不受影响）。
+ */
 function normShadows(list) {
   const out = [];
   for (const s of list ?? []) {
@@ -3540,25 +3555,41 @@ function normShadows(list) {
     const c = parseColor(s.color);
     if (!c || c.a <= 0) continue;
     out.push({
-      x: round2(s.x ?? 0),
-      y: round2(s.y ?? 0),
-      blur: round2(s.blur ?? 0),
+      x: round2(s.x ?? s.offsetX ?? 0),
+      y: round2(s.y ?? s.offsetY ?? 0),
+      blur: round2(s.blur ?? s.blurRadius ?? 0),
       spread: round2(s.spread ?? 0),
-      inset: Boolean(s.inset),
+      inset: Boolean(s.inset) || s.type === '内阴影',
       color: { r: c.r, g: c.g, b: c.b, a: round2(c.a) },
     });
   }
   return out;
 }
 
-/** 模糊：`Background` → 背景模糊（`backdrop-filter`），`Gaussian`/其它 → `filter`。 */
+/**
+ * 模糊类型 → 规范名。`Background` → 背景模糊（`backdrop-filter`），其余 → 元素模糊（`filter`）。
+ *
+ * ⚠️ 与阴影同一个病根：Figma 给英文 `Background`，**Sketch 插件稿给中文 `背景模糊`**
+ *    （实测稿 `71a30d33` 的毛玻璃块，14 处模糊全是 `背景模糊`）。不认它就会把
+ *    「背景模糊」错写成 `filter: blur(10px)` —— 那模糊的是**元素自己**，不是它背后的内容，
+ *    毛玻璃会变成一片糊掉的方块。判据用"含『背景』"而不是全等，是为了同时覆盖
+ *    Sketch 的其它中文写法（如 `背景模糊` 带前后缀）。
+ */
+function normBlurType(type) {
+  const s = typeof type === 'string' ? type : '';
+  if (!s) return null;
+  if (s === 'Background' || s.includes('背景')) return 'Background';
+  return s;
+}
+
+/** 模糊：`Background`（含 Sketch 的 `背景模糊`）→ 背景模糊，其它 → `filter`。 */
 function normBlurs(list) {
   const out = [];
   for (const b of list ?? []) {
     if (!b || typeof b !== 'object' || b.isEnabled === false) continue;
     const r = round2(b.radius ?? 0);
     if (!(r > 0)) continue;
-    out.push({ type: typeof b.type === 'string' ? b.type : null, radius: r });
+    out.push({ type: normBlurType(b.type), radius: r });
   }
   return out;
 }

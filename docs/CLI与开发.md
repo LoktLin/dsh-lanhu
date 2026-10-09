@@ -69,7 +69,7 @@ node lanhu.mjs cookie --clipboard --dry-run  # 只看解析结果，不写入
 ## 本地自检
 
 ```bash
-node test/selfcheck.mjs          # 1505 项，纯离线、秒级
+node test/selfcheck.mjs          # 1509 项，纯离线、秒级
 node test/selfcheck.mjs --json   # 机器可读
 ```
 
@@ -79,7 +79,9 @@ lossless JSON、CLI 入口守卫、图片元信息、字体族判定、坐标映
 落点映射"取最具体的块 / 同框副本取本体 / 命中不了就明说不硬套"、有评论才加标题行那句、
 无评论时输出逐字节不变、接口挂了只降级不失败、`comments:false` 少一次请求、**只发 GET**）、
 设计变更 diff（匹配可靠度）、设计系统审计（组件识别判据、三类漂移、命名不可靠时拒绝出明细、成本上限）、
-**Sketch 插件格式（`type: sketchPlugin`）**（能解析的必须解析出块、取不出图层的必须明示而非静默）、
+**Sketch 插件格式（`type: sketchPlugin`）**（能解析的必须解析出块、取不出图层的必须明示而非静默；
+生成代码侧还要认它那套**不同的字段名**：阴影 `blurRadius`/`offsetX`/`offsetY`、`type: '内阴影'`、
+模糊类型 `背景模糊` —— 认不出会把发光抹成 `0px`、把毛玻璃写成 `filter`）、
 **面板「体检」Tab**（用最小 React 替身把整棵面板树真渲染一遍：tab 真的挂上了、运行中按钮禁用且有进度、
 不可靠结论在界面上可见、颜色全走令牌、fetch 挂了只显示错误不抛）、
 **「稿」下拉的版本数**（Host 侧：默认上限 30 / 硬上限 100 夹回 / offset 分页 / 并发 4 / 单张失败只标 `ok:false`；
